@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Softcom Smart Provisioner</title>
+  <link rel="icon" type="image/png" href="../Assets/App.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><img src="../Assets/App.png" alt=""></div>
+        <div>
+          <strong>Smart Provisioner</strong>
+          <span id="app-version">v1.0.1</span>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <button class="nav-item active" data-page="provision">
+          <span class="nav-icon">◇</span><span>Provisionar</span>
+        </button>
+        <button class="nav-item" data-page="android">
+          <span class="nav-icon">▣</span><span>Android</span>
+        </button>
+        <button class="nav-item" data-page="logs">
+          <span class="nav-icon">≡</span><span>Logs</span>
+        </button>
+        <button class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙</span><span>Configurações</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="status-dot" id="global-status-dot"></div>
+        <div>
+          <strong id="global-status">Inicializando</strong>
+          <span id="global-substatus">Verificando componentes</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">Preparar dispositivo Smart</h1>
+          <p id="page-subtitle">Selecione o ambiente, cliente, empresa e Android para validar o provisionamento.</p>
+        </div>
+        <div class="top-actions">
+          <button class="ghost compact hidden" id="update-available-button">Atualização disponível</button>
+          <span class="phase-badge" id="phase-badge">Fase 1</span>
+          <button class="icon-button" id="theme-toggle" title="Alternar tema">☼</button>
+        </div>
+      </header>
+
+      <section class="page active" id="page-provision">
+        <div class="grid two">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">1. AMBIENTE E CLIENTE</span>
+                <h2>Softcomshop</h2>
+              </div>
+              <span class="mini-status" id="db-credential-status">Credenciais</span>
+            </div>
+
+            <div class="access-mode-card">
+              <span class="field-caption">Modo de acesso</span>
+              <div class="segmented access-mode three" id="access-mode-switch">
+                <button class="active" data-access="online">Online</button>
+                <button data-access="docker">Docker isolado</button>
+                <button data-access="database">VPN local</button>
+              </div>
+              <small id="access-mode-helper">Online usa o Softcomshop. Docker isola a VPN em um container e publica apenas o MySQL localmente. VPN local mantém o fluxo antigo.</small>
+            </div>
+
+            <div id="database-access-options" class="hidden">
+              <div class="segmented" id="environment-switch">
+                <button class="active" data-env="aws1">AWS 1</button>
+                <button data-env="aws2">AWS 2</button>
+              </div>
+            </div>
+
+            <label class="field">
+              <span>Cliente</span>
+              <div class="field-row database-row">
+                <div class="database-combobox" id="database-combobox">
+                  <input id="database-input" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="database-suggestions" placeholder="Digite o nome do cliente, ex.: balerion">
+                  <div class="database-suggestions hidden" id="database-suggestions" role="listbox"></div>
+                </div>
+                <button class="secondary" id="use-database">Usar</button>
+                <button class="secondary" id="load-databases">Buscar bancos</button>
+              </div>
+              <small id="client-helper">Informe o nome do cliente. O Provisioner usa a sessão WEB do Softcomshop e não acessa VPN/MySQL.</small>
+            </label>
+
+            <div class="inline-actions">
+              <button class="ghost hidden" id="connect-docker">Iniciar Docker</button>
+              <button class="ghost" id="connect-vpn">Conectar VPN</button>
+              <button class="ghost" id="open-client-site" disabled>Abrir Softcomshop</button>
+            </div>
+
+            <div class="callout hidden" id="database-error"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">2. EMPRESA</span>
+                <h2>Empresa do dispositivo</h2>
+              </div>
+            </div>
+
+            <label class="field">
+              <span>Empresa</span>
+              <select id="company-select" disabled>
+                <option value="">Selecione o cliente primeiro</option>
+              </select>
+            </label>
+
+            <div class="company-preview empty" id="company-preview">
+              <div class="company-avatar">—</div>
+              <div>
+                <strong>Nenhuma empresa selecionada</strong>
+                <span id="company-source-note">Fonte: sessão Web do Softcomshop</span>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <div class="grid two">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">3. MÓDULO E DISPOSITIVO</span>
+                <h2>Configuração Smart</h2>
+              </div>
+            </div>
+
+            <label class="field">
+              <span>Módulo</span>
+              <select id="module-select">
+                <option value="smart_pdv">Smart PDV</option>
+                <option value="smart_pre_venda">Smart Pré-Venda</option>
+                <option value="smart_tef">Smart TEF</option>
+                <option value="smart_minimercado">Smart Minimercado</option>
+                <option value="smart_totem">Smart Totem</option>
+                <option value="smart_comanda">Smart Comanda</option>
+                <option value="smart_autopagamento">Smart Autopagamento</option>
+              </select>
+              <small>Escolha o módulo inicial. Para os módulos comuns, o vínculo pode ser feito pelo Softcomshop ou pelo SelfHost.</small>
+            </label>
+
+            <label class="selfhost-check-row" id="link-source-config">
+              <input type="checkbox" id="use-selfhost-check">
+              <span>Usar SelfHost</span>
+              <small id="link-source-hint">Permite trocar o módulo depois no próprio Smart, inclusive para Comanda.</small>
+            </label>
+
+            <section class="selfhost-panel compact hidden" id="selfhost-config">
+              <div class="field-row compact">
+                <input id="selfhost-base-url" autocomplete="off" placeholder="SelfHost automático (opcional: http://IP:7711)">
+              </div>
+              <div class="selfhost-status" id="selfhost-status">SelfHost: IP local será detectado automaticamente.</div>
+            </section>
+
+            <div id="standard-device-config">
+              <div class="choice-grid" id="device-mode-grid">
+                <label class="choice selected">
+                  <input type="radio" name="device-mode" value="existing" checked>
+                  <span class="choice-radio"></span>
+                  <span>
+                    <strong>Usar existente</strong>
+                    <small>Reaproveita um cadastro ativo do Softcomshop.</small>
+                  </span>
+                </label>
+                <label class="choice" id="new-device-choice">
+                  <input type="radio" name="device-mode" value="new">
+                  <span class="choice-radio"></span>
+                  <span>
+                    <strong>Criar novo</strong>
+                    <small>Cria o cadastro pela própria tela/endpoint do Softcomshop.</small>
+                  </span>
+                </label>
+              </div>
+
+              <div class="new-device-fields hidden" id="new-device-fields">
+                <label class="field">
+                  <span>Nome do novo dispositivo</span>
+                  <div class="field-row">
+                    <input id="new-device-name" autocomplete="off" placeholder="Ex.: SMART_PDV_TESTE">
+                    <button class="primary" id="create-device">Criar dispositivo</button>
+                  </div>
+                  <small>No modo Online, o Softcomshop gera client_id/client_secret e salva o cadastro sem acesso ao banco.</small>
+                </label>
+              </div>
+
+              <div id="existing-device-fields">
+                <label class="field">
+                  <span id="device-source-label">Dispositivo Softcomshop</span>
+                  <div class="device-select-row">
+                    <select id="oauth-select" disabled>
+                      <option value="">Selecione empresa primeiro</option>
+                    </select>
+                    <button type="button" class="secondary compact-button hidden" id="selfhost-new-device">+ Novo</button>
+                  </div>
+                </label>
+
+                <div class="oauth-preview empty" id="oauth-preview">
+                  <div>
+                    <strong>Selecione um dispositivo</strong>
+                    <span>O vínculo atual será comparado com o Android escolhido.</span>
+                  </div>
+                </div>
+
+                <section class="fiscal-series-panel hidden" id="fiscal-series-panel">
+                  <div class="series-heading">
+                    <button class="series-toggle" id="toggle-series" type="button" aria-expanded="false" aria-controls="series-content">
+                      <span class="series-toggle-text">
+                        <strong>Séries do dispositivo</strong>
+                        <span id="series-summary">Clique para consultar ou alterar NFC-e e NF-e.</span>
+                      </span>
+                      <span class="series-chevron" aria-hidden="true">⌄</span>
+                    </button>
+                    <button class="ghost compact" id="reload-series" type="button" title="Atualizar séries">Atualizar</button>
+                  </div>
+
+                  <div class="series-content collapsed" id="series-content">
+                  <div class="series-grid">
+                    <div class="series-card" data-type="nfce">
+                      <div class="series-card-title"><strong>NFC-e</strong><span>Modelo 65</span></div>
+                      <label class="field compact-field">
+                        <span>Cadastro</span>
+                        <select id="nfce-record"><option value="">Nova série</option></select>
+                      </label>
+                      <div class="series-fields">
+                        <label class="field compact-field"><span>Série</span><input id="nfce-series" inputmode="numeric" placeholder="Ex.: 23"></label>
+                        <label class="field compact-field"><span>Número inicial</span><input id="nfce-number" type="number" min="1" value="1"></label>
+                      </div>
+                      <label class="field compact-field">
+                        <span>Ambiente</span>
+                        <select id="nfce-environment"><option value="2">Homologação</option><option value="1">Produção</option></select>
+                      </label>
+                      <button class="secondary series-save" id="save-nfce-series">Salvar NFC-e</button>
+                    </div>
+
+                    <div class="series-card" data-type="nfe">
+                      <div class="series-card-title"><strong>NF-e</strong><span>Modelo 55</span></div>
+                      <label class="field compact-field">
+                        <span>Cadastro</span>
+                        <select id="nfe-record"><option value="">Nova série</option></select>
+                      </label>
+                      <div class="series-fields">
+                        <label class="field compact-field"><span>Série</span><input id="nfe-series" placeholder="Ex.: 1"></label>
+                        <label class="field compact-field"><span>Número inicial</span><input id="nfe-number" type="number" min="1" value="1"></label>
+                      </div>
+                      <label class="field compact-field">
+                        <span>Ambiente</span>
+                        <select id="nfe-environment"><option value="2">Homologação</option><option value="1">Produção</option></select>
+                      </label>
+                      <button class="secondary series-save" id="save-nfe-series">Salvar NF-e</button>
+                    </div>
+                  </div>
+                  <small class="series-helper">O número informado corresponde ao campo numeracao_inicial da série vinculada ao dispositivo.</small>
+                  </div>
+                </section>
+              </div>
+            </div>
+
+            <div class="tef-config hidden" id="tef-config">
+              <div class="tef-heading">
+                <div>
+                  <strong>Configuração Smart TEF</strong>
+                  <span>O Smart TEF usa o aplicativo RedeFlex e não utiliza URL de oauth_clients neste fluxo.</span>
+                </div>
+                <span class="mini-status ok">RedeFlex</span>
+              </div>
+
+              <label class="field">
+                <span>Nome do dispositivo</span>
+                <input id="tef-device-name" value="SMART 1" autocomplete="off">
+              </label>
+
+              <div class="tef-grid">
+                <label class="field">
+                  <span>CNPJ</span>
+                  <input id="tef-cnpj" value="16161060606116" inputmode="numeric" autocomplete="off">
+                </label>
+                <label class="field">
+                  <span>Empresa ID</span>
+                  <input id="tef-empresa-id" value="106160" inputmode="numeric" autocomplete="off">
+                </label>
+              </div>
+
+              <label class="field">
+                <span>Token</span>
+                <input id="tef-token" value="c531b36997b208f001889804450dde7e" autocomplete="off">
+              </label>
+
+              <div class="callout tef-note">
+                Esses valores ficam preenchidos por padrão e podem ser alterados antes da preparação.
+              </div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">4. ANDROID</span>
+                <h2>Dispositivo ADB</h2>
+              </div>
+              <button class="ghost compact" id="refresh-android">Atualizar</button>
+            </div>
+
+            <div id="android-picker" class="android-picker">
+              <div class="empty-state">Buscando dispositivos ADB...</div>
+            </div>
+
+            <div class="inline-actions">
+              <button class="secondary" id="open-scrcpy" disabled>Abrir scrcpy</button>
+              <button class="danger-soft" id="clear-smart" disabled>Limpar Smart</button>
+            </div>
+          </article>
+        </div>
+
+        <article class="panel final-panel">
+          <div class="final-copy">
+            <span class="eyebrow">PREPARAÇÃO</span>
+            <h2>Preparar e vincular o Smart</h2>
+            <p id="preparation-description">Use <strong>Validar</strong> para conferir o cenário ou <strong>Preparar Smart</strong> para executar de fato: abrir o APK, informar a URL pelo ADB e confirmar o vínculo no banco.</p>
+          </div>
+
+          <div class="validation-card neutral" id="validation-card">
+            <div class="validation-icon">?</div>
+            <div>
+              <strong id="validation-title-default">Selecione um dispositivo WEB e um Android</strong>
+              <span id="validation-detail-default">No modo Online, o vínculo é conferido diretamente na listagem de Dispositivos do Softcomshop.</span>
+            </div>
+          </div>
+
+          <div class="url-box hidden" id="url-box">
+            <label>URL de vínculo</label>
+            <div>
+              <input id="generated-url" readonly>
+              <button class="secondary compact" id="copy-url">Copiar</button>
+            </div>
+          </div>
+
+          <label class="provision-option">
+            <input type="checkbox" id="clear-before-link" checked>
+            <span class="check-box"></span>
+            <span>
+              <strong>Limpar dados do Smart antes de vincular</strong>
+              <small>Recomendado ao trocar de cliente ou cadastro. O APK será preparado para uma nova configuração.</small>
+            </span>
+          </label>
+
+          <div class="final-actions">
+            <button class="secondary big" id="generate-url" disabled>Gerar URL</button>
+            <button class="secondary big" id="validate-link" disabled>Validar</button>
+            <button class="primary big" id="prepare-smart" disabled>Preparar Smart</button>
+          </div>
+
+          <div class="phase-note">
+            <strong>Fase atual:</strong> Softcomshop Online, SelfHost para Comanda/Autopagamento e acesso ao banco por Docker isolado ou VPN local.
+          </div>
+        </article>
+      </section>
+
+      <section class="page" id="page-android">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">ADB / SCRCPY</span>
+            <h2>Dispositivos Android</h2>
+            <p>Lista os emuladores e aparelhos conectados e lê o Android ID usado no vínculo.</p>
+          </div>
+          <button class="secondary" id="refresh-android-page">Atualizar lista</button>
+        </div>
+        <div class="android-grid" id="android-grid"></div>
+      </section>
+
+      <section class="page" id="page-logs">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">DIAGNÓSTICO</span>
+            <h2>Logs do Provisioner</h2>
+            <p>Eventos de banco, VPN, ADB e preparação do Smart sem abrir janelas de console.</p>
+          </div>
+          <div class="inline-actions">
+            <button class="secondary" id="open-log-folder">Abrir pasta</button>
+            <button class="ghost" id="clear-logs">Limpar tela</button>
+          </div>
+        </div>
+        <article class="panel log-panel">
+          <div class="log-list" id="log-list"><div class="empty-state">Nenhum evento registrado nesta sessão.</div></div>
+        </article>
+      </section>
+
+      <section class="page" id="page-settings">
+        <div class="grid two">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">ACESSO INTERNO</span>
+                <h2>Credenciais</h2>
+              </div>
+            </div>
+            <p class="muted">O acesso padrão do Recuperador já está disponível nesta versão. Se necessário, você pode substituir as credenciais somente neste computador.</p>
+            <div class="status-list">
+              <div><span>Banco AWS</span><strong id="setting-db-status">—</strong></div>
+              <div><span>VPN</span><strong id="setting-vpn-status">—</strong></div>
+              <div><span>API Softcomshop</span><strong id="setting-api-status">—</strong></div>
+            </div>
+            <div class="credentials-form">
+              <label class="field">
+                <span>Usuário do banco (opcional)</span>
+                <input id="database-username" autocomplete="off" placeholder="Deixe vazio para usar o acesso padrão">
+              </label>
+              <label class="field">
+                <span>Senha do banco (opcional)</span>
+                <input id="database-password" type="password" autocomplete="new-password" placeholder="Deixe vazio para usar o acesso padrão">
+              </label>
+              <div class="inline-actions">
+                <button class="primary" id="save-database-credentials">Salvar acesso local</button>
+                <button class="ghost" id="import-secrets">Importar do Recuperador</button>
+              </div>
+            </div>
+            <small class="helper">As substituições locais são protegidas pelo usuário atual do Windows e não são exibidas novamente.</small>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">VPN</span>
+                <h2>Perfil OpenVPN</h2>
+              </div>
+            </div>
+            <div class="path-box" id="vpn-profile">Nenhum perfil localizado</div>
+            <button class="secondary" id="choose-vpn">Selecionar .ovpn</button>
+            <small class="helper">O programa também tenta reutilizar automaticamente o perfil já configurado pelo Recuperador.</small>
+          </article>
+        </div>
+
+        <article class="panel update-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">ATUALIZAÇÕES</span>
+              <h2>Atualização automática</h2>
+            </div>
+            <strong id="update-status-badge" class="warn">Não configurado</strong>
+          </div>
+          <p class="muted">O Provisioner consulta um manifesto remoto. Quando houver uma versão nova, baixa o pacote, fecha o aplicativo, atualiza os arquivos e abre novamente sem apagar as configurações locais.</p>
+          <div class="grid two update-fields">
+            <label class="field">
+              <span>Canal</span>
+              <select id="update-channel">
+                <option value="stable">Estável</option>
+                <option value="beta">Teste</option>
+              </select>
+            </label>
+            <label class="field checkbox-field">
+              <span>Verificação</span>
+              <span class="checkbox-line"><input type="checkbox" id="update-auto-check" checked> Verificar automaticamente ao iniciar</span>
+              <span class="checkbox-line"><input type="checkbox" id="update-auto-install" checked> Instalar automaticamente quando houver nova versão</span>
+            </label>
+          </div>
+          <label class="field">
+            <span>Manifesto do canal Estável</span>
+            <input id="update-stable-url" autocomplete="off" placeholder="https://.../stable/latest.json">
+          </label>
+          <label class="field">
+            <span>Manifesto do canal Teste</span>
+            <input id="update-beta-url" autocomplete="off" placeholder="https://.../beta/latest.json">
+          </label>
+          <div class="update-result" id="update-result">Informe a URL do manifesto para ativar as atualizações.</div>
+          <div class="inline-actions">
+            <button class="primary" id="save-update-settings">Salvar configuração</button>
+            <button class="secondary" id="check-update">Verificar agora</button>
+            <button class="primary hidden" id="install-update">Atualizar agora</button>
+          </div>
+        </article>
+
+        <div class="grid two">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">ANDROID</span>
+                <h2>Package do Smart</h2>
+              </div>
+            </div>
+            <label class="field">
+              <span>Package name</span>
+              <div class="field-row">
+                <input id="smart-package" placeholder="Ex.: com.empresa.smart">
+                <button class="secondary" id="save-package">Salvar</button>
+              </div>
+            </label>
+            <button class="ghost" id="detect-package">Detectar no Android selecionado</button>
+            <div class="package-results hidden" id="package-results"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">COMPONENTES</span>
+                <h2>Diagnóstico local</h2>
+              </div>
+            </div>
+            <div class="status-list">
+              <div><span>ADB</span><strong id="setting-adb-status">—</strong></div>
+              <div><span>scrcpy</span><strong id="setting-scrcpy-status">—</strong></div>
+              <div><span>OpenVPN</span><strong id="setting-openvpn-status">—</strong></div>
+              <div><span>WebView2</span><strong class="ok">OK</strong></div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+
+  <div class="modal-backdrop hidden" id="selfhost-create-modal" role="dialog" aria-modal="true" aria-labelledby="selfhost-create-title">
+    <div class="modal-card compact-modal">
+      <div class="modal-heading">
+        <div>
+          <span class="eyebrow">SELFHOST</span>
+          <h3 id="selfhost-create-title">Novo dispositivo</h3>
+        </div>
+        <button type="button" class="icon-button" id="selfhost-create-close" aria-label="Fechar">×</button>
+      </div>
+      <label class="field">
+        <span>Nome do dispositivo</span>
+        <input id="selfhost-create-name" autocomplete="off" placeholder="Ex.: SELFHOST_SMART_01">
+      </label>
+      <div class="selfhost-create-doc-block">
+        <div class="selfhost-create-doc-title">NFC-e</div>
+        <div class="selfhost-create-fiscal-row">
+          <label class="field">
+            <span>Série</span>
+            <input id="selfhost-create-series" inputmode="numeric" autocomplete="off" placeholder="Ex.: 714">
+          </label>
+          <label class="field">
+            <span>Próximo número</span>
+            <input id="selfhost-create-number" inputmode="numeric" autocomplete="off" placeholder="Ex.: 1">
+          </label>
+        </div>
+      </div>
+      <div class="selfhost-create-doc-block">
+        <div class="selfhost-create-doc-title">NF-e <span class="optional-tag">opcional</span></div>
+        <div class="selfhost-create-fiscal-row">
+          <label class="field">
+            <span>Série</span>
+            <input id="selfhost-create-nfe-series" inputmode="numeric" autocomplete="off" placeholder="Ex.: 1">
+          </label>
+          <label class="field">
+            <span>Próximo número</span>
+            <input id="selfhost-create-nfe-number" inputmode="numeric" autocomplete="off" placeholder="Ex.: 1">
+          </label>
+        </div>
+      </div>
+      <small class="modal-helper">A NFC-e é usada na criação do dispositivo. Se a NF-e for informada, ela é vinculada em seguida usando o mesmo cadastro fiscal do dispositivo.</small>
+      <div class="inline-actions modal-actions">
+        <button type="button" class="secondary" id="selfhost-create-cancel">Cancelar</button>
+        <button type="button" class="primary" id="selfhost-create-confirm">Criar</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-host"></div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+.vs/
+bin/
+obj/
+publish/
+*.user
+*.suo
+src/SoftcomSmartProvisioner/appsettings.local.json
+release/
+publish/

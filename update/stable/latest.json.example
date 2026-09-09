@@ -1,0 +1,7 @@
+{
+  "version": "1.0.1",
+  "downloadUrl": "COLE_A_URL_PUBLICA_DO_ZIP_AQUI",
+  "sha256": "COLE_O_SHA256_DO_ZIP_AQUI",
+  "required": false,
+  "notes": "Atualizacao do Softcom Smart Provisioner."
+}

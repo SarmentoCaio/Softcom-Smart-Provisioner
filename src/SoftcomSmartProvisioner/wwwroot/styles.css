@@ -1,0 +1,6 @@
+
+.selfhost-panel{margin:14px 0;padding:14px;border:1px solid #29415e;border-radius:12px;background:#0c1a2c}
+.selfhost-heading{display:flex;justify-content:space-between;gap:12px;margin-bottom:10px}
+.selfhost-heading strong{display:block;color:#f7f9fc;margin-bottom:3px}
+.selfhost-heading span{display:block;color:#8ba1bd;font-size:12px;line-height:1.4}
+.selfhost-status{margin-top:8px;font-size:12px;color:#75d6ff}
