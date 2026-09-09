@@ -8,7 +8,10 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 function Invoke-Git {
-    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
+    param(
+        [Parameter(Mandatory=$true)]
+        [string[]]$GitArgs
+    )
 
     # No Windows PowerShell 5.x, mensagens informativas do Git escritas em STDERR
     # (por exemplo, "From https://github.com/..." durante fetch/pull) podem virar
@@ -18,7 +21,7 @@ function Invoke-Git {
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $output = & git @Args 2>&1
+        $output = & git @GitArgs 2>&1
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
@@ -26,7 +29,7 @@ function Invoke-Git {
 
     if ($exitCode -ne 0) {
         $text = (($output | Out-String).Trim())
-        throw "Falha ao executar git $($Args -join ' '): $text"
+        throw "Falha ao executar git $($GitArgs -join ' '): $text"
     }
 
     return $output
@@ -95,7 +98,7 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     throw "Git nao localizado no PATH."
 }
 
-$branchOutput = @(Invoke-Git branch --show-current)
+$branchOutput = @(Invoke-Git -GitArgs @("branch", "--show-current"))
 $branch = (($branchOutput -join "`n").Trim())
 if ([string]::IsNullOrWhiteSpace($branch)) {
     throw "Nao foi possivel identificar a branch atual do Git."
@@ -104,14 +107,14 @@ if ($branch -ne "main") {
     throw "Execute a publicacao a partir da branch main. Branch atual: $branch"
 }
 
-$localTagOutput = @(Invoke-Git tag --list "v$Version")
+$localTagOutput = @(Invoke-Git -GitArgs @("tag", "--list", "v$Version"))
 $localTag = (($localTagOutput -join "`n").Trim())
 if (-not [string]::IsNullOrWhiteSpace($localTag)) {
     throw "A tag v$Version ja existe localmente."
 }
 
-[void](Invoke-Git fetch origin --tags)
-$remoteTagOutput = @(Invoke-Git ls-remote --tags origin "refs/tags/v$Version")
+[void](Invoke-Git -GitArgs @("fetch", "origin", "--tags"))
+$remoteTagOutput = @(Invoke-Git -GitArgs @("ls-remote", "--tags", "origin", "refs/tags/v$Version"))
 $remoteTag = (($remoteTagOutput -join "`n").Trim())
 if (-not [string]::IsNullOrWhiteSpace($remoteTag)) {
     throw "A tag v$Version ja existe no GitHub."
@@ -120,20 +123,20 @@ if (-not [string]::IsNullOrWhiteSpace($remoteTag)) {
 Set-ProjectVersion $mainProject $Version
 Set-ProjectVersion $updaterProject $Version
 
-[void](Invoke-Git add .)
+[void](Invoke-Git -GitArgs @("add", "."))
 & git diff --cached --quiet
 $diffExit = $LASTEXITCODE
 if ($diffExit -eq 1) {
-    [void](Invoke-Git commit -m $Message)
+    [void](Invoke-Git -GitArgs @("commit", "-m", $Message))
 } elseif ($diffExit -ne 0) {
     throw "Falha ao verificar alteracoes preparadas no Git. Codigo: $diffExit"
 } else {
     Write-Host "Nenhuma alteracao de codigo para commit; seguindo com a tag." -ForegroundColor Yellow
 }
 
-[void](Invoke-Git push origin main)
-[void](Invoke-Git tag -a "v$Version" -m "Softcom Smart Provisioner v$Version")
-[void](Invoke-Git push origin "v$Version")
+[void](Invoke-Git -GitArgs @("push", "origin", "main"))
+[void](Invoke-Git -GitArgs @("tag", "-a", "v$Version", "-m", "Softcom Smart Provisioner v$Version"))
+[void](Invoke-Git -GitArgs @("push", "origin", "v$Version"))
 
 Write-Host ""
 Write-Host "Tag v$Version enviada." -ForegroundColor Green
