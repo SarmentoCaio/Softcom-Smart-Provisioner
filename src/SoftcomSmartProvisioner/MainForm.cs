@@ -12,7 +12,7 @@ namespace SoftcomSmartProvisioner;
 
 public sealed class MainForm : Form
 {
-    private const string AppVersion = "1.0.1";
+    private static string AppVersion => AppVersionInfo.Current;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -595,15 +595,9 @@ public sealed class MainForm : Form
                     WriteLog("SELFHOST", $"NF-e série {nfeSeries}, próximo número {nfeInitialNumber}, vinculada ao dispositivo {item.Name}.");
                 }
 
-                // A API pode levar um instante para refletir o novo cadastro na paginação.
-                // Reconsultamos antes de atualizar o seletor e confirmamos pelo client_id retornado.
-                IReadOnlyList<OAuthClientInfo> refreshed = Array.Empty<OAuthClientInfo>();
-                for (var attempt = 1; attempt <= 3; attempt++)
-                {
-                    refreshed = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
-                    if (refreshed.Any(x => x.ClientId == item.ClientId)) break;
-                    if (attempt < 3) await Task.Delay(500, _shutdown.Token);
-                }
+                // Atualiza a lista uma única vez após a criação. Se a API ainda não refletir
+                // o cadastro, mantemos o item retornado pela própria criação no seletor local.
+                var refreshed = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
                 items = refreshed.Any(x => x.ClientId == item.ClientId)
                     ? refreshed
                     : refreshed.Concat(new[] { item }).OrderBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();

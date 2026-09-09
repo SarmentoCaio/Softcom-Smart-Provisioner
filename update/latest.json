@@ -3,5 +3,5 @@
   "downloadUrl": "https://github.com/SarmentoCaio/Softcom-Smart-Provisioner/releases/download/v1.0.1/Softcom-Smart-Provisioner-v1.0.1.zip",
   "sha256": "043b4692c13baa2a7cb265abbcf5b5bdd0f6ef957c85e4235fc7c60989f26112",
   "required": false,
-  "notes": "Melhorias no fluxo SelfHost e criação de dispositivos."
+  "notes": "Melhorias no fluxo SelfHost e criacao de dispositivos."
 }

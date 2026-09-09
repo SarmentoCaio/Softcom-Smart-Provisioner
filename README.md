@@ -552,3 +552,44 @@ Na criação de um novo dispositivo SelfHost, o Provisioner agora solicita expli
 - NFC-e é enviada na criação do dispositivo SelfHost.
 - NF-e opcional é vinculada ao mesmo `client_id` usando o fluxo fiscal já existente do Softcomshop.
 - Após criar, a lista SelfHost é reconsultada com pequenas tentativas para absorver eventual atraso da API.
+
+## Publicacao automatica no GitHub (v1.0.2+)
+
+O repositorio esta preparado para publicar atualizacoes automaticamente usando GitHub Actions.
+
+Fluxo recomendado:
+
+1. Trabalhe normalmente na branch `main`.
+2. Execute `PUBLICAR-ATUALIZACAO.bat`.
+3. Informe a nova versao no formato `X.Y.Z` (ex.: `1.0.2`).
+4. O script atualiza a versao dos projetos, envia a `main`, cria a tag `vX.Y.Z` e envia a tag ao GitHub.
+5. O workflow `.github/workflows/release.yml`:
+   - compila Provisioner e Updater em `win-x64` self-contained;
+   - gera o ZIP da versao;
+   - calcula SHA-256;
+   - cria a GitHub Release;
+   - anexa o ZIP;
+   - atualiza `update/latest.json` na `main` com a nova versao, URL e hash.
+6. Os computadores da equipe consultam sempre o manifesto fixo:
+
+`https://raw.githubusercontent.com/SarmentoCaio/Softcom-Smart-Provisioner/refs/heads/main/update/latest.json`
+
+O `GERAR-RELEASE.bat` continua disponivel como alternativa manual.
+
+### Permissao do GitHub Actions
+
+O workflow usa `contents: write`. Se a etapa de atualizar `latest.json` retornar HTTP 403, confirme em:
+
+`GitHub > Settings > Actions > General > Workflow permissions > Read and write permissions`
+
+### Rollback de atualizacao
+
+Antes de substituir os arquivos, o Updater salva a instalacao anterior em:
+
+`%LOCALAPPDATA%\SoftcomSmartProvisioner\Backups\`
+
+Se a copia da nova versao ou o reinicio falhar, ele tenta restaurar automaticamente a versao anterior. Sao mantidos os dois backups mais recentes.
+
+
+### Correcao do publicador automatico
+O script de publicacao trata corretamente comandos Git sem saida (por exemplo, quando a tag ainda nao existe), evitando erro de metodo em valor nulo no PowerShell.

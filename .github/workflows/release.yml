@@ -1,0 +1,140 @@
+name: Publicar atualizacao
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Resolver versao da tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith("v")) { throw "A tag deve iniciar com v." }
+          $version = $tag.Substring(1)
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versao invalida: $version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Restaurar dependencias
+        shell: pwsh
+        run: dotnet restore
+
+      - name: Publicar Provisioner
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          dotnet publish src\SoftcomSmartProvisioner\SoftcomSmartProvisioner.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -o publish\win-x64 `
+            /p:Version=$version `
+            /p:AssemblyVersion="$version.0" `
+            /p:FileVersion="$version.0"
+
+      - name: Publicar Updater
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          dotnet publish src\SoftcomSmartProvisioner.Updater\SoftcomSmartProvisioner.Updater.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -o publish\updater-temp `
+            /p:Version=$version
+          Copy-Item publish\updater-temp\SoftcomSmartProvisioner.Updater.exe publish\win-x64\SoftcomSmartProvisioner.Updater.exe -Force
+          Remove-Item publish\updater-temp -Recurse -Force
+
+      - name: Gerar pacote e SHA-256
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $zipName = "Softcom-Smart-Provisioner-v$version.zip"
+          $zipPath = Join-Path $PWD $zipName
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path publish\win-x64\* -DestinationPath $zipPath -CompressionLevel Optimal
+          $sha = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "zipName=$zipName" >> $env:GITHUB_OUTPUT
+          "zipPath=$zipPath" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Criar Release no GitHub
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $version = "${{ steps.version.outputs.version }}"
+          $zip = "${{ steps.package.outputs.zipPath }}"
+          gh release create $tag $zip `
+            --title "Softcom Smart Provisioner v$version" `
+            --generate-notes `
+            --latest
+
+      - name: Atualizar latest.json na main
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = "${{ steps.version.outputs.tag }}"
+          $zipName = "${{ steps.package.outputs.zipName }}"
+          $sha = "${{ steps.package.outputs.sha256 }}"
+          $repo = "${{ github.repository }}"
+          $downloadUrl = "https://github.com/$repo/releases/download/$tag/$zipName"
+
+          git fetch origin main
+          git checkout main
+          git pull --ff-only origin main
+
+          New-Item -ItemType Directory -Force -Path update | Out-Null
+          $manifest = [ordered]@{
+            version = $version
+            downloadUrl = $downloadUrl
+            sha256 = $sha
+            required = $false
+            notes = "Atualizacao automatica v$version. Consulte as notas da Release no GitHub."
+          }
+          $manifest | ConvertTo-Json | Set-Content -LiteralPath update\latest.json -Encoding UTF8
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update\latest.json
+          git diff --cached --quiet
+          $diffExit = $LASTEXITCODE
+          if ($diffExit -eq 1) {
+            git commit -m "Atualiza manifesto para v$version"
+            git push origin main
+          } elseif ($diffExit -ne 0) {
+            throw "Falha ao verificar alteracoes no manifesto. Codigo: $diffExit"
+          }
+
+      - name: Resumo
+        shell: pwsh
+        run: |
+          "## Release publicada" >> $env:GITHUB_STEP_SUMMARY
+          "- Versao: **${{ steps.version.outputs.version }}**" >> $env:GITHUB_STEP_SUMMARY
+          "- Pacote: **${{ steps.package.outputs.zipName }}**" >> $env:GITHUB_STEP_SUMMARY
+          "- SHA-256: `${{ steps.package.outputs.sha256 }}`" >> $env:GITHUB_STEP_SUMMARY
+          "- update/latest.json atualizado automaticamente na branch main." >> $env:GITHUB_STEP_SUMMARY

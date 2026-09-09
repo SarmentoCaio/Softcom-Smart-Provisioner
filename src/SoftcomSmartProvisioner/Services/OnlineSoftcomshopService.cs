@@ -468,7 +468,7 @@ public sealed class OnlineSoftcomshopService
             BaseAddress = uri,
             Timeout = TimeSpan.FromSeconds(45)
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 SoftcomSmartProvisioner/1.0.1");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd($"Mozilla/5.0 SoftcomSmartProvisioner/{AppVersionInfo.Current}");
         return client;
     }
 

@@ -6,4 +6,3 @@ publish/
 *.suo
 src/SoftcomSmartProvisioner/appsettings.local.json
 release/
-publish/

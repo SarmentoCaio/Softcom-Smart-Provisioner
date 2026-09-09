@@ -1,4 +1,4 @@
 {
-  "stableManifestUrl": "https://raw.githubusercontent.com/SarmentoCaio/Softcom-Smart-Provisioner/main/update/latest.json",
+  "stableManifestUrl": "https://raw.githubusercontent.com/SarmentoCaio/Softcom-Smart-Provisioner/refs/heads/main/update/latest.json",
   "betaManifestUrl": ""
 }

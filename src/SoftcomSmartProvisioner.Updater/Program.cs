@@ -9,6 +9,8 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        string? backupDirectory = null;
+        string? targetDirectory = null;
         try
         {
             var options = ParseArgs(args);
@@ -16,6 +18,7 @@ internal static class Program
             var package = Require(options, "package");
             var target = Require(options, "target");
             var restart = Require(options, "restart");
+            targetDirectory = target;
 
             WaitForProcess(pid);
             StopLocalToolProcesses(target);
@@ -24,22 +27,44 @@ internal static class Program
             Directory.CreateDirectory(staging);
             ZipFile.ExtractToDirectory(package, staging, true);
             var sourceRoot = ResolveSourceRoot(staging);
+
+            backupDirectory = CreateBackup(target);
             CopyTree(sourceRoot, target);
 
             TryDelete(package);
             try { Directory.Delete(staging, true); } catch { }
 
-            Process.Start(new ProcessStartInfo(restart)
+            var restarted = Process.Start(new ProcessStartInfo(restart)
             {
                 UseShellExecute = true,
                 WorkingDirectory = Path.GetDirectoryName(restart) ?? target
             });
+            if (restarted is null)
+            {
+                throw new InvalidOperationException("Nao foi possivel reiniciar o Softcom Smart Provisioner.");
+            }
+
+            CleanupOldBackups(keep: 2);
             return 0;
         }
         catch (Exception ex)
         {
+            var rollbackMessage = string.Empty;
+            if (!string.IsNullOrWhiteSpace(backupDirectory) && !string.IsNullOrWhiteSpace(targetDirectory))
+            {
+                try
+                {
+                    RestoreBackup(backupDirectory, targetDirectory);
+                    rollbackMessage = "\n\nA versao anterior foi restaurada automaticamente.";
+                }
+                catch (Exception rollbackEx)
+                {
+                    rollbackMessage = "\n\nTambem nao foi possivel restaurar automaticamente a versao anterior: " + rollbackEx.Message;
+                }
+            }
+
             MessageBox.Show(
-                "Nao foi possivel concluir a atualizacao.\n\n" + ex.Message,
+                "Nao foi possivel concluir a atualizacao.\n\n" + ex.Message + rollbackMessage,
                 "Softcom Smart Provisioner Updater",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
@@ -92,6 +117,47 @@ internal static class Program
             return dirs[0];
         }
         return staging;
+    }
+
+    private static string CreateBackup(string target)
+    {
+        var baseDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SoftcomSmartProvisioner",
+            "Backups");
+        Directory.CreateDirectory(baseDirectory);
+
+        var backup = Path.Combine(baseDirectory, DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+        Directory.CreateDirectory(backup);
+        CopyTree(target, backup);
+        return backup;
+    }
+
+    private static void RestoreBackup(string backup, string target)
+    {
+        StopLocalToolProcesses(target);
+        CopyTree(backup, target);
+    }
+
+    private static void CleanupOldBackups(int keep)
+    {
+        try
+        {
+            var baseDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SoftcomSmartProvisioner",
+                "Backups");
+            if (!Directory.Exists(baseDirectory)) return;
+
+            foreach (var directory in new DirectoryInfo(baseDirectory)
+                         .GetDirectories()
+                         .OrderByDescending(x => x.CreationTimeUtc)
+                         .Skip(Math.Max(keep, 0)))
+            {
+                try { directory.Delete(true); } catch { }
+            }
+        }
+        catch { }
     }
 
     private static void CopyTree(string source, string target)
