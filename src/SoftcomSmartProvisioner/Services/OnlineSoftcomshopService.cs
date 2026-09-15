@@ -238,6 +238,58 @@ public sealed class OnlineSoftcomshopService
         return ParseFiscalSeries(html, companyId, clientId);
     }
 
+    public async Task<int?> GetFiscalEnvironmentAsync(
+        string database,
+        long companyId,
+        string clientId,
+        string documentType,
+        CancellationToken cancellationToken = default)
+    {
+        var suffix = documentType.Equals("nfce", StringComparison.OrdinalIgnoreCase) ||
+                     documentType.Equals("NFCe", StringComparison.OrdinalIgnoreCase)
+            ? "nfce"
+            : "nfe";
+
+        var baseUrl = EnvironmentCatalog.BuildSiteUrl(database);
+        var token = await GetCsrfTokenAsync(baseUrl, cancellationToken);
+        var response = await PostFormAsync(
+            baseUrl,
+            $"/serie-dispositivo/nfenfce/novo?oauth_client_id={Uri.EscapeDataString(clientId)}",
+            new Dictionary<string, string>
+            {
+                ["client_id"] = clientId,
+                ["empresa_id"] = companyId.ToString()
+            },
+            token,
+            $"/cadastro/empresa/{companyId}/editar",
+            cancellationToken);
+
+        var html = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"Falha ao consultar ambiente fiscal do dispositivo (HTTP {(int)response.StatusCode}).");
+        }
+        EnsureAuthenticatedHtml(html, "ambiente fiscal do dispositivo");
+
+        var field = $"ambiente_{suffix}";
+        var candidates = new[]
+        {
+            FindCheckedInputValue(html, field),
+            FindSelectedOptionValue(html, field),
+            FindNonChoiceInputValue(html, field)
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (int.TryParse(candidate, out var value) && value is 1 or 2)
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
     public async Task<FiscalSeriesInfo> SaveFiscalSeriesAsync(
         string database,
         long companyId,
@@ -555,22 +607,36 @@ public sealed class OnlineSoftcomshopService
 
         void Add(string documentType, string suffix)
         {
-            var id = ParseLong(FindInputValue(html, $"{suffix}_serie_id")) ?? 0;
-            var series = FindInputValue(html, $"serie_{suffix}");
+            var id = ParseLong(FindControlValue(html, $"{suffix}_serie_id")) ?? 0;
+            var series = FindControlValue(html, $"serie_{suffix}");
             if (string.IsNullOrWhiteSpace(series))
             {
-                series = FindInputValue(html, $"auto_serie_{suffix}");
+                series = FindControlValue(html, $"auto_serie_{suffix}");
             }
             if (string.IsNullOrWhiteSpace(series))
             {
                 return;
             }
 
-            var number = (int)(ParseLong(FindInputValue(html, $"numeracao_inicial_{suffix}")) ?? 1);
-            var environment = (int)(ParseLong(FindInputValue(html, $"ambiente_{suffix}")) ?? 2);
+            var number = (int)(ParseLong(FindControlValue(html, $"numeracao_inicial_{suffix}")) ?? 1);
+            var environment = (int)(ParseLong(FindControlValue(html, $"ambiente_{suffix}")) ?? 2);
             if (environment is not (1 or 2)) environment = 2;
             result.Add(new FiscalSeriesInfo(id, documentType, companyId, series, Math.Max(number, 1), environment, false, clientId, null));
         }
+    }
+
+    private static string? FindControlValue(string html, string idOrName)
+    {
+        var checkedValue = FindCheckedInputValue(html, idOrName);
+        if (!string.IsNullOrWhiteSpace(checkedValue)) return checkedValue;
+
+        var selectedValue = FindSelectedOptionValue(html, idOrName);
+        if (!string.IsNullOrWhiteSpace(selectedValue)) return selectedValue;
+
+        var inputValue = FindNonChoiceInputValue(html, idOrName);
+        if (!string.IsNullOrWhiteSpace(inputValue)) return inputValue;
+
+        return FindInputValue(html, idOrName);
     }
 
     private static string? ExtractCsrfToken(string html)
@@ -586,6 +652,99 @@ public sealed class OnlineSoftcomshopService
         }
         return FindInputValue(html, "_token");
     }
+
+    private static string? FindCheckedInputValue(string html, string idOrName)
+    {
+        foreach (Match match in Regex.Matches(html, "<input(?<attrs>[^>]*)>", RegexOptions.IgnoreCase | RegexOptions.Singleline))
+        {
+            var attrs = match.Groups["attrs"].Value;
+            var id = GetAttribute(attrs, "id");
+            var name = GetAttribute(attrs, "name");
+            if (!string.Equals(id, idOrName, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(name, idOrName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var type = (GetAttribute(attrs, "type") ?? string.Empty).Trim();
+            if (!type.Equals("radio", StringComparison.OrdinalIgnoreCase) &&
+                !type.Equals("checkbox", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!HasBooleanAttribute(attrs, "checked"))
+            {
+                continue;
+            }
+
+            return WebUtility.HtmlDecode(GetAttribute(attrs, "value") ?? string.Empty);
+        }
+        return null;
+    }
+
+    private static string? FindSelectedOptionValue(string html, string idOrName)
+    {
+        foreach (Match select in Regex.Matches(
+                     html,
+                     "<select(?<attrs>[^>]*)>(?<body>.*?)</select>",
+                     RegexOptions.IgnoreCase | RegexOptions.Singleline))
+        {
+            var attrs = select.Groups["attrs"].Value;
+            var id = GetAttribute(attrs, "id");
+            var name = GetAttribute(attrs, "name");
+            if (!string.Equals(id, idOrName, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(name, idOrName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            foreach (Match option in Regex.Matches(
+                         select.Groups["body"].Value,
+                         "<option(?<attrs>[^>]*)>",
+                         RegexOptions.IgnoreCase | RegexOptions.Singleline))
+            {
+                var optionAttrs = option.Groups["attrs"].Value;
+                if (!HasBooleanAttribute(optionAttrs, "selected"))
+                {
+                    continue;
+                }
+                return WebUtility.HtmlDecode(GetAttribute(optionAttrs, "value") ?? string.Empty);
+            }
+        }
+        return null;
+    }
+
+    private static string? FindNonChoiceInputValue(string html, string idOrName)
+    {
+        foreach (Match match in Regex.Matches(html, "<input(?<attrs>[^>]*)>", RegexOptions.IgnoreCase | RegexOptions.Singleline))
+        {
+            var attrs = match.Groups["attrs"].Value;
+            var id = GetAttribute(attrs, "id");
+            var name = GetAttribute(attrs, "name");
+            if (!string.Equals(id, idOrName, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(name, idOrName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var type = (GetAttribute(attrs, "type") ?? string.Empty).Trim();
+            if (type.Equals("radio", StringComparison.OrdinalIgnoreCase) ||
+                type.Equals("checkbox", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            return WebUtility.HtmlDecode(GetAttribute(attrs, "value") ?? string.Empty);
+        }
+        return null;
+    }
+
+    private static bool HasBooleanAttribute(string attrs, string name) =>
+        Regex.IsMatch(
+            attrs,
+            $"(?:^|\\s){Regex.Escape(name)}(?:\\s*=\\s*([\\\"']).*?\\1|(?=\\s|$))",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
     private static string? FindInputValue(string html, string idOrName)
     {
@@ -622,18 +781,55 @@ public sealed class OnlineSoftcomshopService
         try
         {
             using var json = JsonDocument.Parse(body);
-            if (json.RootElement.TryGetProperty("message", out var message))
+            var messages = new List<string>();
+            CollectServerMessages(json.RootElement, messages);
+            var message = string.Join(" ", messages
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase));
+            if (!string.IsNullOrWhiteSpace(message))
             {
-                return message.GetString() ?? string.Empty;
-            }
-            if (json.RootElement.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.String)
-            {
-                return error.GetString() ?? string.Empty;
+                return message.Length <= 320 ? message : message[..320] + "...";
             }
         }
         catch (JsonException) { }
+
         var text = Regex.Replace(body, "<[^>]+>", " ");
         text = WebUtility.HtmlDecode(Regex.Replace(text, "\\s+", " ")).Trim();
-        return text.Length <= 220 ? text : text[..220] + "...";
+        return text.Length <= 320 ? text : text[..320] + "...";
+    }
+
+    private static void CollectServerMessages(JsonElement element, List<string> messages, string? propertyName = null)
+    {
+        if (IsSensitiveServerField(propertyName)) return;
+
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.String:
+                var value = element.GetString();
+                if (!string.IsNullOrWhiteSpace(value)) messages.Add(value);
+                break;
+            case JsonValueKind.Array:
+                foreach (var child in element.EnumerateArray())
+                {
+                    CollectServerMessages(child, messages, propertyName);
+                }
+                break;
+            case JsonValueKind.Object:
+                foreach (var property in element.EnumerateObject())
+                {
+                    CollectServerMessages(property.Value, messages, property.Name);
+                }
+                break;
+        }
+    }
+
+    private static bool IsSensitiveServerField(string? propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(propertyName)) return false;
+        return propertyName.Contains("secret", StringComparison.OrdinalIgnoreCase) ||
+               propertyName.Contains("token", StringComparison.OrdinalIgnoreCase) ||
+               propertyName.Contains("password", StringComparison.OrdinalIgnoreCase) ||
+               propertyName.Contains("senha", StringComparison.OrdinalIgnoreCase);
     }
 }

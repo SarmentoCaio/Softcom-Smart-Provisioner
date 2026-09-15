@@ -50,6 +50,20 @@ public static class ProvisioningService
             };
         }
 
+        if (!string.IsNullOrWhiteSpace(androidDevice.ConfirmedSmartDeviceId) &&
+            string.Equals(
+                oauthClient.DeviceId.Trim(),
+                androidDevice.ConfirmedSmartDeviceId.Trim(),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return new
+            {
+                status = "success",
+                title = "Dispositivo já vinculado",
+                detail = $"Este cadastro já está vinculado ao Android selecionado (Smart ID {oauthClient.DeviceId.Trim()})."
+            };
+        }
+
         return new
         {
             status = "ready",

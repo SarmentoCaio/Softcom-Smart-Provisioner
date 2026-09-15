@@ -9,6 +9,8 @@ public sealed class AppSettings
     public long? LastCompanyId { get; set; }
     public string AccessMode { get; set; } = "online";
     public string LastOnlineClient { get; set; } = string.Empty;
+    public List<string> RecentOnlineClients { get; set; } = new();
+    public Dictionary<string, string> ConfirmedSmartDeviceIds { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public bool AutoCheckUpdates { get; set; } = true;
     public bool AutoInstallUpdates { get; set; } = true;
     public string UpdateChannel { get; set; } = "stable";

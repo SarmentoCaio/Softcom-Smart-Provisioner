@@ -60,6 +60,8 @@ public sealed class AdbService
 
             string androidVersion = string.Empty;
             string androidId = string.Empty;
+            string smartVersion = string.Empty;
+            string smartFlow = "Nao detectado";
             int? battery = null;
             long? latency = null;
 
@@ -98,6 +100,15 @@ public sealed class AdbService
                         battery = parsedBattery;
                     }
                 }
+
+                // Detecta a versao instalada do Smart para escolher o fluxo de automacao.
+                // Primeiro tenta o package padrao; se nao existir, tenta a variante RedeFlex/TEF.
+                smartVersion = await GetPackageVersionNameAsync(serial, "softcom.mobile.smart2", cancellationToken);
+                if (string.IsNullOrWhiteSpace(smartVersion))
+                {
+                    smartVersion = await GetPackageVersionNameAsync(serial, "softcom.mobile.smart2.redeflex", cancellationToken);
+                }
+                smartFlow = ClassifySmartFlow(smartVersion);
             }
 
             devices.Add(new DeviceInfo(
@@ -109,7 +120,9 @@ public sealed class AdbService
                 androidVersion,
                 battery,
                 latency,
-                androidId));
+                androidId,
+                smartVersion,
+                smartFlow));
         }
 
         return devices;
@@ -163,7 +176,7 @@ public sealed class AdbService
         return ShellAsync(serial, $"am force-stop {packageName.Trim()}", cancellationToken, 10000);
     }
 
-    public Task<ProcessResult> LaunchPackageAsync(
+    public async Task<ProcessResult> LaunchPackageAsync(
         string serial,
         string packageName,
         CancellationToken cancellationToken = default)
@@ -173,11 +186,44 @@ public sealed class AdbService
             throw new ArgumentException("Informe o package name do Smart.", nameof(packageName));
         }
 
-        return ShellAsync(
+        var package = packageName.Trim();
+
+        // Prefere o launcher explicitamente restrito ao package informado. Isso evita
+        // depender do comportamento do monkey em Androids antigos e garante que o
+        // Provisioner nunca tente iniciar outro APK durante o fluxo do Smart.
+        var direct = await ShellAsync(
             serial,
-            $"monkey -p {packageName.Trim()} -c android.intent.category.LAUNCHER 1",
+            $"am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}",
             cancellationToken,
             20000);
+
+        var directOutput = direct.CombinedOutput ?? string.Empty;
+        var directFailed = !direct.Success ||
+                           directOutput.Contains("Error:", StringComparison.OrdinalIgnoreCase) ||
+                           directOutput.Contains("unable to resolve", StringComparison.OrdinalIgnoreCase) ||
+                           directOutput.Contains("Activity not started", StringComparison.OrdinalIgnoreCase);
+        if (!directFailed)
+        {
+            return direct;
+        }
+
+        // Fallback para builds Android onde `am start -p` nao resolve o launcher.
+        // O `-p` continua limitando o evento exclusivamente ao package solicitado.
+        var monkey = await ShellAsync(
+            serial,
+            $"monkey -p {package} -c android.intent.category.LAUNCHER 1",
+            cancellationToken,
+            20000);
+
+        if (monkey.Success)
+        {
+            return monkey;
+        }
+
+        return new ProcessResult(
+            monkey.ExitCode,
+            string.Join(Environment.NewLine, new[] { direct.StandardOutput, monkey.StandardOutput }.Where(x => !string.IsNullOrWhiteSpace(x))),
+            string.Join(Environment.NewLine, new[] { direct.StandardError, monkey.StandardError }.Where(x => !string.IsNullOrWhiteSpace(x))));
     }
 
     public async Task<ProcessResult> DumpUiHierarchyAsync(
@@ -260,21 +306,39 @@ public sealed class AdbService
         CancellationToken cancellationToken = default)
     {
         var result = await ShellAsync(serial, "dumpsys window", cancellationToken, 12000);
-        if (!result.Success)
+        if (result.Success)
         {
-            return string.Empty;
+            foreach (var pattern in new[]
+            {
+                @"mCurrentFocus=.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+)/(?:[A-Za-z0-9._$]+)",
+                @"mFocusedApp=.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+)/(?:[A-Za-z0-9._$]+)"
+            })
+            {
+                var match = Regex.Match(result.StandardOutput, pattern, RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    return match.Groups[1].Value.Trim();
+                }
+            }
         }
 
-        foreach (var pattern in new[]
+        // Android 7 e algumas ROMs nao publicam mCurrentFocus de forma consistente.
+        // Nesses casos consultamos a activity retomada, sem inferir o package por nome.
+        var activity = await ShellAsync(serial, "dumpsys activity activities", cancellationToken, 12000);
+        if (activity.Success)
         {
-            @"mCurrentFocus=.*?\s([A-Za-z0-9._]+)/(?:[A-Za-z0-9._$]+)",
-            @"mFocusedApp=.*?\s([A-Za-z0-9._]+)/(?:[A-Za-z0-9._$]+)"
-        })
-        {
-            var match = Regex.Match(result.StandardOutput, pattern, RegexOptions.IgnoreCase);
-            if (match.Success)
+            foreach (var pattern in new[]
             {
-                return match.Groups[1].Value.Trim();
+                @"mResumedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+)/(?:[A-Za-z0-9._$]+)",
+                @"ResumedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+)/(?:[A-Za-z0-9._$]+)",
+                @"mFocusedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+)/(?:[A-Za-z0-9._$]+)"
+            })
+            {
+                var match = Regex.Match(activity.StandardOutput, pattern, RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    return match.Groups[1].Value.Trim();
+                }
             }
         }
 
@@ -287,6 +351,79 @@ public sealed class AdbService
         int y,
         CancellationToken cancellationToken = default) =>
         ShellAsync(serial, $"input tap {x} {y}", cancellationToken, 10000);
+
+    public Task<ProcessResult> LongPressAsync(
+        string serial,
+        int x,
+        int y,
+        int durationMs = 5000,
+        CancellationToken cancellationToken = default)
+    {
+        durationMs = Math.Clamp(durationMs, 500, 15000);
+        return ShellAsync(
+            serial,
+            $"input swipe {x} {y} {x} {y} {durationMs}",
+            cancellationToken,
+            durationMs + 10000);
+    }
+
+    public async Task<string> GetPackageVersionNameAsync(
+        string serial,
+        string packageName,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(packageName) ||
+            !Regex.IsMatch(packageName, @"^[A-Za-z0-9._]+$"))
+        {
+            return string.Empty;
+        }
+
+        var result = await ShellAsync(serial, $"dumpsys package {packageName}", cancellationToken, 12000);
+        if (!result.Success)
+        {
+            return string.Empty;
+        }
+
+        var match = Regex.Match(
+            result.StandardOutput ?? string.Empty,
+            @"(?:^|\s)versionName=([^\s]+)",
+            RegexOptions.IgnoreCase);
+
+        return match.Success ? match.Groups[1].Value.Trim() : string.Empty;
+    }
+
+
+    public static string ClassifySmartFlow(string? versionName)
+    {
+        if (string.IsNullOrWhiteSpace(versionName))
+        {
+            return "Nao detectado";
+        }
+
+        var normalized = versionName.Trim();
+        var numeric = Regex.Match(normalized, @"\d+(?:\.\d+){1,3}").Value;
+        if (string.IsNullOrWhiteSpace(numeric))
+        {
+            return "Versao nao reconhecida";
+        }
+
+        // Version.TryParse("8.1.0") gera Revision = -1. Comparar esse valor diretamente
+        // com 8.1.0.0 faz 8.1.0 ser considerado menor, embora seja a mesma versao
+        // funcional para a regra de interface. Normalizamos sempre para quatro partes.
+        var components = numeric.Split('.', StringSplitOptions.RemoveEmptyEntries).ToList();
+        while (components.Count < 4) components.Add("0");
+        if (components.Count > 4) components = components.Take(4).ToList();
+
+        var comparable = string.Join('.', components);
+        if (!Version.TryParse(comparable, out var version))
+        {
+            return "Versao nao reconhecida";
+        }
+
+        return version >= new Version(8, 1, 0, 0)
+            ? "Smart 8.1+"
+            : "Smart legado (< 8.1)";
+    }
 
     public Task<ProcessResult> KeyEventAsync(
         string serial,

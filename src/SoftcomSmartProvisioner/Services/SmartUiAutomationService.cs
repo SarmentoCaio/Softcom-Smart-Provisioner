@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace SoftcomSmartProvisioner.Services;
@@ -64,7 +65,8 @@ public sealed class SmartUiAutomationService
         bool clearData,
         Action<string, string>? progress = null,
         Func<string, Task>? beforeSubmitAsync = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? confirmedSmartDeviceId = null)
     {
         // Todos os modulos deste fluxo (PDV, Pre-Venda, Minimercado, Totem,
         // Comanda e Autopagamento) usam o package padrao do Smart. O Smart TEF
@@ -79,10 +81,29 @@ public sealed class SmartUiAutomationService
         // proxima operacao ADB retorna o erro normalmente em vez de travar aqui.
         progress?.Invoke("package", "Preparando o aplicativo Softcom Smart...");
         const string standardSmartPackage = "softcom.mobile.smart2";
-        var packageName = !string.IsNullOrWhiteSpace(configuredPackage) &&
-                          !configuredPackage.Contains("redeflex", StringComparison.OrdinalIgnoreCase)
-            ? configuredPackage.Trim()
-            : standardSmartPackage;
+        // Este fluxo e exclusivo do Smart padrao. Smart TEF/RedeFlex possui rotina
+        // propria. Portanto nao reutilizamos um package salvo/detectado anteriormente:
+        // isso evita abrir outro APK quando uma configuracao local antiga estiver errada.
+        var packageName = standardSmartPackage;
+        if (!string.IsNullOrWhiteSpace(configuredPackage) &&
+            !configuredPackage.Trim().Equals(standardSmartPackage, StringComparison.OrdinalIgnoreCase))
+        {
+            progress?.Invoke(
+                "package",
+                $"Package salvo '{configuredPackage.Trim()}' ignorado neste fluxo. Usando {standardSmartPackage}.");
+        }
+
+        // A versao e validada novamente no momento do provisionamento. A lista de Androids
+        // tambem exibe essa informacao, mas a leitura aqui evita usar um diagnostico antigo
+        // caso o APK tenha sido atualizado depois da ultima atualizacao da tela.
+        var smartVersion = await _adb.GetPackageVersionNameAsync(serial, packageName, cancellationToken);
+        var smartFlow = AdbService.ClassifySmartFlow(smartVersion);
+        var isLegacySmart = string.Equals(smartFlow, "Smart legado (< 8.1)", StringComparison.OrdinalIgnoreCase);
+        progress?.Invoke(
+            "smart-version",
+            string.IsNullOrWhiteSpace(smartVersion)
+                ? "Versao do Smart nao identificada. O fluxo sera validado pela interface atual."
+                : $"Smart {smartVersion} detectado. Perfil de interface: {smartFlow}.");
 
         if (clearData)
         {
@@ -117,6 +138,28 @@ public sealed class SmartUiAutomationService
             await Task.Delay(500, cancellationToken);
         }
 
+        // Smart 8.0 / Android 7: o `pm clear` revoga as permissoes runtime.
+        // O APK 8.0 mapeado declara READ_EXTERNAL_STORAGE e WRITE_EXTERNAL_STORAGE e,
+        // ao abrir a configuracao, solicita o grupo de armazenamento. Concedemos essas
+        // permissoes antes do launch para que o dialogo do Android nao interrompa o fluxo.
+        if (isLegacySmart)
+        {
+            progress?.Invoke(
+                "legacy-permissions",
+                "Garantindo as permissoes de armazenamento exigidas pelo Smart 8.0...");
+
+            var permissionResult = await EnsureLegacyStoragePermissionsAsync(
+                serial,
+                packageName,
+                cancellationToken);
+
+            progress?.Invoke(
+                "legacy-permissions",
+                permissionResult.Success
+                    ? "Permissoes de armazenamento do Smart 8.0 concedidas via ADB."
+                    : "Nao foi possivel confirmar todas as permissoes de armazenamento via ADB. O fluxo continuara e validara uma eventual solicitacao do Android. " + permissionResult.Detail);
+        }
+
         progress?.Invoke("launch", "Abrindo o Softcom Smart no Android selecionado...");
         var launch = await _adb.LaunchPackageAsync(serial, packageName, cancellationToken);
         if (!launch.Success)
@@ -133,13 +176,392 @@ public sealed class SmartUiAutomationService
 
         await Task.Delay(1800, cancellationToken);
 
-        var snapshot = await ReadUiAsync(serial, cancellationToken);
-        if (!snapshot.Success)
+        // Smart 8.0 / Android 7: o mapeamento real do K2_MINI mostrou que
+        // `uiautomator dump` falha na LoginActivity com "ERROR: could not get idle state".
+        // Portanto NUNCA lemos a arvore de acessibilidade enquanto essa Activity estiver
+        // em primeiro plano. Confirmamos a Activity via dumpsys, tocamos a engrenagem
+        // usando a posicao proporcional mapeada e somente depois, ja em EmpresaActivity,
+        // voltamos a usar UIAutomator. Isso evita fechar/perder o foco do APK legado.
+        UiSnapshot snapshot;
+        // Em Android 8+ o ANDROID_ID lido pelo shell ADB nao pertence ao mesmo
+        // escopo de assinatura do APK. Quando o Provisioner ja confirmou o ID real
+        // em uma vinculacao anterior, ele entra aqui como a unica fonte antecipada.
+        var smartDeviceId = confirmedSmartDeviceId?.Trim() ?? string.Empty;
+
+        if (isLegacySmart)
         {
-            return new SmartAutomationResult(false, packageName, "ui", snapshot.Error, string.Empty, string.Empty);
+            // No Android 7 o foco da janela pode apontar momentaneamente para o launcher
+            // enquanto a LoginActivity do Smart ja esta sendo retomada. Nao podemos cair
+            // no UIAutomator nesse intervalo, pois o dump nessa tela foi comprovadamente
+            // instavel no K2_MINI. Aguarda primeiro uma Activity REAL do Smart 8.0.
+            var foregroundActivity = await WaitForLegacySmartActivityAsync(
+                serial,
+                24,
+                cancellationToken);
+
+            progress?.Invoke(
+                "legacy-activity",
+                string.IsNullOrWhiteSpace(foregroundActivity)
+                    ? "Nenhuma Activity do Smart 8.0 foi confirmada apos o launch."
+                    : $"Activity inicial estabilizada para o Smart 8.0: {foregroundActivity}.");
+
+            if (IsLegacyLoginActivity(foregroundActivity))
+            {
+                var largeSelfService = IsLegacy80LargeSelfServiceModule(module);
+                var sdkLevel = await GetAndroidSdkLevelAsync(serial, cancellationToken);
+
+                progress?.Invoke(
+                    "legacy-settings",
+                    sdkLevel > 25 && !largeSelfService
+                        ? $"Smart 8.0 na LoginActivity (SDK {sdkLevel}). Localizando a engrenagem pela arvore da tela do celular/GPOS..."
+                        : "Smart 8.0 na LoginActivity. Abrindo a engrenagem pelo ponto mapeado, sem UIAutomator nesta tela...");
+
+                var display = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
+                if (!display.Success)
+                {
+                    return new SmartAutomationResult(
+                        false,
+                        packageName,
+                        "legacy-settings",
+                        "A tela de login do Smart 8.0 foi identificada, mas nao foi possivel obter a resolucao do Android para acionar a engrenagem.",
+                        foregroundActivity,
+                        string.Empty);
+                }
+
+                int settingsX;
+                int settingsY;
+                var settingsSource = "ponto mapeado";
+
+                // O problema de UIAutomator foi comprovado no K2_MINI / Android 7 (SDK 25).
+                // Em Android mais novo, especialmente no emulador/celular, a arvore e estavel
+                // e e mais seguro localizar o botao real do que escalar uma coordenada de screenshot.
+                if (!largeSelfService && sdkLevel > 25)
+                {
+                    var loginUi = await ReadUiQuickAsync(serial, cancellationToken);
+                    var settingsNode = loginUi.Success && IsUiFromPackage(loginUi.Nodes, packageName)
+                        ? FindLegacySettingsButton(loginUi.Nodes)
+                        : null;
+
+                    if (settingsNode is not null)
+                    {
+                        settingsX = settingsNode.CenterX;
+                        settingsY = settingsNode.CenterY;
+                        settingsSource = string.IsNullOrWhiteSpace(settingsNode.ResourceId)
+                            ? "arvore da tela"
+                            : $"resource-id {settingsNode.ResourceId}";
+                    }
+                    else
+                    {
+                        // Alguns GPOS modernos (confirmado no Newland N950 / Android 12)
+                        // nao conseguem produzir o XML do UIAutomator na LoginActivity,
+                        // embora `dumpsys activity top` exponha a hierarquia nativa completa.
+                        // Nesse caso usamos o retangulo real de app:id/btn_config e acumulamos
+                        // os offsets dos pais (inclusive a barra de status) antes de tocar.
+                        var dumpSettings = await FindViewBoundsFromActivityDumpAsync(
+                            serial,
+                            "app:id/btn_config",
+                            cancellationToken);
+
+                        if (dumpSettings.Success)
+                        {
+                            settingsX = Math.Clamp(dumpSettings.CenterX, 1, display.Width - 1);
+                            settingsY = Math.Clamp(dumpSettings.CenterY, 1, display.Height - 1);
+                            settingsSource = "dumpsys activity top (app:id/btn_config)";
+                        }
+                        else
+                        {
+                            var settingsXRatio = 258d / 307d;
+                            var settingsYRatio = 265d / 672d;
+                            settingsX = Math.Clamp((int)Math.Round(display.Width * settingsXRatio), 1, display.Width - 1);
+                            settingsY = Math.Clamp((int)Math.Round(display.Height * settingsYRatio), 1, display.Height - 1);
+                            settingsSource = loginUi.Success
+                                ? "fallback proporcional (engrenagem nao exposta nas hierarquias Android)"
+                                : "fallback proporcional (hierarquias Android indisponiveis)";
+                        }
+                    }
+                }
+                else
+                {
+                    // Totem/AutoPagamento e Android 7 preservam o comportamento ja validado.
+                    var settingsXRatio = largeSelfService ? (1000d / 1080d) : (258d / 307d);
+                    var settingsYRatio = largeSelfService ? (477d / 1920d) : (265d / 672d);
+                    settingsX = Math.Clamp((int)Math.Round(display.Width * settingsXRatio), 1, display.Width - 1);
+                    settingsY = Math.Clamp((int)Math.Round(display.Height * settingsYRatio), 1, display.Height - 1);
+                }
+
+                progress?.Invoke(
+                    "legacy-settings-tap",
+                    $"LoginActivity confirmada. Acionando a engrenagem em {settingsX},{settingsY} via {settingsSource}.");
+
+                var tapSettings = await _adb.TapAsync(serial, settingsX, settingsY, cancellationToken);
+                if (!tapSettings.Success)
+                {
+                    return new SmartAutomationResult(
+                        false,
+                        packageName,
+                        "legacy-settings-tap",
+                        "Nao foi possivel acionar a engrenagem do Smart 8.0 pelo ADB.",
+                        foregroundActivity,
+                        string.Empty);
+                }
+
+                var configurationActivity = await WaitForLegacyCompanyActivityAsync(
+                    serial,
+                    packageName,
+                    sdkLevel,
+                    settingsX,
+                    settingsY,
+                    progress,
+                    cancellationToken);
+
+                if (!IsLegacyCompanyActivity(configurationActivity))
+                {
+                    return new SmartAutomationResult(
+                        false,
+                        packageName,
+                        "legacy-settings-open",
+                        string.IsNullOrWhiteSpace(configurationActivity)
+                            ? "A engrenagem foi acionada, mas a EmpresaActivity do Smart 8.0 nao apareceu."
+                            : $"A engrenagem foi acionada, mas a Activity esperada nao abriu. Activity atual: {configurationActivity}.",
+                        configurationActivity,
+                        string.Empty);
+                }
+
+                progress?.Invoke(
+                    "legacy-settings-open",
+                    "EmpresaActivity aberta. O Smart 8.0 permanecera sem UIAutomator nesta tela para evitar perda de foco no Android 7.");
+
+                // Essa equivalencia foi confirmada somente no Android 7. Em Android 8+
+                // o ANDROID_ID e escopado pela assinatura do APK e o shell retorna outro
+                // valor; portanto ele nunca pode substituir o ID real do Smart.
+                if (sdkLevel <= 25)
+                {
+                    smartDeviceId = FirstNonEmpty(
+                        smartDeviceId,
+                        await GetAndroidIdFallbackAsync(serial, cancellationToken));
+                }
+                progress?.Invoke(
+                    "legacy-settings",
+                    string.IsNullOrWhiteSpace(smartDeviceId)
+                        ? "Tela Configurar Empresas aberta. O Android moderno nao permite usar o ANDROID_ID do shell como Device ID do Smart."
+                        : $"Tela Configurar Empresas aberta. Device ID autoritativo disponivel: {smartDeviceId}.");
+
+                // IMPORTANTE: no Android 7 deste Smart 8.0, o uiautomator pode retirar o
+                // aplicativo do primeiro plano mesmo na EmpresaActivity. O botao NOVA
+                // EMPRESA ja foi mapeado no aparelho de referencia: bounds
+                // [540,1771][1059,1835] em 1080x1920, centro aproximado 800,1803.
+                // Portanto acionamos diretamente o ponto proporcional, mas somente depois
+                // de confirmar por dumpsys que a EmpresaActivity ainda esta em primeiro plano.
+                var activityBeforeNewCompany = await GetLegacySmartActivityAsync(serial, cancellationToken);
+                if (!IsLegacyCompanyActivity(activityBeforeNewCompany))
+                {
+                    return new SmartAutomationResult(
+                        false,
+                        packageName,
+                        "legacy-new-company",
+                        $"A tela Configurar Empresas foi aberta, mas deixou de estar em primeiro plano antes de Nova Empresa. Activity atual: {activityBeforeNewCompany}.",
+                        activityBeforeNewCompany,
+                        smartDeviceId);
+                }
+
+                var newCompanyDisplay = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
+                if (!newCompanyDisplay.Success)
+                {
+                    return new SmartAutomationResult(
+                        false,
+                        packageName,
+                        "legacy-new-company",
+                        "A tela Configurar Empresas foi aberta, mas nao foi possivel obter a resolucao do Android para acionar Nova Empresa.",
+                        activityBeforeNewCompany,
+                        smartDeviceId);
+                }
+
+                var largeSelfServiceNewCompany = IsLegacy80LargeSelfServiceModule(module);
+                var newCompanyXRatio = largeSelfServiceNewCompany ? (800d / 1080d) : (223d / 304d);
+                var newCompanyYRatio = largeSelfServiceNewCompany ? (1803d / 1920d) : (634d / 676d);
+                var newCompanyX = Math.Clamp((int)Math.Round(newCompanyDisplay.Width * newCompanyXRatio), 1, newCompanyDisplay.Width - 1);
+                var newCompanyY = Math.Clamp((int)Math.Round(newCompanyDisplay.Height * newCompanyYRatio), 1, newCompanyDisplay.Height - 1);
+                var newCompanySource = "ponto proporcional mapeado";
+
+                if (!largeSelfServiceNewCompany && sdkLevel > 25)
+                {
+                    var newCompanyBounds = await FindViewBoundsFromActivityDumpAsync(
+                        serial,
+                        "app:id/btn_novo",
+                        cancellationToken);
+                    if (IsActivityPointInsideDisplay(newCompanyBounds, newCompanyDisplay))
+                    {
+                        newCompanyX = newCompanyBounds.CenterX;
+                        newCompanyY = newCompanyBounds.CenterY;
+                        newCompanySource = "dumpsys activity top (app:id/btn_novo)";
+                    }
+                }
+
+                await Task.Delay(450, cancellationToken);
+                activityBeforeNewCompany = await GetLegacySmartActivityAsync(serial, cancellationToken);
+                if (!IsLegacyCompanyActivity(activityBeforeNewCompany))
+                {
+                    return new SmartAutomationResult(
+                        false,
+                        packageName,
+                        "legacy-new-company",
+                        $"A EmpresaActivity nao permaneceu estavel ate o clique em Nova Empresa. Activity atual: {activityBeforeNewCompany}.",
+                        activityBeforeNewCompany,
+                        smartDeviceId);
+                }
+
+                progress?.Invoke(
+                    "legacy-new-company",
+                    $"EmpresaActivity confirmada. Acionando Nova Empresa em {newCompanyX},{newCompanyY} via {newCompanySource}...");
+
+                var tapNewCompany = await _adb.TapAsync(
+                    serial,
+                    newCompanyX,
+                    newCompanyY,
+                    cancellationToken);
+
+                if (!tapNewCompany.Success)
+                {
+                    return new SmartAutomationResult(
+                        false,
+                        packageName,
+                        "legacy-new-company",
+                        "Nao foi possivel acionar Nova Empresa pelo ADB.",
+                        tapNewCompany.CombinedOutput.Trim(),
+                        smartDeviceId);
+                }
+
+                // O mapeamento completo confirmou que NOVA EMPRESA abre
+                // EmpresaAddConfigActivity. Usamos a Activity como primeira validacao e
+                // somente depois lemos a arvore da tela. Isso evita confundir a lista de
+                // empresas com a selecao de modulo do Smart 8.0.
+                var addConfigActivity = await WaitForLegacyActivityAsync(
+                    serial,
+                    IsLegacyCompanyAddConfigActivity,
+                    20,
+                    cancellationToken);
+
+                if (!IsLegacyCompanyAddConfigActivity(addConfigActivity))
+                {
+                    return new SmartAutomationResult(
+                        false,
+                        packageName,
+                        "legacy-new-company-open",
+                        string.IsNullOrWhiteSpace(addConfigActivity)
+                            ? "Nova Empresa foi acionado, mas a EmpresaAddConfigActivity nao apareceu."
+                            : $"Nova Empresa foi acionado, mas a Activity esperada nao abriu. Activity atual: {addConfigActivity}.",
+                        addConfigActivity,
+                        smartDeviceId);
+                }
+
+                // Nao lemos a arvore da EmpresaAddConfigActivity aqui. No K2_MINI / Android 7
+                // o UIAutomator tambem pode interferir nessa tela e fazer o Smart recuar/fechar.
+                // O fluxo especializado decide se pode usar acessibilidade (celular/GPOS) ou se
+                // deve seguir apenas por Activity + pontos proporcionais (Totem/AutoPagamento).
+                snapshot = new UiSnapshot(false, Array.Empty<UiNode>(), string.Empty);
+
+                progress?.Invoke(
+                    "legacy-new-company-open",
+                    "Tela Nova Empresa aberta. Iniciando o fluxo mapeado do Smart 8.0: modulo -> Confirmar -> DIGITAR -> Host.");
+
+                return await SubmitDeviceUrlLegacy80Async(
+                    serial,
+                    url,
+                    module,
+                    packageName,
+                    snapshot,
+                    smartDeviceId,
+                    progress,
+                    beforeSubmitAsync,
+                    cancellationToken);
+            }
+            else if (IsLegacySmartPackageActivity(foregroundActivity))
+            {
+                // O UIAutomator so e permitido depois que dumpsys confirmou que o primeiro
+                // plano pertence de fato ao softcom.mobile.smart2 e nao e a LoginActivity.
+                progress?.Invoke(
+                    "legacy-activity",
+                    $"Activity do Smart 8.0 confirmada antes da leitura da interface: {foregroundActivity}.");
+                snapshot = await WaitForReadableUiAsync(serial, 10, cancellationToken);
+            }
+            else
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy-launch-wait",
+                    string.IsNullOrWhiteSpace(foregroundActivity)
+                        ? "O Smart 8.0 foi iniciado, mas nenhuma Activity do softcom.mobile.smart2 ficou em primeiro plano. A automacao foi interrompida sem executar UIAutomator na tela de login."
+                        : $"O Smart 8.0 foi iniciado, mas a Activity do package nao estabilizou. Primeiro plano observado: {foregroundActivity}. A automacao foi interrompida sem executar UIAutomator.",
+                    foregroundActivity,
+                    smartDeviceId);
+            }
+        }
+        else
+        {
+            // Em 8.1+ mantemos exatamente o comportamento ja validado.
+            snapshot = await WaitForReadableUiAsync(serial, 10, cancellationToken);
         }
 
-        var smartDeviceId = ExtractSmartDeviceId(snapshot.Nodes);
+        if (!snapshot.Success)
+        {
+            return new SmartAutomationResult(false, packageName, "ui", snapshot.Error, string.Empty, smartDeviceId);
+        }
+
+        // Em Smart legado, nenhum toque adicional e executado se a arvore atual nao
+        // pertencer ao package esperado. A excecao e a LoginActivity acima, validada
+        // exclusivamente por dumpsys antes do toque mapeado na engrenagem.
+        if (isLegacySmart && !IsUiFromPackage(snapshot.Nodes, packageName))
+        {
+            var foreground = await _adb.GetForegroundPackageAsync(serial, cancellationToken);
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy-launch-verify",
+                string.IsNullOrWhiteSpace(foreground)
+                    ? "A interface atual nao pertence ao package softcom.mobile.smart2. A automacao foi interrompida sem tocar em outro aplicativo."
+                    : $"O primeiro plano atual e {foreground}. A automacao foi interrompida sem tocar em outro aplicativo.",
+                BuildSummary(snapshot.Nodes),
+                smartDeviceId);
+        }
+
+        smartDeviceId = FirstNonEmpty(smartDeviceId, ExtractSmartDeviceId(snapshot.Nodes));
+
+        // O Smart 8.1 possui dois caminhos diferentes:
+        // 1) onboarding/primeira configuracao: Bem-vindo -> Selecione o modulo -> Configurar modulo.
+        //    Esse e o fluxo que ja estava validado na v1.0.2 e deve continuar sendo usado,
+        //    inclusive para Smart Comanda e Smart Autopagamento via SelfHost.
+        // 2) Smart ja fora do onboarding: Configuracoes -> Nova Empresa -> DIGITAR.
+        //
+        // A regressao da v1.0.3 ocorria porque qualquer 8.1+ era enviado diretamente para
+        // Nova Empresa, mesmo quando a tela real era "Selecione o modulo".
+        var isSmart81 = string.Equals(smartFlow, "Smart 8.1+", StringComparison.OrdinalIgnoreCase);
+        var moduleLabel = GetModuleLabel(module);
+        var isInitialProvisioning = IsInitialProvisioningState(snapshot.Nodes, moduleLabel);
+
+        if (isSmart81 && !isInitialProvisioning)
+        {
+            return await SubmitDeviceUrlSmart81Async(
+                serial,
+                url,
+                module,
+                packageName,
+                snapshot,
+                smartDeviceId,
+                progress,
+                beforeSubmitAsync,
+                cancellationToken);
+        }
+
+        if (isSmart81 && isInitialProvisioning)
+        {
+            progress?.Invoke(
+                "smart81-onboarding",
+                $"Smart 8.1+ em configuracao inicial. Mantendo o fluxo validado da v1.0.2 para {moduleLabel}: selecao de modulo -> Avancar -> URL.");
+        }
+
+        // A LoginActivity do Smart 8.0 ja foi tratada antes da primeira chamada ao
+        // UIAutomator. Se chegamos aqui, estamos em uma tela que pode ser lida normalmente.
 
         // Tela inicial do Smart: "Bem vindo ao Smart!" -> "Iniciar Configuracao".
         if (ContainsLabel(snapshot.Nodes, "bem vindo ao smart") ||
@@ -170,7 +592,6 @@ public sealed class SmartUiAutomationService
         // Tela "Selecione o modulo".
         if (ContainsLabel(snapshot.Nodes, "selecione o modulo"))
         {
-            var moduleLabel = GetModuleLabel(module);
             progress?.Invoke("module", $"Selecionando o modulo {moduleLabel}...");
 
             var moduleCard = FindByLabels(snapshot.Nodes, new[] { moduleLabel });
@@ -234,6 +655,18 @@ public sealed class SmartUiAutomationService
                     BuildSummary(snapshot.Nodes),
                     smartDeviceId);
             }
+        }
+
+        if (isLegacySmart &&
+            (!IsUiFromPackage(snapshot.Nodes, packageName) || !IsLegacySmartConfigurationScreen(snapshot.Nodes)))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy-ui-state",
+                "O Smart legado nao esta na tela de configuracao esperada. A automacao foi interrompida antes de qualquer toque adicional.",
+                BuildSummary(snapshot.Nodes),
+                smartDeviceId);
         }
 
         // Neste ponto o Smart ja informou o Device ID real usado pelo Softcomshop.
@@ -409,6 +842,1838 @@ public sealed class SmartUiAutomationService
             $"Modulo {GetModuleLabel(module)} selecionado, URL informada e confirmacao acionada no Smart.",
             finalSnapshot.Success ? BuildSummary(finalSnapshot.Nodes) : string.Empty,
             smartDeviceId);
+    }
+
+    private async Task<SmartAutomationResult> SubmitDeviceUrlLegacy80Async(
+        string serial,
+        string url,
+        string module,
+        string packageName,
+        UiSnapshot snapshot,
+        string smartDeviceId,
+        Action<string, string>? progress,
+        Func<string, Task>? beforeSubmitAsync,
+        CancellationToken cancellationToken)
+    {
+        var moduleLabel = GetModuleLabel(module);
+        progress?.Invoke(
+            "legacy80",
+            $"Smart 8.0 detectado. Usando o fluxo mapeado: Nova Empresa -> {moduleLabel} -> Confirmar -> DIGITAR -> Host -> Confirmar 5s -> Confirmar final.");
+
+        var currentActivity = await WaitForLegacyActivityAsync(
+            serial,
+            IsLegacyCompanyAddConfigActivity,
+            12,
+            cancellationToken);
+
+        if (!IsLegacyCompanyAddConfigActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-module-screen",
+                string.IsNullOrWhiteSpace(currentActivity)
+                    ? "A tela Nova Empresa foi aberta, mas a EmpresaAddConfigActivity nao permaneceu em primeiro plano."
+                    : $"A tela Nova Empresa foi aberta, mas a Activity atual e {currentActivity}.",
+                snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                smartDeviceId);
+        }
+
+        // Totem e AutoPagamento usam o perfil de tela grande ja validado no K2_MINI.
+        if (IsLegacy80LargeSelfServiceModule(module))
+        {
+            return await SubmitDeviceUrlLegacy80LargeSelfServiceAsync(
+                serial,
+                url,
+                module,
+                packageName,
+                smartDeviceId,
+                progress,
+                beforeSubmitAsync,
+                cancellationToken);
+        }
+
+        // Demais modulos usam o perfil celular/GPOS. As telas reais enviadas pelo
+        // usuario mostram que o layout e diferente do Totem ja na LoginActivity.
+        // Para evitar a mesma regressao causada por uiautomator dump no Smart 8.0,
+        // o caminho movel tambem usa Activity + pontos proporcionais nas etapas criticas.
+        return await SubmitDeviceUrlLegacy80MobileAsync(
+            serial,
+            url,
+            module,
+            packageName,
+            smartDeviceId,
+            progress,
+            beforeSubmitAsync,
+            cancellationToken);
+    }
+
+    private async Task<SmartAutomationResult> SubmitDeviceUrlLegacy80MobileAsync(
+        string serial,
+        string url,
+        string module,
+        string packageName,
+        string smartDeviceId,
+        Action<string, string>? progress,
+        Func<string, Task>? beforeSubmitAsync,
+        CancellationToken cancellationToken)
+    {
+        var moduleLabel = GetModuleLabel(module);
+        var display = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
+        if (!display.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-display",
+                "A tela de selecao do modulo foi aberta, mas nao foi possivel consultar a resolucao do Android.",
+                display.Message,
+                smartDeviceId);
+        }
+
+        var currentActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddConfigActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-module-screen",
+                $"A selecao do modulo nao esta mais na EmpresaAddConfigActivity. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        var sdkLevel = await GetAndroidSdkLevelAsync(serial, cancellationToken);
+
+        // Referencia real do celular/GPOS: 304x674.
+        // A lista de modulos aparece sempre na mesma ordem no Smart 8.0.x.
+        var moduleX = Math.Clamp((int)Math.Round(display.Width * (268d / 304d)), 1, display.Width - 1);
+        var moduleY = Math.Clamp((int)Math.Round(display.Height * (GetLegacy80MobileModuleReferenceY(module) / 674d)), 1, display.Height - 1);
+        var firstConfirmX = Math.Clamp((int)Math.Round(display.Width * (223d / 304d)), 1, display.Width - 1);
+        var firstConfirmY = Math.Clamp((int)Math.Round(display.Height * (636d / 674d)), 1, display.Height - 1);
+        var moduleSource = "ponto proporcional mapeado";
+        var firstConfirmSource = "ponto proporcional mapeado";
+
+        if (sdkLevel > 25)
+        {
+            var moduleResourceId = GetLegacy80ModuleResourceId(module);
+            if (!string.IsNullOrWhiteSpace(moduleResourceId))
+            {
+                var moduleBounds = await FindViewBoundsFromActivityDumpAsync(
+                    serial,
+                    moduleResourceId,
+                    cancellationToken);
+                if (IsActivityPointInsideDisplay(moduleBounds, display))
+                {
+                    moduleX = moduleBounds.CenterX;
+                    moduleY = moduleBounds.CenterY;
+                    moduleSource = $"dumpsys activity top ({moduleResourceId})";
+                }
+            }
+
+            var firstConfirmBounds = await FindViewBoundsFromActivityDumpAsync(
+                serial,
+                "app:id/btn_confirmar",
+                cancellationToken);
+            if (IsActivityPointInsideDisplay(firstConfirmBounds, display))
+            {
+                firstConfirmX = firstConfirmBounds.CenterX;
+                firstConfirmY = firstConfirmBounds.CenterY;
+                firstConfirmSource = "dumpsys activity top (app:id/btn_confirmar)";
+            }
+        }
+
+        if (string.Equals(module, "smart_pdv", StringComparison.OrdinalIgnoreCase))
+        {
+            // Nova Empresa abre com Smart PDV ja selecionado. Tocar novamente no switch
+            // poderia desmarcar o modulo, entao apenas preservamos a selecao padrao.
+            progress?.Invoke(
+                "legacy80-mobile-module",
+                "Smart PDV ja vem selecionado ao abrir Nova Empresa. Mantendo a selecao atual sem tocar no switch.");
+        }
+        else
+        {
+            progress?.Invoke(
+                "legacy80-mobile-module",
+                $"Perfil celular/GPOS: selecionando {moduleLabel} em {moduleX},{moduleY} via {moduleSource}...");
+
+            var moduleTap = await _adb.TapAsync(serial, moduleX, moduleY, cancellationToken);
+            if (!moduleTap.Success)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-mobile-module",
+                    $"Nao foi possivel selecionar {moduleLabel} no Smart 8.0.",
+                    moduleTap.CombinedOutput.Trim(),
+                    smartDeviceId);
+            }
+
+            await Task.Delay(450, cancellationToken);
+            currentActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+            if (!IsLegacyCompanyAddConfigActivity(currentActivity))
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-mobile-module",
+                    $"O toque de selecao do modulo foi executado, mas a EmpresaAddConfigActivity deixou o primeiro plano antes de Confirmar. Activity atual: {currentActivity}.",
+                    currentActivity,
+                    smartDeviceId);
+            }
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-module-confirm",
+            $"{moduleLabel} selecionado. Acionando Confirmar uma unica vez em {firstConfirmX},{firstConfirmY} via {firstConfirmSource}...");
+
+        var firstConfirmTap = await _adb.TapAsync(serial, firstConfirmX, firstConfirmY, cancellationToken);
+        if (!firstConfirmTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-module-confirm",
+                "Nao foi possivel acionar o Confirmar da selecao do modulo.",
+                firstConfirmTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        // Android moderno reporta a Activity de primeiro plano de forma mais confiavel
+        // pelo WindowManager. No Android 7 mantemos o caminho legado porque o launcher
+        // pode aparecer temporariamente durante as transicoes.
+        var deviceActivity = sdkLevel > 25
+            ? await WaitForForegroundActivityAsync(serial, IsLegacyCompanyAddActivity, 30, cancellationToken)
+            : await WaitForLegacyActivityAsync(serial, IsLegacyCompanyAddActivity, 30, cancellationToken);
+
+        if (!IsLegacyCompanyAddActivity(deviceActivity) && sdkLevel > 25)
+        {
+            // Fallback adicional apenas para diagnostico/compatibilidade: se o WindowManager
+            // nao refletir a transicao, consulta o ActivityManager antes de desistir.
+            deviceActivity = await WaitForLegacyActivityAsync(
+                serial,
+                IsLegacyCompanyAddActivity,
+                8,
+                cancellationToken);
+        }
+
+        if (!IsLegacyCompanyAddActivity(deviceActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-device-screen",
+                string.IsNullOrWhiteSpace(deviceActivity)
+                    ? "O modulo foi confirmado, mas a EmpresaAddActivity nao apareceu. O botao DIGITAR nao sera acionado ate essa tela ser confirmada."
+                    : $"O modulo foi confirmado, mas a EmpresaAddActivity nao foi confirmada. Activity atual: {deviceActivity}. O botao DIGITAR nao sera acionado ate essa tela ser confirmada.",
+                deviceActivity,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-device-screen",
+            $"EmpresaAddActivity confirmada em primeiro plano ({deviceActivity}). Iniciando agora a etapa obrigatoria DIGITAR -> Host...");
+
+        await Task.Delay(450, cancellationToken);
+
+        // Mapeamento real do Smart 8.0 em celular/GPOS (incluindo Android 17):
+        // a EmpresaAddActivity permanece a mesma antes e depois de DIGITAR, e o
+        // UIAutomator nao fornece um estado confiavel para confirmar essa transicao.
+        // O sinal confiavel aparece somente depois de tocar no Host: o IME passa de
+        // oculto para visivel. Portanto esta etapa NAO usa UIAutomator em nenhuma
+        // versao do Android. Executamos DIGITAR -> Host por pontos proporcionais e
+        // so seguimos quando o teclado realmente estiver visivel.
+        // Referencia real da tela Configuracao em celular/GPOS: 304x678.
+        // Centro medido do botao DIGITAR na captura real 304x678: ~225,115.
+        var typeX = Math.Clamp((int)Math.Round(display.Width * (225d / 304d)), 1, display.Width - 1);
+        var typeY = Math.Clamp((int)Math.Round(display.Height * (115d / 678d)), 1, display.Height - 1);
+        var hostX = Math.Clamp((int)Math.Round(display.Width * (152d / 304d)), 1, display.Width - 1);
+        var hostY = Math.Clamp((int)Math.Round(display.Height * (274d / 678d)), 1, display.Height - 1);
+        var confirmX = Math.Clamp((int)Math.Round(display.Width * (224d / 304d)), 1, display.Width - 1);
+        var confirmY = Math.Clamp((int)Math.Round(display.Height * (318d / 678d)), 1, display.Height - 1);
+        var typeSource = "ponto proporcional mapeado";
+        var hostSource = "ponto proporcional mapeado";
+        var confirmSource = "ponto proporcional mapeado";
+
+        if (sdkLevel > 25)
+        {
+            var typeBounds = await FindViewBoundsFromActivityDumpAsync(
+                serial,
+                "app:id/btn_digitar",
+                cancellationToken);
+            if (IsActivityPointInsideDisplay(typeBounds, display))
+            {
+                typeX = typeBounds.CenterX;
+                typeY = typeBounds.CenterY;
+                typeSource = "dumpsys activity top (app:id/btn_digitar)";
+            }
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-type",
+            $"EmpresaAddActivity aberta. Acionando DIGITAR em {typeX},{typeY} via {typeSource} antes de acessar o Host...");
+        var typeTap = await _adb.TapAsync(serial, typeX, typeY, cancellationToken);
+        if (!typeTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-type",
+                "Nao foi possivel acionar DIGITAR no Smart 8.0.",
+                typeTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        await Task.Delay(650, cancellationToken);
+        currentActivity = sdkLevel > 25
+            ? await GetForegroundActivityAsync(serial, cancellationToken)
+            : await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-type",
+                $"O toque em DIGITAR foi enviado, mas a EmpresaAddActivity deixou o primeiro plano. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        if (sdkLevel > 25)
+        {
+            var hostBounds = await FindViewBoundsFromActivityDumpAsync(
+                serial,
+                "app:id/text_host",
+                cancellationToken);
+            if (IsActivityPointInsideDisplay(hostBounds, display))
+            {
+                hostX = hostBounds.CenterX;
+                hostY = hostBounds.CenterY;
+                hostSource = "dumpsys activity top (app:id/text_host)";
+            }
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-host-focus",
+            $"DIGITAR acionado. Selecionando o campo Host em {hostX},{hostY} via {hostSource} e validando o modo de edicao antes de alterar o conteudo...");
+
+        var hostTap = await _adb.TapAsync(serial, hostX, hostY, cancellationToken);
+        if (!hostTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-host-focus",
+                "Nao foi possivel selecionar o campo Host depois de acionar DIGITAR.",
+                hostTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        await Task.Delay(400, cancellationToken);
+        var editingActive = await _adb.IsSoftKeyboardVisibleAsync(serial, cancellationToken);
+        if (!editingActive)
+        {
+            progress?.Invoke(
+                "legacy80-mobile-type-retry",
+                "O Host ainda nao entrou em edicao. Repetindo DIGITAR e Host uma unica vez antes de continuar...");
+
+            currentActivity = sdkLevel > 25
+                ? await GetForegroundActivityAsync(serial, cancellationToken)
+                : await GetLegacySmartActivityAsync(serial, cancellationToken);
+            if (!IsLegacyCompanyAddActivity(currentActivity))
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-mobile-type-retry",
+                    $"Antes da segunda tentativa de DIGITAR, a EmpresaAddActivity deixou o primeiro plano. Activity atual: {currentActivity}.",
+                    currentActivity,
+                    smartDeviceId);
+            }
+
+            var retryTypeTap = await _adb.TapAsync(serial, typeX, typeY, cancellationToken);
+            if (!retryTypeTap.Success)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-mobile-type-retry",
+                    "Nao foi possivel repetir o toque em DIGITAR.",
+                    retryTypeTap.CombinedOutput.Trim(),
+                    smartDeviceId);
+            }
+
+            await Task.Delay(650, cancellationToken);
+            var retryHostTap = await _adb.TapAsync(serial, hostX, hostY, cancellationToken);
+            if (!retryHostTap.Success)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-mobile-host-focus",
+                    "DIGITAR foi repetido, mas nao foi possivel selecionar o Host.",
+                    retryHostTap.CombinedOutput.Trim(),
+                    smartDeviceId);
+            }
+
+            await Task.Delay(400, cancellationToken);
+            editingActive = await _adb.IsSoftKeyboardVisibleAsync(serial, cancellationToken);
+            if (!editingActive)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-mobile-host-focus",
+                    "O Smart permaneceu na tela de configuracao, mas DIGITAR nao ativou a edicao do Host apos duas tentativas. Nenhum conteudo foi apagado e o fluxo foi interrompido nesta etapa.",
+                    currentActivity,
+                    smartDeviceId);
+            }
+        }
+
+        if (sdkLevel <= 25)
+        {
+            smartDeviceId = FirstNonEmpty(smartDeviceId, await GetAndroidIdFallbackAsync(serial, cancellationToken));
+        }
+        if (beforeSubmitAsync is not null)
+        {
+            if (string.IsNullOrWhiteSpace(smartDeviceId))
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-mobile-device-id",
+                    "O Device ID do Smart 8.0 nao foi localizado antes de enviar a URL.",
+                    currentActivity,
+                    string.Empty);
+            }
+
+            await beforeSubmitAsync(smartDeviceId);
+        }
+
+        if (sdkLevel > 25)
+        {
+            var confirmBounds = await FindViewBoundsFromActivityDumpAsync(
+                serial,
+                "app:id/btn_confirmar",
+                cancellationToken);
+            if (IsActivityPointInsideDisplay(confirmBounds, display))
+            {
+                confirmX = confirmBounds.CenterX;
+                confirmY = confirmBounds.CenterY;
+                confirmSource = "dumpsys activity top (app:id/btn_confirmar)";
+            }
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-host",
+            "Host em modo de edicao confirmado. Selecionando tudo, apagando o conteudo atual e informando a URL de vinculo...");
+        var clear = await _adb.ClearFocusedTextAsync(serial, 128, cancellationToken);
+        if (!clear.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-host",
+                "Nao foi possivel selecionar tudo e limpar o Host atual.",
+                clear.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        var clearRemainder = await _adb.ClearFocusedTextAsync(serial, 128, cancellationToken);
+        if (!clearRemainder.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-host",
+                "A primeira limpeza do Host foi executada, mas a segunda passagem de seguranca falhou.",
+                clearRemainder.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        var input = await _adb.InputTextAsync(serial, url, cancellationToken);
+        if (!input.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-host",
+                string.IsNullOrWhiteSpace(input.CombinedOutput)
+                    ? "Nao foi possivel informar a URL no campo Host."
+                    : input.CombinedOutput.Trim(),
+                currentActivity,
+                smartDeviceId);
+        }
+
+        // Nao envia KEYCODE_BACK para fechar o teclado neste fluxo. No Smart 8.0
+        // esse comando pode ser interpretado como VOLTAR e retornar para a selecao do modulo.
+        // O processo manual validado mantem o teclado aberto e segue direto para Confirmar.
+        await Task.Delay(350, cancellationToken);
+
+        currentActivity = sdkLevel > 25
+            ? await GetForegroundActivityAsync(serial, cancellationToken)
+            : await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-hold-confirm",
+                $"A URL foi informada, mas a EmpresaAddActivity deixou o primeiro plano antes do Confirmar. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-hold-confirm",
+            $"Mantendo Confirmar pressionado por 5 segundos em {confirmX},{confirmY} via {confirmSource}...");
+        var hold = await _adb.LongPressAsync(serial, confirmX, confirmY, 5000, cancellationToken);
+        if (!hold.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-hold-confirm",
+                "O ADB nao conseguiu executar o toque prolongado de 5 segundos em Confirmar.",
+                hold.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        await Task.Delay(1400, cancellationToken);
+        currentActivity = sdkLevel > 25
+            ? await GetForegroundActivityAsync(serial, cancellationToken)
+            : await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-review",
+                $"O toque prolongado foi executado, mas a tela de revisao nao permaneceu na EmpresaAddActivity. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-final-confirm",
+            "Toque prolongado concluido. Acionando o Confirmar final uma unica vez...");
+        var finalTap = await _adb.TapAsync(serial, confirmX, confirmY, cancellationToken);
+        if (!finalTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-final-confirm",
+                "Nao foi possivel acionar o Confirmar final do Smart 8.0.",
+                finalTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        return await CompleteLegacy80SynchronizationAsync(
+            serial,
+            packageName,
+            module,
+            smartDeviceId,
+            progress,
+            cancellationToken);
+    }
+
+    private async Task<SmartAutomationResult> SubmitDeviceUrlLegacy80MobileModernFinalAsync(
+        string serial,
+        string url,
+        string module,
+        string packageName,
+        string smartDeviceId,
+        Action<string, string>? progress,
+        Func<string, Task>? beforeSubmitAsync,
+        CancellationToken cancellationToken)
+    {
+        // 1) Nesta tela DIGITAR precisa ser uma etapa real, nao apenas um toque enviado.
+        var snapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => IsUiFromPackage(nodes, packageName) &&
+                     FindByLabelsIncludingText(nodes, new[] { "digitar", "digitar dados manualmente" }) is not null &&
+                     ContainsLabel(nodes, "host"),
+            12,
+            cancellationToken);
+
+        var typeNode = snapshot.Success
+            ? FindByLabelsIncludingText(snapshot.Nodes, new[] { "digitar", "digitar dados manualmente" })
+            : null;
+        if (typeNode is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-type",
+                "A tela final de configuracao abriu, mas o botao DIGITAR nao foi localizado. O Host nao sera alterado.",
+                snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-type",
+            $"Botao DIGITAR localizado pela interface em {typeNode.CenterX},{typeNode.CenterY}. Acionando antes de acessar o Host...");
+
+        var typeTap = await _adb.TapAsync(serial, typeNode.CenterX, typeNode.CenterY, cancellationToken);
+        if (!typeTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-type",
+                "Nao foi possivel acionar DIGITAR no Smart 8.0.",
+                typeTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        // 2) So avanca quando o Host realmente virar um campo editavel.
+        var editSnapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => IsUiFromPackage(nodes, packageName) && FindSmart81HostEditable(nodes) is not null,
+            10,
+            cancellationToken);
+
+        var hostEdit = editSnapshot.Success ? FindSmart81HostEditable(editSnapshot.Nodes) : null;
+        if (hostEdit is null)
+        {
+            // Uma unica segunda tentativa, novamente pelo botao real da tela.
+            var retrySnapshot = await ReadUiQuickAsync(serial, cancellationToken);
+            var retryType = retrySnapshot.Success
+                ? FindByLabelsIncludingText(retrySnapshot.Nodes, new[] { "digitar", "digitar dados manualmente" })
+                : null;
+
+            if (retryType is not null)
+            {
+                progress?.Invoke(
+                    "legacy80-mobile-type-retry",
+                    "DIGITAR foi acionado, mas o Host ainda nao ficou editavel. Repetindo o clique em DIGITAR uma unica vez...");
+                await _adb.TapAsync(serial, retryType.CenterX, retryType.CenterY, cancellationToken);
+                editSnapshot = await WaitForUiStateAsync(
+                    serial,
+                    nodes => IsUiFromPackage(nodes, packageName) && FindSmart81HostEditable(nodes) is not null,
+                    8,
+                    cancellationToken);
+                hostEdit = editSnapshot.Success ? FindSmart81HostEditable(editSnapshot.Nodes) : null;
+            }
+        }
+
+        if (hostEdit is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-type",
+                "DIGITAR nao ativou o modo de edicao: o campo Host nao apareceu como editavel. A automacao foi interrompida antes de apagar ou informar a URL.",
+                editSnapshot.Success ? BuildSummary(editSnapshot.Nodes) : editSnapshot.Error,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-host-focus",
+            $"DIGITAR confirmado. Host editavel localizado em {hostEdit.CenterX},{hostEdit.CenterY}. Selecionando o campo...");
+
+        var hostTap = await _adb.TapAsync(serial, hostEdit.CenterX, hostEdit.CenterY, cancellationToken);
+        if (!hostTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-host-focus",
+                "DIGITAR foi confirmado, mas nao foi possivel focar o campo Host.",
+                hostTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        await Task.Delay(350, cancellationToken);
+
+        if (beforeSubmitAsync is not null)
+        {
+            if (string.IsNullOrWhiteSpace(smartDeviceId))
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-mobile-device-id",
+                    "O Device ID do Smart 8.0 nao foi localizado antes de enviar a URL.",
+                    BuildSummary(editSnapshot.Nodes),
+                    string.Empty);
+            }
+
+            await beforeSubmitAsync(smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-host",
+            "Host em modo de edicao confirmado. Selecionando tudo, apagando o valor atual e informando a URL de vinculo...");
+
+        var clear = await _adb.ClearFocusedTextAsync(serial, 128, cancellationToken);
+        if (!clear.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-host",
+                "Nao foi possivel selecionar tudo e limpar o Host atual.",
+                clear.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        var clearRemainder = await _adb.ClearFocusedTextAsync(serial, 128, cancellationToken);
+        if (!clearRemainder.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-host",
+                "A primeira limpeza do Host foi executada, mas a segunda passagem de seguranca falhou.",
+                clearRemainder.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        var input = await _adb.InputTextAsync(serial, url, cancellationToken);
+        if (!input.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-host",
+                string.IsNullOrWhiteSpace(input.CombinedOutput)
+                    ? "Nao foi possivel informar a URL no campo Host."
+                    : input.CombinedOutput.Trim(),
+                BuildSummary(editSnapshot.Nodes),
+                smartDeviceId);
+        }
+
+        await Task.Delay(300, cancellationToken);
+        await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
+
+        // 3) O primeiro Confirmar tambem e localizado pela tela real.
+        var confirmSnapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => IsUiFromPackage(nodes, packageName) &&
+                     FindByLabelsIncludingText(nodes, new[] { "confirmar" }) is not null,
+            10,
+            cancellationToken);
+        var holdConfirm = confirmSnapshot.Success
+            ? FindByLabelsIncludingText(confirmSnapshot.Nodes, new[] { "confirmar" })
+            : null;
+        if (holdConfirm is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-hold-confirm",
+                "A URL foi informada, mas o botao Confirmar nao foi localizado para o toque prolongado.",
+                confirmSnapshot.Success ? BuildSummary(confirmSnapshot.Nodes) : confirmSnapshot.Error,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-hold-confirm",
+            $"URL informada. Mantendo Confirmar pressionado por 5 segundos em {holdConfirm.CenterX},{holdConfirm.CenterY}...");
+        var hold = await _adb.LongPressAsync(
+            serial,
+            holdConfirm.CenterX,
+            holdConfirm.CenterY,
+            5000,
+            cancellationToken);
+        if (!hold.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-hold-confirm",
+                "O ADB nao conseguiu executar o toque prolongado de 5 segundos em Confirmar.",
+                hold.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        // 4) So executa o segundo Confirmar depois que a revisao realmente aparecer.
+        var reviewSnapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => IsUiFromPackage(nodes, packageName) && IsLegacy80ConfirmationDetails(nodes),
+            12,
+            cancellationToken);
+        var finalConfirm = reviewSnapshot.Success
+            ? FindByLabelsIncludingText(reviewSnapshot.Nodes, new[] { "confirmar" })
+            : null;
+        if (finalConfirm is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-review",
+                "O Confirmar foi mantido pressionado, mas a tela de revisao com o Confirmar final nao foi localizada.",
+                reviewSnapshot.Success ? BuildSummary(reviewSnapshot.Nodes) : reviewSnapshot.Error,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-mobile-final-confirm",
+            "Tela de revisao confirmada. Acionando o Confirmar final uma unica vez...");
+        var finalTap = await _adb.TapAsync(serial, finalConfirm.CenterX, finalConfirm.CenterY, cancellationToken);
+        if (!finalTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-final-confirm",
+                "Nao foi possivel acionar o Confirmar final do Smart 8.0.",
+                finalTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        return await CompleteLegacy80SynchronizationAsync(
+            serial,
+            packageName,
+            module,
+            smartDeviceId,
+            progress,
+            cancellationToken);
+    }
+
+    private async Task<SmartAutomationResult> SubmitDeviceUrlLegacy80LargeSelfServiceAsync(
+        string serial,
+        string url,
+        string module,
+        string packageName,
+        string smartDeviceId,
+        Action<string, string>? progress,
+        Func<string, Task>? beforeSubmitAsync,
+        CancellationToken cancellationToken)
+    {
+        var moduleLabel = GetModuleLabel(module);
+        var sdkLevel = await GetAndroidSdkLevelAsync(serial, cancellationToken);
+        var display = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
+        if (!display.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-display",
+                "A tela de selecao do modulo foi aberta, mas nao foi possivel consultar a resolucao do Android.",
+                display.Message,
+                smartDeviceId);
+        }
+
+        var currentActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddConfigActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-module-screen",
+                $"A selecao do modulo nao esta mais na EmpresaAddConfigActivity. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        // Mapeamento real do dispositivo de autoatendimento 1080x1920.
+        // Os pontos abaixo sao escalados proporcionalmente pela resolucao atual.
+        // Nao usamos UIAutomator nesta etapa porque o dump pode fazer o Smart 8.0
+        // recuar ate a tela inicial no Android 7.
+        var moduleReferenceY = module.Equals("smart_totem", StringComparison.OrdinalIgnoreCase)
+            ? 403d
+            : 557d; // Smart AutoPagamento
+        var moduleX = Math.Clamp((int)Math.Round(display.Width * (1010d / 1080d)), 1, display.Width - 1);
+        var moduleY = Math.Clamp((int)Math.Round(display.Height * (moduleReferenceY / 1920d)), 1, display.Height - 1);
+        var firstConfirmX = Math.Clamp((int)Math.Round(display.Width * (810d / 1080d)), 1, display.Width - 1);
+        var firstConfirmY = Math.Clamp((int)Math.Round(display.Height * (1813d / 1920d)), 1, display.Height - 1);
+
+        progress?.Invoke(
+            "legacy80-large-module",
+            $"Tela grande detectada para {moduleLabel}. Selecionando o modulo no ponto mapeado {moduleX},{moduleY}, sem UIAutomator...");
+
+        var moduleTap = await _adb.TapAsync(serial, moduleX, moduleY, cancellationToken);
+        if (!moduleTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-module",
+                $"Nao foi possivel selecionar {moduleLabel} no Smart 8.0.",
+                moduleTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        await Task.Delay(450, cancellationToken);
+        currentActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddConfigActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-module",
+                $"O toque de selecao do modulo foi executado, mas a EmpresaAddConfigActivity deixou o primeiro plano antes de Confirmar. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-large-module-confirm",
+            $"{moduleLabel} selecionado. Acionando Confirmar uma unica vez em {firstConfirmX},{firstConfirmY}...");
+
+        var firstConfirmTap = await _adb.TapAsync(serial, firstConfirmX, firstConfirmY, cancellationToken);
+        if (!firstConfirmTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-module-confirm",
+                "Nao foi possivel acionar o Confirmar da selecao do modulo.",
+                firstConfirmTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        var deviceActivity = await WaitForLegacyActivityAsync(
+            serial,
+            IsLegacyCompanyAddActivity,
+            20,
+            cancellationToken);
+        if (!IsLegacyCompanyAddActivity(deviceActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-device-screen",
+                string.IsNullOrWhiteSpace(deviceActivity)
+                    ? "O modulo foi confirmado, mas a EmpresaAddActivity nao apareceu. A automacao foi interrompida sem voltar ou reiniciar o Smart."
+                    : $"O modulo foi confirmado, mas a EmpresaAddActivity nao abriu. Activity atual: {deviceActivity}. A automacao foi interrompida sem voltar ou reiniciar o Smart.",
+                deviceActivity,
+                smartDeviceId);
+        }
+
+        // Tela Configuracao (PDV) do Totem/AutoPagamento 8.0.
+        // Mapeamento 1080x1920: DIGITAR ~= 810,226; Host ~= 540,525;
+        // Confirmar ~= 810,606. Esses pontos tambem sao proporcionais.
+        var typeX = Math.Clamp((int)Math.Round(display.Width * (810d / 1080d)), 1, display.Width - 1);
+        var typeY = Math.Clamp((int)Math.Round(display.Height * (226d / 1920d)), 1, display.Height - 1);
+        var hostX = Math.Clamp((int)Math.Round(display.Width * (540d / 1080d)), 1, display.Width - 1);
+        var hostY = Math.Clamp((int)Math.Round(display.Height * (525d / 1920d)), 1, display.Height - 1);
+        var confirmX = Math.Clamp((int)Math.Round(display.Width * (810d / 1080d)), 1, display.Width - 1);
+        var confirmY = Math.Clamp((int)Math.Round(display.Height * (606d / 1920d)), 1, display.Height - 1);
+
+        progress?.Invoke(
+            "legacy80-large-type",
+            $"EmpresaAddActivity aberta. Acionando DIGITAR em {typeX},{typeY}, sem UIAutomator...");
+        var typeTap = await _adb.TapAsync(serial, typeX, typeY, cancellationToken);
+        if (!typeTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-type",
+                "Nao foi possivel acionar DIGITAR no Smart 8.0.",
+                typeTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        await Task.Delay(500, cancellationToken);
+        currentActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-host",
+                $"DIGITAR foi acionado, mas a EmpresaAddActivity deixou o primeiro plano. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        if (sdkLevel <= 25)
+        {
+            smartDeviceId = FirstNonEmpty(smartDeviceId, await GetAndroidIdFallbackAsync(serial, cancellationToken));
+        }
+        if (beforeSubmitAsync is not null)
+        {
+            if (string.IsNullOrWhiteSpace(smartDeviceId))
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "legacy80-large-device-id",
+                    "O Device ID do Smart 8.0 nao foi localizado antes de enviar a URL.",
+                    currentActivity,
+                    string.Empty);
+            }
+
+            await beforeSubmitAsync(smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-large-host",
+            $"Selecionando o campo Host em {hostX},{hostY}, limpando o conteudo e informando a URL de vinculo...");
+        var hostTap = await _adb.TapAsync(serial, hostX, hostY, cancellationToken);
+        if (!hostTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-host",
+                "Nao foi possivel selecionar o campo Host.",
+                hostTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        await Task.Delay(250, cancellationToken);
+        var clear = await _adb.ClearFocusedTextAsync(serial, 128, cancellationToken);
+        if (!clear.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-host",
+                "Nao foi possivel selecionar tudo e limpar o Host atual.",
+                clear.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        var clearRemainder = await _adb.ClearFocusedTextAsync(serial, 128, cancellationToken);
+        if (!clearRemainder.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-host",
+                "A primeira limpeza do Host foi executada, mas a segunda passagem de seguranca falhou.",
+                clearRemainder.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        var input = await _adb.InputTextAsync(serial, url, cancellationToken);
+        if (!input.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-host",
+                string.IsNullOrWhiteSpace(input.CombinedOutput)
+                    ? "Nao foi possivel informar a URL no campo Host."
+                    : input.CombinedOutput.Trim(),
+                currentActivity,
+                smartDeviceId);
+        }
+
+        await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
+        await Task.Delay(350, cancellationToken);
+
+        currentActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-hold-confirm",
+                $"A URL foi informada, mas a EmpresaAddActivity deixou o primeiro plano antes do Confirmar. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        progress?.Invoke(
+            "legacy80-large-hold-confirm",
+            $"Mantendo Confirmar pressionado por 5 segundos em {confirmX},{confirmY}...");
+        var hold = await _adb.LongPressAsync(serial, confirmX, confirmY, 5000, cancellationToken);
+        if (!hold.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-hold-confirm",
+                "O ADB nao conseguiu executar o toque prolongado de 5 segundos em Confirmar.",
+                hold.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        await Task.Delay(1400, cancellationToken);
+        currentActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (!IsLegacyCompanyAddActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-review",
+                $"O toque prolongado foi executado, mas a tela de revisao nao permaneceu na EmpresaAddActivity. Activity atual: {currentActivity}.",
+                currentActivity,
+                smartDeviceId);
+        }
+
+        // O procedimento manual confirmado pelo usuario usa o mesmo Confirmar novamente
+        // depois do toque prolongado. Mantemos exatamente esse comportamento, sem ler a UI.
+        progress?.Invoke(
+            "legacy80-large-final-confirm",
+            "Toque prolongado concluido. Acionando o Confirmar final uma unica vez...");
+        var finalTap = await _adb.TapAsync(serial, confirmX, confirmY, cancellationToken);
+        if (!finalTap.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-large-final-confirm",
+                "Nao foi possivel acionar o Confirmar final do Smart 8.0.",
+                finalTap.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        return await CompleteLegacy80SynchronizationAsync(
+            serial,
+            packageName,
+            module,
+            smartDeviceId,
+            progress,
+            cancellationToken);
+    }
+
+    private async Task<SmartAutomationResult> CompleteLegacy80SynchronizationAsync(
+        string serial,
+        string packageName,
+        string module,
+        string smartDeviceId,
+        Action<string, string>? progress,
+        CancellationToken cancellationToken)
+    {
+        progress?.Invoke("legacy80-sync", "Aguardando a sincronizacao inicial do Smart 8.0...");
+        UiSnapshot finalSnapshot = new(false, Array.Empty<UiNode>(), string.Empty);
+
+        var consecutiveUnavailableSnapshots = 0;
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            await Task.Delay(attempt == 0 ? 1800 : 900, cancellationToken);
+            // O N950 pode retornar `could not get idle state` em todas as leituras.
+            // Uma captura curta evita transformar a validacao remota em varios minutos.
+            finalSnapshot = await ReadUiQuickAsync(serial, cancellationToken);
+            if (finalSnapshot.Success &&
+                (IsSynchronizationSuccess(finalSnapshot.Nodes) || IsSynchronizationFailure(finalSnapshot.Nodes)))
+            {
+                break;
+            }
+
+            consecutiveUnavailableSnapshots = finalSnapshot.Success
+                ? 0
+                : consecutiveUnavailableSnapshots + 1;
+            if (consecutiveUnavailableSnapshots >= 2)
+            {
+                break;
+            }
+        }
+
+        if (finalSnapshot.Success && IsSynchronizationSuccess(finalSnapshot.Nodes))
+        {
+            progress?.Invoke("legacy80-sync-success", "Dados sincronizados com sucesso. Finalizando a confirmacao...");
+            var ok = FindSynchronizationOkNode(finalSnapshot.Nodes);
+            if (ok is not null)
+            {
+                progress?.Invoke("legacy80-sync-ok", $"Acionando OK da sincronizacao em {ok.CenterX},{ok.CenterY}...");
+                await _adb.TapAsync(serial, ok.CenterX, ok.CenterY, cancellationToken);
+                await Task.Delay(700, cancellationToken);
+            }
+            else if (IsLegacy80LargeSelfServiceModule(module))
+            {
+                // No Smart 8.0 de Totem/AutoPagamento o dialogo de sucesso pode exibir
+                // a mensagem no UIAutomator sem expor o botao OK como um no clicavel.
+                // O ponto abaixo foi mapeado no dispositivo 1080x1920 e e escalado
+                // proporcionalmente para a resolucao Android atual.
+                var activity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+                if (IsLegacyCompanyAddActivity(activity))
+                {
+                    var display = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
+                    if (display.Success)
+                    {
+                        var okX = Math.Clamp((int)Math.Round(display.Width * (830d / 1080d)), 1, display.Width - 1);
+                        var okY = Math.Clamp((int)Math.Round(display.Height * (1025d / 1920d)), 1, display.Height - 1);
+                        progress?.Invoke("legacy80-sync-ok-fallback", $"OK nao foi exposto pela interface. Acionando o ponto mapeado {okX},{okY}...");
+                        await _adb.TapAsync(serial, okX, okY, cancellationToken);
+                        await Task.Delay(700, cancellationToken);
+                    }
+                }
+            }
+
+            return new SmartAutomationResult(
+                true,
+                packageName,
+                "legacy80-sync-complete",
+                $"Smart 8.0 configurado com {GetModuleLabel(module)} e dados sincronizados com sucesso.",
+                BuildSummary(finalSnapshot.Nodes),
+                smartDeviceId);
+        }
+
+        if (finalSnapshot.Success && IsSynchronizationFailure(finalSnapshot.Nodes))
+        {
+            var failureSummary = BuildSummary(finalSnapshot.Nodes);
+            progress?.Invoke("legacy80-sync-error", "O Smart retornou erro ao registrar ou sincronizar o dispositivo.");
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-sync-error",
+                ExtractSynchronizationFailureMessage(finalSnapshot.Nodes),
+                failureSummary,
+                smartDeviceId);
+        }
+
+        if (finalSnapshot.Success && IsSynchronizationInProgress(finalSnapshot.Nodes))
+        {
+            progress?.Invoke("legacy80-sync-timeout", "O Smart nao concluiu a sincronizacao no tempo esperado.");
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-sync-timeout",
+                "O Smart permaneceu sincronizando e nao confirmou o registro do dispositivo. A tela foi mantida aberta para exibir o erro ou estado real.",
+                BuildSummary(finalSnapshot.Nodes),
+                smartDeviceId);
+        }
+
+        // Quando a arvore e indisponivel, o chamador ainda pode confirmar o device_id
+        // pela API administrativa. `submitted` significa somente que o POST foi disparado
+        // pelo Smart e ainda exige confirmacao remota.
+        return new SmartAutomationResult(
+            true,
+            packageName,
+            "legacy80-submitted",
+            "O Confirmar final foi acionado no Smart 8.0. A confirmacao do device_id sera feita pelo cadastro do Softcomshop.",
+            finalSnapshot.Success ? BuildSummary(finalSnapshot.Nodes) : finalSnapshot.Error,
+            smartDeviceId);
+    }
+
+    public async Task<bool> DismissConfirmedSynchronizationAsync(
+        string serial,
+        string packageName,
+        Action<string, string>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        // Este metodo so deve ser chamado depois que o servidor confirmou o vinculo.
+        // No N950 o UIAutomator pode ficar indisponivel justamente no dialogo final,
+        // mas o APK 8.0.1 expoe o botao positivo como app:id/dialog_button.
+        // Nao usamos coordenada fixa e nao fechamos dialogs enquanto a API ainda nao
+        // confirmou o device_id, preservando na tela qualquer erro retornado pelo Smart.
+        var display = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
+        if (!display.Success)
+        {
+            return false;
+        }
+
+        // dialog_button pertence ao custom_dialog.xml do Smart 8.0.1. button1 cobre
+        // o AlertDialog padrao usado por outras compilacoes sem afetar o formulario,
+        // pois ambos sao procurados somente apos a confirmacao remota do vinculo.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var foregroundActivity = await GetForegroundActivityAsync(serial, cancellationToken);
+            if (IsLegacyLoginActivity(foregroundActivity))
+            {
+                progress?.Invoke(
+                    "legacy80-sync-finished",
+                    "O Smart ja encerrou a confirmacao de sincronizacao e retornou para a tela de Login.");
+                return true;
+            }
+
+            if (string.IsNullOrWhiteSpace(foregroundActivity) ||
+                !foregroundActivity.Contains(packageName, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            foreach (var resourceId in new[] { "app:id/dialog_button", "android:id/button1" })
+            {
+                var bounds = await FindViewBoundsFromActivityDumpAsync(serial, resourceId, cancellationToken);
+                if (!IsActivityPointInsideDisplay(bounds, display))
+                {
+                    continue;
+                }
+
+                var tap = await _adb.TapAsync(serial, bounds.CenterX, bounds.CenterY, cancellationToken);
+                if (!tap.Success)
+                {
+                    continue;
+                }
+
+                progress?.Invoke(
+                    "legacy80-sync-ok",
+                    $"Vinculo confirmado pela API. Acionando OK da sincronizacao via {resourceId} em {bounds.CenterX},{bounds.CenterY}...");
+                await Task.Delay(700, cancellationToken);
+                return true;
+            }
+
+            if (attempt < 2)
+            {
+                await Task.Delay(450, cancellationToken);
+            }
+        }
+
+        // Se a compilacao nao expuser um dos IDs conhecidos no ActivityManager,
+        // tentamos por ultimo a arvore de acessibilidade. Essa ordem evita primeiro
+        // o UIAutomator instavel do N950 e ainda preserva outras variantes do Smart.
+        var snapshot = await ReadUiQuickAsync(serial, cancellationToken);
+        if (!snapshot.Success || IsSynchronizationFailure(snapshot.Nodes) ||
+            !IsSynchronizationSuccess(snapshot.Nodes))
+        {
+            return false;
+        }
+
+        var ok = FindSynchronizationOkNode(snapshot.Nodes);
+        if (ok is null)
+        {
+            return false;
+        }
+
+        var uiTap = await _adb.TapAsync(serial, ok.CenterX, ok.CenterY, cancellationToken);
+        if (!uiTap.Success)
+        {
+            return false;
+        }
+
+        progress?.Invoke(
+            "legacy80-sync-ok",
+            $"Vinculo confirmado. Acionando OK da sincronizacao em {ok.CenterX},{ok.CenterY}...");
+        await Task.Delay(700, cancellationToken);
+        return true;
+    }
+
+    private async Task<SmartAutomationResult> SubmitDeviceUrlSmart81Async(
+        string serial,
+        string url,
+        string module,
+        string packageName,
+        UiSnapshot snapshot,
+        string smartDeviceId,
+        Action<string, string>? progress,
+        Func<string, Task>? beforeSubmitAsync,
+        CancellationToken cancellationToken)
+    {
+        progress?.Invoke("smart81", "Smart 8.1+ detectado. Usando o fluxo Configuracoes -> Nova Empresa -> DIGITAR.");
+
+        var expectedCompany = ExtractCompanyNameFromDeviceUrl(url);
+        if (string.IsNullOrWhiteSpace(expectedCompany))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-company",
+                "A URL /device/add nao possui empresa_name. O Smart 8.1+ precisa desse dado para selecionar a empresa com seguranca.",
+                BuildSummary(snapshot.Nodes),
+                string.Empty);
+        }
+
+        // 1) Abre Configuracoes. Nao existe fallback por coordenada: se a engrenagem nao
+        // estiver exposta na arvore de acessibilidade, interrompemos em vez de clicar as cegas.
+        if (!ContainsLabel(snapshot.Nodes, "nova empresa"))
+        {
+            var settings = FindByLabels(snapshot.Nodes, new[]
+            {
+                "configuracoes",
+                "configuracao",
+                "ajustes",
+                "settings",
+                "engrenagem"
+            });
+            if (settings is null)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "smart81-settings",
+                    "Smart 8.1+ detectado, mas o botao de Configuracoes/engrenagem nao foi localizado.",
+                    BuildSummary(snapshot.Nodes),
+                    string.Empty);
+            }
+
+            progress?.Invoke("smart81-settings", "Abrindo Configuracoes do Smart 8.1+...");
+            await _adb.TapAsync(serial, settings.CenterX, settings.CenterY, cancellationToken);
+            snapshot = await WaitForUiStateAsync(
+                serial,
+                nodes => ContainsLabel(nodes, "nova empresa"),
+                12,
+                cancellationToken);
+
+            if (!snapshot.Success || !ContainsLabel(snapshot.Nodes, "nova empresa"))
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "smart81-new-company",
+                    "As Configuracoes foram abertas, mas a opcao Nova Empresa nao apareceu.",
+                    snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                    string.Empty);
+            }
+        }
+
+        // 2) Nova Empresa.
+        var newCompany = FindByLabels(snapshot.Nodes, new[] { "nova empresa" });
+        if (newCompany is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-new-company",
+                "A tela de Configuracoes foi identificada, mas Nova Empresa nao esta acionavel.",
+                BuildSummary(snapshot.Nodes),
+                string.Empty);
+        }
+
+        progress?.Invoke("smart81-new-company", "Abrindo Nova Empresa...");
+        await _adb.TapAsync(serial, newCompany.CenterX, newCompany.CenterY, cancellationToken);
+
+        snapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => FindByLabels(nodes, new[] { expectedCompany }) is not null,
+            15,
+            cancellationToken);
+        var companyNode = snapshot.Success
+            ? FindByLabels(snapshot.Nodes, new[] { expectedCompany })
+            : null;
+        if (companyNode is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-company",
+                $"A lista de empresas abriu, mas a empresa '{expectedCompany}' nao foi localizada. Nenhuma outra empresa foi selecionada automaticamente.",
+                snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                string.Empty);
+        }
+
+        // 3) Seleciona a empresa exata obtida da propria URL de vinculo.
+        progress?.Invoke("smart81-company", $"Selecionando a empresa {expectedCompany}...");
+        await _adb.TapAsync(serial, companyNode.CenterX, companyNode.CenterY, cancellationToken);
+
+        snapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => FindByLabels(nodes, new[] { "confirmar" }) is not null,
+            10,
+            cancellationToken);
+        var firstConfirm = snapshot.Success
+            ? FindByLabels(snapshot.Nodes, new[] { "confirmar" })
+            : null;
+        if (firstConfirm is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-company-confirm",
+                "A empresa foi selecionada, mas o primeiro botao Confirmar nao foi localizado.",
+                snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                string.Empty);
+        }
+
+        progress?.Invoke("smart81-company-confirm", "Confirmando a empresa selecionada...");
+        await _adb.TapAsync(serial, firstConfirm.CenterX, firstConfirm.CenterY, cancellationToken);
+
+        // 4) O novo fluxo exige entrar explicitamente em DIGITAR antes de informar Host.
+        snapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => FindByLabels(nodes, new[] { "digitar", "digitar dados manualmente" }) is not null,
+            12,
+            cancellationToken);
+        var typeManually = snapshot.Success
+            ? FindByLabels(snapshot.Nodes, new[] { "digitar", "digitar dados manualmente" })
+            : null;
+        if (typeManually is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-type",
+                "A empresa foi confirmada, mas a opcao DIGITAR nao foi localizada.",
+                snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                string.Empty);
+        }
+
+        progress?.Invoke("smart81-type", "Abrindo a configuracao manual pelo botao DIGITAR...");
+        await _adb.TapAsync(serial, typeManually.CenterX, typeManually.CenterY, cancellationToken);
+
+        snapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => FindSmart81HostEditable(nodes) is not null,
+            12,
+            cancellationToken);
+        var hostEdit = snapshot.Success ? FindSmart81HostEditable(snapshot.Nodes) : null;
+        if (hostEdit is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-host",
+                "A configuracao manual abriu, mas o campo Host nao foi localizado.",
+                snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                string.Empty);
+        }
+
+        // Em Android moderno, nunca substituimos o ID do APK pelo ANDROID_ID do shell.
+        // O valor antecipado vem de uma vinculacao remota confirmada anteriormente;
+        // a arvore do proprio Smart continua tendo prioridade quando exibir o Device ID.
+        smartDeviceId = FirstNonEmpty(ExtractSmartDeviceId(snapshot.Nodes), smartDeviceId);
+        if (string.IsNullOrWhiteSpace(smartDeviceId) &&
+            await GetAndroidSdkLevelAsync(serial, cancellationToken) <= 25)
+        {
+            smartDeviceId = await GetAndroidIdFallbackAsync(serial, cancellationToken);
+        }
+
+        if (beforeSubmitAsync is not null)
+        {
+            if (string.IsNullOrWhiteSpace(smartDeviceId))
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "smart81-device-id",
+                    "O Smart 8.1+ nao exibiu Device ID e o android_id tambem nao pôde ser obtido. O vinculo anterior nao pode ser validado com seguranca.",
+                    BuildSummary(snapshot.Nodes),
+                    string.Empty);
+            }
+
+            await beforeSubmitAsync(smartDeviceId);
+        }
+
+        // 5) Limpa o Host existente e cola exatamente a URL /device/add recebida.
+        progress?.Invoke("smart81-host", "Informando a URL /device/add no campo Host...");
+        await _adb.TapAsync(serial, hostEdit.CenterX, hostEdit.CenterY, cancellationToken);
+        await Task.Delay(250, cancellationToken);
+        var clear = await _adb.ClearFocusedTextAsync(serial, 128, cancellationToken);
+        if (!clear.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-host",
+                "Nao foi possivel limpar o campo Host antes de informar a URL.",
+                clear.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        var input = await _adb.InputTextAsync(serial, url, cancellationToken);
+        if (!input.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-host",
+                string.IsNullOrWhiteSpace(input.CombinedOutput)
+                    ? "Nao foi possivel preencher o Host pelo ADB."
+                    : input.CombinedOutput.Trim(),
+                BuildSummary(snapshot.Nodes),
+                smartDeviceId);
+        }
+
+        await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
+        snapshot = await WaitForUiStateAsync(
+            serial,
+            nodes => FindByLabels(nodes, new[] { "confirmar" }) is not null,
+            10,
+            cancellationToken);
+        var holdConfirm = snapshot.Success
+            ? FindByLabels(snapshot.Nodes, new[] { "confirmar" })
+            : null;
+        if (holdConfirm is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-hold-confirm",
+                "A URL foi preenchida, mas o botao Confirmar que exige toque prolongado nao foi localizado.",
+                snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                smartDeviceId);
+        }
+
+        // 6) Primeiro Confirmar da configuracao manual: toque prolongado de 5 segundos.
+        progress?.Invoke("smart81-hold-confirm", "Mantendo Confirmar pressionado por 5 segundos...");
+        var hold = await _adb.LongPressAsync(
+            serial,
+            holdConfirm.CenterX,
+            holdConfirm.CenterY,
+            5000,
+            cancellationToken);
+        if (!hold.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-hold-confirm",
+                "O ADB nao conseguiu executar o toque prolongado de 5 segundos em Confirmar.",
+                hold.CombinedOutput.Trim(),
+                smartDeviceId);
+        }
+
+        // 7) So confirma definitivamente depois que a tela de revisao expuser os quatro dados
+        // esperados. Se essa etapa nao aparecer, a automacao para aqui.
+        snapshot = await WaitForUiStateAsync(
+            serial,
+            IsSmart81ConfirmationDetails,
+            15,
+            cancellationToken);
+        if (!snapshot.Success || !IsSmart81ConfirmationDetails(snapshot.Nodes))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-review",
+                "O toque prolongado foi executado, mas a tela de revisao com Empresa, Dispositivo, Client ID e Host nao apareceu.",
+                snapshot.Success ? BuildSummary(snapshot.Nodes) : snapshot.Error,
+                smartDeviceId);
+        }
+
+        smartDeviceId = FirstNonEmpty(ExtractSmartDeviceId(snapshot.Nodes), smartDeviceId);
+        var finalConfirm = FindByLabels(snapshot.Nodes, new[] { "confirmar" });
+        if (finalConfirm is null)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-final-confirm",
+                "A tela de revisao foi validada, mas o Confirmar final nao foi localizado.",
+                BuildSummary(snapshot.Nodes),
+                smartDeviceId);
+        }
+
+        progress?.Invoke("smart81-final-confirm", "Revisao validada. Confirmando o vinculo no Smart 8.1+...");
+        await _adb.TapAsync(serial, finalConfirm.CenterX, finalConfirm.CenterY, cancellationToken);
+        return await CompleteSmart81SynchronizationAsync(
+            serial,
+            packageName,
+            module,
+            smartDeviceId,
+            progress,
+            cancellationToken);
+    }
+
+    private async Task<SmartAutomationResult> CompleteSmart81SynchronizationAsync(
+        string serial,
+        string packageName,
+        string module,
+        string smartDeviceId,
+        Action<string, string>? progress,
+        CancellationToken cancellationToken)
+    {
+        progress?.Invoke("smart81-sync", "Aguardando a sincronizacao inicial do Smart 8.1+...");
+        UiSnapshot finalSnapshot = new(false, Array.Empty<UiNode>(), string.Empty);
+
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            await Task.Delay(attempt == 0 ? 1800 : 900, cancellationToken);
+            finalSnapshot = await ReadUiAsync(serial, cancellationToken);
+            if (finalSnapshot.Success &&
+                (IsSynchronizationSuccess(finalSnapshot.Nodes) || IsSynchronizationFailure(finalSnapshot.Nodes)))
+            {
+                break;
+            }
+        }
+
+        if (finalSnapshot.Success && IsSynchronizationSuccess(finalSnapshot.Nodes))
+        {
+            progress?.Invoke("smart81-sync-success", "Dados sincronizados com sucesso. Fechando apenas a confirmacao final...");
+            var ok = FindByLabels(finalSnapshot.Nodes, new[] { "ok!!!", "ok" });
+            if (ok is not null)
+            {
+                await _adb.TapAsync(serial, ok.CenterX, ok.CenterY, cancellationToken);
+                await Task.Delay(700, cancellationToken);
+            }
+
+            return new SmartAutomationResult(
+                true,
+                packageName,
+                "smart81-sync-complete",
+                $"Smart 8.1+ configurado e {GetModuleLabel(module)} pronto apos a sincronizacao inicial.",
+                BuildSummary(finalSnapshot.Nodes),
+                smartDeviceId);
+        }
+
+        if (finalSnapshot.Success && IsSynchronizationFailure(finalSnapshot.Nodes))
+        {
+            progress?.Invoke("smart81-sync-restart", "Falha de sincronizacao detectada. O vinculo ja foi confirmado; reiniciando o Smart...");
+            await _adb.ForceStopPackageAsync(serial, packageName, cancellationToken);
+            await Task.Delay(600, cancellationToken);
+            var relaunch = await _adb.LaunchPackageAsync(serial, packageName, cancellationToken);
+            await Task.Delay(1800, cancellationToken);
+
+            if (!relaunch.Success)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "smart81-sync-restart",
+                    "O vinculo foi confirmado, mas houve falha de sincronizacao e o Smart nao pôde ser reaberto automaticamente.",
+                    BuildSummary(finalSnapshot.Nodes),
+                    smartDeviceId);
+            }
+
+            return new SmartAutomationResult(
+                true,
+                packageName,
+                "smart81-sync-restarted",
+                "O vinculo foi confirmado. O Smart apresentou falha de sincronizacao complementar e foi reiniciado automaticamente.",
+                BuildSummary(finalSnapshot.Nodes),
+                smartDeviceId);
+        }
+
+        if (finalSnapshot.Success && IsSynchronizationInProgress(finalSnapshot.Nodes))
+        {
+            progress?.Invoke("smart81-sync-timeout", "A sincronizacao permaneceu em andamento alem do tempo esperado. Reiniciando o Smart para liberar a tela...");
+            await _adb.ForceStopPackageAsync(serial, packageName, cancellationToken);
+            await Task.Delay(700, cancellationToken);
+            var relaunch = await _adb.LaunchPackageAsync(serial, packageName, cancellationToken);
+            await Task.Delay(1800, cancellationToken);
+
+            if (!relaunch.Success)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "smart81-sync-timeout",
+                    "O vinculo foi confirmado, mas a sincronizacao ficou presa e o Smart nao pôde ser reaberto automaticamente.",
+                    BuildSummary(finalSnapshot.Nodes),
+                    smartDeviceId);
+            }
+
+            return new SmartAutomationResult(
+                true,
+                packageName,
+                "smart81-sync-timeout-restarted",
+                "O vinculo foi confirmado. A sincronizacao ficou em andamento alem do esperado e o Smart foi reiniciado automaticamente.",
+                BuildSummary(finalSnapshot.Nodes),
+                smartDeviceId);
+        }
+
+        // A confirmacao final ja foi acionada. Permitimos que o chamador faça a verificacao
+        // autoritativa pelo Softcomshop/device_id mesmo se a arvore Android nao expuser o modal.
+        return new SmartAutomationResult(
+            true,
+            packageName,
+            "smart81-submitted",
+            "O Confirmar final foi acionado no Smart 8.1+. A confirmacao do device_id sera feita pelo cadastro do Softcomshop.",
+            finalSnapshot.Success ? BuildSummary(finalSnapshot.Nodes) : finalSnapshot.Error,
+            smartDeviceId);
+    }
+
+    private async Task<UiSnapshot> WaitForReadableUiAsync(
+        string serial,
+        int attempts,
+        CancellationToken cancellationToken)
+    {
+        attempts = Math.Clamp(attempts, 1, 20);
+        UiSnapshot last = new(false, Array.Empty<UiNode>(), "Nao foi possivel ler os componentes da tela Android.");
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            if (attempt > 0) await Task.Delay(650, cancellationToken);
+            last = await ReadUiAsync(serial, cancellationToken);
+            if (last.Success && last.Nodes.Count > 0)
+            {
+                return last;
+            }
+        }
+
+        return last.Success && last.Nodes.Count == 0
+            ? new UiSnapshot(false, Array.Empty<UiNode>(), "A arvore da tela Android permaneceu vazia apos varias tentativas.")
+            : last;
+    }
+
+    private async Task<UiSnapshot> WaitForUiStateAsync(
+        string serial,
+        Func<IReadOnlyList<UiNode>, bool> predicate,
+        int attempts,
+        CancellationToken cancellationToken)
+    {
+        attempts = Math.Clamp(attempts, 1, 30);
+        UiSnapshot last = new(false, Array.Empty<UiNode>(), "A tela esperada nao foi localizada.");
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            await Task.Delay(attempt == 0 ? 500 : 650, cancellationToken);
+            last = await ReadUiAsync(serial, cancellationToken);
+            if (last.Success && predicate(last.Nodes))
+            {
+                return last;
+            }
+        }
+        return last;
+    }
+
+    private async Task<string> GetAndroidIdFallbackAsync(
+        string serial,
+        CancellationToken cancellationToken)
+    {
+        var result = await _adb.ShellAsync(
+            serial,
+            "settings get secure android_id",
+            cancellationToken,
+            6000);
+        if (!result.Success)
+        {
+            return string.Empty;
+        }
+
+        var value = result.StandardOutput.Trim();
+        return string.IsNullOrWhiteSpace(value) || value.Equals("null", StringComparison.OrdinalIgnoreCase)
+            ? string.Empty
+            : value;
+    }
+
+    private static UiNode? FindSmart81HostEditable(IEnumerable<UiNode> nodes) =>
+        FindEditableByHints(nodes, new[] { "host" }) ??
+        FindEditableBelowLabels(nodes, new[] { "host" });
+
+    private static bool IsSmart81ConfirmationDetails(IEnumerable<UiNode> nodes) =>
+        ContainsLabel(nodes, "empresa") &&
+        ContainsLabel(nodes, "dispositivo") &&
+        (ContainsLabel(nodes, "client id") ||
+         ContainsLabel(nodes, "client_id") ||
+         ContainsLabel(nodes, "clientid")) &&
+        ContainsLabel(nodes, "host");
+
+    private static bool IsLegacy80ConfirmationDetails(IEnumerable<UiNode> nodes)
+    {
+        var list = nodes.ToArray();
+        if (FindByLabelsIncludingText(list, new[] { "confirmar" }) is null)
+        {
+            return false;
+        }
+
+        // O 8.0 permanece na EmpresaAddActivity durante DIGITAR, Host e revisao.
+        // Consideramos revisao apenas quando o Host deixa de ser editavel e a tela
+        // ainda apresenta dados de configuracao suficientes para um segundo Confirmar.
+        if (FindSmart81HostEditable(list) is not null)
+        {
+            return false;
+        }
+
+        var hasConfigurationData =
+            ContainsLabel(list, "host") ||
+            ContainsLabel(list, "empresa") ||
+            ContainsLabel(list, "dispositivo") ||
+            ContainsLabel(list, "client id") ||
+            ContainsLabel(list, "client_id") ||
+            ContainsLabel(list, "clientid");
+
+        return hasConfigurationData;
+    }
+
+    private static string ExtractCompanyNameFromDeviceUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return string.Empty;
+        }
+
+        var expectedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "empresa_name",
+            "empresa_nome",
+            "company_name",
+            "empresa_fantasia",
+            "empresa_razao_social"
+        };
+
+        foreach (var part in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = part.IndexOf('=');
+            var rawKey = separator >= 0 ? part[..separator] : part;
+            var rawValue = separator >= 0 ? part[(separator + 1)..] : string.Empty;
+            var key = Uri.UnescapeDataString(rawKey.Replace("+", " "));
+            if (!expectedKeys.Contains(key))
+            {
+                continue;
+            }
+
+            return Uri.UnescapeDataString(rawValue.Replace("+", " ")).Trim();
+        }
+
+        return string.Empty;
     }
 
     private async Task<(bool Success, string Detail)> TryClearPackageAsync(
@@ -1144,6 +3409,428 @@ public sealed class SmartUiAutomationService
             conclude.X, conclude.Y);
     }
 
+    private async Task<string> GetForegroundActivityAsync(
+        string serial,
+        CancellationToken cancellationToken)
+    {
+        var window = await _adb.ShellAsync(serial, "dumpsys window windows", cancellationToken, 10000);
+        if (window.Success)
+        {
+            foreach (var pattern in new[]
+            {
+                @"mCurrentFocus\[[^\]]*\]=Window\{[^}]*\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)",
+                @"mCurrentFocus=.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)",
+                @"mFocusedApp=.*?ActivityRecord\{[^}]*\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)"
+            })
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    window.StandardOutput ?? string.Empty,
+                    pattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    return match.Groups[1].Value.Trim();
+                }
+            }
+        }
+
+        var activities = await _adb.ShellAsync(serial, "dumpsys activity activities", cancellationToken, 10000);
+        if (activities.Success)
+        {
+            foreach (var pattern in new[]
+            {
+                @"mResumedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)",
+                @"ResumedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)",
+                @"\* Hist #0: ActivityRecord\{[^}]*\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)"
+            })
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    activities.StandardOutput ?? string.Empty,
+                    pattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    return match.Groups[1].Value.Trim();
+                }
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private async Task<string> WaitForLegacySmartActivityAsync(
+        string serial,
+        int attempts,
+        CancellationToken cancellationToken)
+    {
+        attempts = Math.Clamp(attempts, 1, 40);
+        var last = string.Empty;
+
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            if (attempt > 0)
+            {
+                await Task.Delay(350, cancellationToken);
+            }
+
+            last = await GetLegacySmartActivityAsync(serial, cancellationToken);
+            if (IsLegacySmartPackageActivity(last))
+            {
+                return last;
+            }
+        }
+
+        return last;
+    }
+
+    private async Task<string> WaitForLegacyActivityAsync(
+        string serial,
+        Func<string, bool> predicate,
+        int attempts,
+        CancellationToken cancellationToken)
+    {
+        attempts = Math.Clamp(attempts, 1, 40);
+        var last = string.Empty;
+
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            if (attempt > 0)
+            {
+                await Task.Delay(350, cancellationToken);
+            }
+
+            last = await GetLegacySmartActivityAsync(serial, cancellationToken);
+            if (predicate(last))
+            {
+                return last;
+            }
+        }
+
+        return last;
+    }
+
+    private async Task<string> GetLegacySmartActivityAsync(
+        string serial,
+        CancellationToken cancellationToken)
+    {
+        // Primeiro tenta a consulta mais curta. Em Android moderno ela evita ficar
+        // processando o dump completo enquanto a tela final ja esta visivel.
+        var top = await _adb.ShellAsync(serial, "dumpsys activity top", cancellationToken, 6000);
+        if (top.Success)
+        {
+            var topMatch = System.Text.RegularExpressions.Regex.Match(
+                top.StandardOutput ?? string.Empty,
+                @"ACTIVITY\s+(softcom\.mobile\.smart2/[A-Za-z0-9._$]+)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (topMatch.Success)
+            {
+                return topMatch.Groups[1].Value.Trim();
+            }
+        }
+
+        // No Android 7 observado, dumpsys window pode reportar o launcher durante uma
+        // transicao mesmo quando o Smart esta sendo retomado. Para o fluxo legado,
+        // priorizamos a Activity resumida informada por ActivityManager.
+        var activities = await _adb.ShellAsync(serial, "dumpsys activity activities", cancellationToken, 10000);
+        if (activities.Success)
+        {
+            foreach (var pattern in new[]
+            {
+                @"mResumedActivity:.*?\s(?:u\d+\s+)?(softcom\.mobile\.smart2/[A-Za-z0-9._$]+)",
+                @"ResumedActivity:.*?\s(?:u\d+\s+)?(softcom\.mobile\.smart2/[A-Za-z0-9._$]+)"
+            })
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    activities.StandardOutput ?? string.Empty,
+                    pattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    return match.Groups[1].Value.Trim();
+                }
+            }
+        }
+
+        return await GetForegroundActivityAsync(serial, cancellationToken);
+    }
+
+    private async Task<string> WaitForForegroundActivityAsync(
+        string serial,
+        Func<string, bool> predicate,
+        int attempts,
+        CancellationToken cancellationToken)
+    {
+        attempts = Math.Clamp(attempts, 1, 30);
+        var last = string.Empty;
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            if (attempt > 0)
+            {
+                await Task.Delay(350, cancellationToken);
+            }
+
+            last = await GetForegroundActivityAsync(serial, cancellationToken);
+            if (predicate(last))
+            {
+                return last;
+            }
+        }
+
+        return last;
+    }
+
+    private async Task<LegacyPermissionResult> EnsureLegacyStoragePermissionsAsync(
+        string serial,
+        string packageName,
+        CancellationToken cancellationToken)
+    {
+        var failures = new List<string>();
+        foreach (var permission in new[]
+        {
+            "android.permission.READ_EXTERNAL_STORAGE",
+            "android.permission.WRITE_EXTERNAL_STORAGE"
+        })
+        {
+            var grant = await _adb.ShellAsync(
+                serial,
+                $"pm grant {packageName} {permission}",
+                cancellationToken,
+                10000);
+
+            if (!grant.Success)
+            {
+                var detail = string.IsNullOrWhiteSpace(grant.CombinedOutput)
+                    ? "sem retorno do ADB"
+                    : grant.CombinedOutput.Trim();
+                failures.Add($"{permission}: {detail}");
+            }
+        }
+
+        if (failures.Count == 0)
+        {
+            return new LegacyPermissionResult(true, string.Empty);
+        }
+
+        return new LegacyPermissionResult(false, string.Join(" | ", failures));
+    }
+
+    private async Task<string> WaitForLegacyCompanyActivityAsync(
+        string serial,
+        string packageName,
+        int sdkLevel,
+        int settingsX,
+        int settingsY,
+        Action<string, string>? progress,
+        CancellationToken cancellationToken)
+    {
+        var last = string.Empty;
+        var permissionWasHandled = false;
+        var settingsRetriedAfterPermission = false;
+
+        for (var attempt = 0; attempt < 24; attempt++)
+        {
+            if (attempt > 0)
+            {
+                await Task.Delay(350, cancellationToken);
+            }
+
+            // Primeiro verifica a Activity REAL em primeiro plano. GetLegacySmartActivityAsync
+            // filtra pelo package do Smart e, com uma janela de permissao por cima, pode continuar
+            // devolvendo LoginActivity e esconder o PermissionController.
+            var actualForeground = await GetForegroundActivityAsync(serial, cancellationToken);
+            if (IsLegacyCompanyActivity(actualForeground))
+            {
+                return actualForeground;
+            }
+
+            var permissionDetected = IsRuntimePermissionActivity(actualForeground);
+
+            // Em Android moderno o dialogo de permissao pode ser uma janela sobre a LoginActivity
+            // sem que dumpsys activity troque de Activity. Nessa plataforma o UIAutomator da tela
+            // de login e estavel, entao podemos procurar explicitamente o botao Allow/Permitir.
+            UiSnapshot? permissionUi = null;
+            UiNode? allowButton = null;
+            if (sdkLevel > 25 && !permissionDetected)
+            {
+                permissionUi = await ReadUiQuickAsync(serial, cancellationToken);
+                if (permissionUi.Success)
+                {
+                    allowButton = FindByLabels(permissionUi.Nodes, new[]
+                    {
+                        "permitir",
+                        "allow",
+                        "enquanto usa o app",
+                        "while using the app",
+                        "permitir acesso",
+                        "allow access"
+                    });
+                    permissionDetected = allowButton is not null;
+                }
+            }
+
+            if (permissionDetected)
+            {
+                last = actualForeground;
+                progress?.Invoke(
+                    "legacy-permission-dialog",
+                    "O Android exibiu uma permissao sobre o Smart. Aceitando a solicitacao antes de abrir Configuracoes novamente...");
+
+                var grant = await EnsureLegacyStoragePermissionsAsync(serial, packageName, cancellationToken);
+                if (!grant.Success)
+                {
+                    progress?.Invoke(
+                        "legacy-permission-dialog",
+                        "O pm grant nao resolveu completamente a solicitacao. Acionando o botao Permitir/Allow da janela do Android...");
+                }
+
+                if (allowButton is null)
+                {
+                    permissionUi ??= await ReadUiQuickAsync(serial, cancellationToken);
+                    if (permissionUi.Success)
+                    {
+                        allowButton = FindByLabels(permissionUi.Nodes, new[]
+                        {
+                            "permitir",
+                            "allow",
+                            "enquanto usa o app",
+                            "while using the app",
+                            "permitir acesso",
+                            "allow access"
+                        });
+                    }
+                }
+
+                if (allowButton is not null)
+                {
+                    progress?.Invoke(
+                        "legacy-permission-dialog",
+                        $"Acionando a permissao do Android em {allowButton.CenterX},{allowButton.CenterY}...");
+                    await _adb.TapAsync(serial, allowButton.CenterX, allowButton.CenterY, cancellationToken);
+                }
+
+                permissionWasHandled = true;
+                await Task.Delay(800, cancellationToken);
+                continue;
+            }
+
+            var smartActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+            if (IsLegacyCompanyActivity(smartActivity))
+            {
+                return smartActivity;
+            }
+
+            // O primeiro toque na engrenagem do Smart 8.0 pode servir apenas para disparar
+            // a permissao de fotos/midia. Depois que o usuario/automacao aceita, o app volta
+            // para LoginActivity e exige um SEGUNDO toque na engrenagem. Fazemos isso uma unica
+            // vez e somente apos confirmar que a permissao foi tratada.
+            if (permissionWasHandled &&
+                !settingsRetriedAfterPermission &&
+                (IsLegacyLoginActivity(actualForeground) || IsLegacyLoginActivity(smartActivity)))
+            {
+                progress?.Invoke(
+                    "legacy-settings-retap",
+                    $"Permissao concluida e Smart retornou para LoginActivity. Acionando Configuracoes novamente em {settingsX},{settingsY}...");
+
+                var retryTap = await _adb.TapAsync(serial, settingsX, settingsY, cancellationToken);
+                if (!retryTap.Success)
+                {
+                    return actualForeground;
+                }
+
+                settingsRetriedAfterPermission = true;
+                await Task.Delay(800, cancellationToken);
+                continue;
+            }
+
+            last = !string.IsNullOrWhiteSpace(actualForeground)
+                ? actualForeground
+                : smartActivity;
+        }
+
+        return last;
+    }
+
+    private static bool IsRuntimePermissionActivity(string activity) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        (activity.Contains("packageinstaller", StringComparison.OrdinalIgnoreCase) ||
+         activity.Contains("permissioncontroller", StringComparison.OrdinalIgnoreCase) ||
+         activity.Contains("grantpermissions", StringComparison.OrdinalIgnoreCase));
+
+    private sealed record LegacyPermissionResult(bool Success, string Detail);
+
+    private static bool IsLegacySmartPackageActivity(string activity) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsLegacyLoginActivity(string activity) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase) &&
+        activity.EndsWith("softcom.mobile.smart.views.activities.login.LoginActivity", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsLegacyCompanyActivity(string activity) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase) &&
+        activity.EndsWith("softcom.mobile.smart.views.activities.empresa.EmpresaActivity", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsLegacyCompanyAddConfigActivity(string activity) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase) &&
+        activity.EndsWith("softcom.mobile.smart.views.activities.EmpresaAddConfigActivity", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsLegacyCompanyAddActivity(string activity) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase) &&
+        activity.EndsWith("softcom.mobile.smart.views.activities.device.EmpresaAddActivity", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsLegacy80LargeSelfServiceModule(string module) =>
+        string.Equals(module, "smart_totem", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(module, "smart_autopagamento", StringComparison.OrdinalIgnoreCase);
+
+    private static string GetLegacy80ModuleResourceId(string module) =>
+        (module ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "smart_pdv" => "app:id/swt_config_modo_pdv",
+            "smart_comanda" => "app:id/swt_config_modo_comanda",
+            "smart_pre_venda" => "app:id/swt_config_modo_pre_venda",
+            "smart_totem" => "app:id/swt_config_modo_autoatendimento",
+            "smart_minimercado" => "app:id/swt_config_modo_selfcheckout",
+            "smart_autopagamento" => "app:id/swt_config_modo_autopag",
+            _ => string.Empty
+        };
+
+    private static double GetLegacy80MobileModuleReferenceY(string module) =>
+        (module ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "smart_pdv" => 91d,
+            "smart_comanda" => 135d,
+            "smart_pre_venda" => 178d,
+            "smart_totem" => 221d,
+            "smart_minimercado" => 264d,
+            "smart_autopagamento" => 311d,
+            "smart_tef" => 404d,
+            _ => 91d
+        };
+
+    private async Task<int> GetAndroidSdkLevelAsync(
+        string serial,
+        CancellationToken cancellationToken)
+    {
+        var result = await _adb.ShellAsync(
+            serial,
+            "getprop ro.build.version.sdk",
+            cancellationToken,
+            8000);
+
+        if (!result.Success)
+        {
+            return 0;
+        }
+
+        return int.TryParse((result.StandardOutput ?? string.Empty).Trim(), out var sdk)
+            ? sdk
+            : 0;
+    }
+
     private async Task<DisplaySizeResult> GetAndroidDisplaySizeAsync(
         string serial,
         CancellationToken cancellationToken)
@@ -1169,6 +3856,130 @@ public sealed class SmartUiAutomationService
 
         return new DisplaySizeResult(true, width, height, string.Empty);
     }
+
+    private async Task<ActivityViewBoundsResult> FindViewBoundsFromActivityDumpAsync(
+        string serial,
+        string resourceId,
+        CancellationToken cancellationToken)
+    {
+        var result = await _adb.ShellAsync(
+            serial,
+            "dumpsys activity top",
+            cancellationToken,
+            12000);
+
+        if (!result.Success || string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            return new ActivityViewBoundsResult(
+                false,
+                0,
+                0,
+                0,
+                0,
+                "O Android nao disponibilizou a hierarquia da Activity atual.");
+        }
+
+        return ParseActivityViewBounds(result.StandardOutput, resourceId);
+    }
+
+    private static ActivityViewBoundsResult ParseActivityViewBounds(string dump, string resourceId)
+    {
+        if (string.IsNullOrWhiteSpace(dump) || string.IsNullOrWhiteSpace(resourceId))
+        {
+            return new ActivityViewBoundsResult(false, 0, 0, 0, 0, "Hierarquia ou resource-id nao informado.");
+        }
+
+        // O formato de View.toString() usado pelo dumpsys informa as coordenadas
+        // relativas ao pai: `classe{estado left,top-right,bottom ... resource-id}`.
+        // A pilha por indentacao converte o retangulo para coordenadas fisicas da tela.
+        var parents = new Stack<ActivityDumpView>();
+        var inViewHierarchy = false;
+        ActivityViewBoundsResult? lastMatch = null;
+        var viewPattern = new Regex(
+            @"^(?<indent>\s*)(?<type>[A-Za-z0-9_.$]+)\{.*\s(?<left>-?\d+),(?<top>-?\d+)-(?<right>-?\d+),(?<bottom>-?\d+)(?:\s[^}]*)?\}\s*$",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+        foreach (var rawLine in dump.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (rawLine.Contains("View Hierarchy:", StringComparison.Ordinal))
+            {
+                inViewHierarchy = true;
+                parents.Clear();
+                continue;
+            }
+
+            if (!inViewHierarchy)
+            {
+                continue;
+            }
+
+            var match = viewPattern.Match(rawLine);
+            if (!match.Success)
+            {
+                continue;
+            }
+
+            var indent = match.Groups["indent"].Value.Length;
+            while (parents.Count > 0 && parents.Peek().Indent >= indent)
+            {
+                parents.Pop();
+            }
+
+            if (!int.TryParse(match.Groups["left"].Value, out var left) ||
+                !int.TryParse(match.Groups["top"].Value, out var top) ||
+                !int.TryParse(match.Groups["right"].Value, out var right) ||
+                !int.TryParse(match.Groups["bottom"].Value, out var bottom))
+            {
+                continue;
+            }
+
+            var parentLeft = parents.Count > 0 ? parents.Peek().AbsoluteLeft : 0;
+            var parentTop = parents.Count > 0 ? parents.Peek().AbsoluteTop : 0;
+            var current = new ActivityDumpView(
+                indent,
+                parentLeft + left,
+                parentTop + top,
+                parentLeft + right,
+                parentTop + bottom);
+
+            if (rawLine.Contains(resourceId, StringComparison.OrdinalIgnoreCase))
+            {
+                if (current.AbsoluteRight <= current.AbsoluteLeft ||
+                    current.AbsoluteBottom <= current.AbsoluteTop)
+                {
+                    continue;
+                }
+
+                // `dumpsys activity top` pode incluir tasks antigas antes da Activity
+                // retomada. Conservamos a ultima ocorrencia valida, que corresponde ao
+                // topo exibido nas versoes Android observadas.
+                lastMatch = new ActivityViewBoundsResult(
+                    true,
+                    current.AbsoluteLeft,
+                    current.AbsoluteTop,
+                    current.AbsoluteRight,
+                    current.AbsoluteBottom,
+                    string.Empty);
+            }
+
+            parents.Push(current);
+        }
+
+        return lastMatch ?? new ActivityViewBoundsResult(
+            false,
+            0,
+            0,
+            0,
+            0,
+            $"O resource-id {resourceId} nao foi localizado na Activity atual.");
+    }
+
+    private static bool IsActivityPointInsideDisplay(
+        ActivityViewBoundsResult bounds,
+        DisplaySizeResult display) =>
+        bounds.Success &&
+        bounds.CenterX > 0 && bounds.CenterX < display.Width &&
+        bounds.CenterY > 0 && bounds.CenterY < display.Height;
 
     private async Task<UiSnapshot> ReadUiQuickAsync(string serial, CancellationToken cancellationToken)
     {
@@ -1481,7 +4292,9 @@ public sealed class SmartUiAutomationService
         return new UiNode(
             element.Attribute("text")?.Value ?? string.Empty,
             element.Attribute("content-desc")?.Value ?? string.Empty,
+            element.Attribute("resource-id")?.Value ?? string.Empty,
             element.Attribute("class")?.Value ?? string.Empty,
+            element.Attribute("package")?.Value ?? string.Empty,
             searchText,
             element.Attribute("clickable")?.Value == "true",
             element.Attribute("enabled")?.Value != "false",
@@ -1489,6 +4302,86 @@ public sealed class SmartUiAutomationService
             top,
             right,
             bottom);
+    }
+
+    private static bool IsUiFromPackage(IEnumerable<UiNode> nodes, string packageName)
+    {
+        if (string.IsNullOrWhiteSpace(packageName)) return false;
+        return nodes.Any(x =>
+            !string.IsNullOrWhiteSpace(x.PackageName) &&
+            x.PackageName.Equals(packageName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsLegacySmartLoginScreen(IEnumerable<UiNode> nodes)
+    {
+        var list = nodes.ToArray();
+        var hasLogin = FindByLabels(list, new[] { "login" }) is not null || ContainsLabel(list, "login");
+        var hasCompany = ContainsLabel(list, "empresa");
+        var hasPassword = ContainsLabel(list, "senha");
+        var hasUser = ContainsLabel(list, "email ou nome") || ContainsLabel(list, "email") || ContainsLabel(list, "nome");
+
+        return hasLogin && hasCompany && hasPassword && hasUser;
+    }
+
+    private static bool IsLegacySmartConfigurationScreen(IEnumerable<UiNode> nodes)
+    {
+        var list = nodes.ToArray();
+        if (IsLegacySmartLoginScreen(list))
+        {
+            return false;
+        }
+
+        return !string.IsNullOrWhiteSpace(ExtractSmartDeviceId(list)) ||
+               FindEditable(list) is not null ||
+               ContainsLabel(list, "digite a url") ||
+               ContainsLabel(list, "configurar smart") ||
+               ContainsLabel(list, "device id");
+    }
+
+    private static UiNode? FindLegacySettingsButton(IEnumerable<UiNode> nodes)
+    {
+        var list = nodes.Where(x => x.Enabled).ToArray();
+
+        var labeled = FindByLabels(
+            list,
+            new[] { "configuracoes", "configuracao", "ajustes", "settings", "engrenagem" });
+        if (labeled is not null)
+        {
+            return labeled;
+        }
+
+        var byResource = list
+            .Where(x => x.Clickable ||
+                        x.ClassName.Contains("Button", StringComparison.OrdinalIgnoreCase) ||
+                        x.ClassName.Contains("Image", StringComparison.OrdinalIgnoreCase))
+            .FirstOrDefault(x =>
+            {
+                var resource = Normalize(x.ResourceId);
+                return resource.Contains("config", StringComparison.OrdinalIgnoreCase) ||
+                       resource.Contains("setting", StringComparison.OrdinalIgnoreCase) ||
+                       resource.Contains("gear", StringComparison.OrdinalIgnoreCase);
+            });
+        if (byResource is not null)
+        {
+            return byResource;
+        }
+
+        // Na interface antiga o botao de configuracao fica imediatamente a direita do LOGIN.
+        // Esse criterio usa a geometria da propria arvore Android e evita coordenada fixa.
+        var login = FindByLabels(list, new[] { "login" });
+        if (login is null)
+        {
+            return null;
+        }
+
+        var rowTolerance = Math.Max(70, login.Bottom - login.Top);
+        return list
+            .Where(x => x.Clickable)
+            .Where(x => x.Left >= login.Right - 6)
+            .Where(x => Math.Abs(x.CenterY - login.CenterY) <= rowTolerance)
+            .OrderBy(x => Math.Abs(x.CenterY - login.CenterY))
+            .ThenBy(x => Math.Abs(x.Left - login.Right))
+            .FirstOrDefault();
     }
 
     private static UiNode? FindEditableByHints(IEnumerable<UiNode> nodes, IEnumerable<string> hints)
@@ -1537,6 +4430,19 @@ public sealed class SmartUiAutomationService
             x.Enabled &&
             x.ClassName.Contains("EditText", StringComparison.OrdinalIgnoreCase));
 
+    private static UiNode? FindByResourceId(IEnumerable<UiNode> nodes, string resourceId)
+    {
+        if (string.IsNullOrWhiteSpace(resourceId))
+        {
+            return null;
+        }
+
+        return nodes
+            .Where(x => x.Enabled && !string.IsNullOrWhiteSpace(x.ResourceId))
+            .FirstOrDefault(x =>
+                x.ResourceId.Equals(resourceId, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static UiNode? FindByLabels(IEnumerable<UiNode> nodes, IEnumerable<string> labels)
     {
         var normalizedLabels = labels.Select(Normalize).Where(x => x.Length > 0).ToArray();
@@ -1549,6 +4455,75 @@ public sealed class SmartUiAutomationService
             .FirstOrDefault();
     }
 
+    private static UiNode? FindByLabelsIncludingText(IEnumerable<UiNode> nodes, IEnumerable<string> labels)
+    {
+        var list = nodes.ToArray();
+        var actionable = FindByLabels(list, labels);
+        if (actionable is not null)
+        {
+            return actionable;
+        }
+
+        var normalizedLabels = labels.Select(Normalize).Where(x => x.Length > 0).ToArray();
+        if (normalizedLabels.Length == 0)
+        {
+            return null;
+        }
+
+        return list
+            .Where(x => x.Enabled)
+            .Select(x => new { Node = x, Value = Normalize(x.SearchText) })
+            .Where(x => normalizedLabels.Any(label => x.Value.Contains(label, StringComparison.OrdinalIgnoreCase)))
+            .OrderBy(x => (x.Node.Right - x.Node.Left) * (x.Node.Bottom - x.Node.Top))
+            .Select(x => x.Node)
+            .FirstOrDefault();
+    }
+
+    private static UiNode? FindSynchronizationOkNode(IEnumerable<UiNode> nodes)
+    {
+        var list = nodes.ToArray();
+        var exactOk = list
+            .Where(x => x.Enabled)
+            .Where(x =>
+            {
+                var value = Normalize(x.SearchText);
+                return value == "ok" || value == "ok!!!";
+            })
+            .OrderByDescending(x => x.Clickable || x.ClassName.Contains("Button", StringComparison.OrdinalIgnoreCase))
+            .ThenBy(x => (x.Right - x.Left) * (x.Bottom - x.Top))
+            .FirstOrDefault();
+
+        if (exactOk is not null)
+        {
+            return exactOk;
+        }
+
+        var success = list
+            .Where(x => x.Enabled)
+            .FirstOrDefault(x =>
+            {
+                var value = Normalize(x.SearchText);
+                return value.Contains("dados sincronizados com sucesso", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("dados foram sincronizados com sucesso", StringComparison.OrdinalIgnoreCase);
+            });
+
+        if (success is null)
+        {
+            return null;
+        }
+
+        // Alguns dialogs antigos expoem o texto de OK em um filho nao clicavel.
+        // Nesse caso, usamos o primeiro controle acionavel logo abaixo da mensagem
+        // de sucesso, evitando escolher botoes da tela que ficam acima do dialogo.
+        return list
+            .Where(x => x.Enabled &&
+                        (x.Clickable || x.ClassName.Contains("Button", StringComparison.OrdinalIgnoreCase)) &&
+                        x.CenterY > success.CenterY)
+            .OrderBy(x => x.CenterY - success.CenterY)
+            .ThenBy(x => Math.Abs(x.CenterX - success.CenterX))
+            .FirstOrDefault();
+    }
+
     private static bool ContainsLabel(IEnumerable<UiNode> nodes, string label)
     {
         var normalized = Normalize(label);
@@ -1557,18 +4532,65 @@ public sealed class SmartUiAutomationService
 
     private static bool IsSynchronizationSuccess(IEnumerable<UiNode> nodes) =>
         ContainsLabel(nodes, "atualizacao concluida") ||
-        ContainsLabel(nodes, "dados foram sincronizados com sucesso");
+        ContainsLabel(nodes, "dados foram sincronizados com sucesso") ||
+        ContainsLabel(nodes, "dados sincronizados com sucesso");
 
     private static bool IsSynchronizationFailure(IEnumerable<UiNode> nodes) =>
         ContainsLabel(nodes, "falha na sincronizacao") ||
         ContainsLabel(nodes, "unable to resolve host") ||
-        ContainsLabel(nodes, "no address associated with hostname");
+        ContainsLabel(nodes, "no address associated with hostname") ||
+        ContainsLabel(nodes, "nao foi possivel sincronizar") ||
+        ContainsLabel(nodes, "erro de sincronizacao") ||
+        ContainsLabel(nodes, "dispositivo ja esta em uso") ||
+        ContainsLabel(nodes, "dispositivo esta em uso") ||
+        ContainsLabel(nodes, "device ja esta em uso") ||
+        ContainsLabel(nodes, "device esta em uso") ||
+        ContainsLabel(nodes, "dispositivo em uso") ||
+        ContainsLabel(nodes, "erro ao vincular") ||
+        ContainsLabel(nodes, "falha ao vincular") ||
+        ContainsLabel(nodes, "vinculo recusado");
+
+    private static string ExtractSynchronizationFailureMessage(IEnumerable<UiNode> nodes)
+    {
+        var visibleMessages = nodes
+            .SelectMany(x => new[] { x.Text, x.ContentDescription })
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .Where(x =>
+            {
+                var value = Normalize(x);
+                return value.Contains("erro", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("falha", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("nao foi possivel", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("em uso", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("unable", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("no address", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("recus", StringComparison.OrdinalIgnoreCase);
+            })
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(4)
+            .ToArray();
+
+        return visibleMessages.Length == 0
+            ? "O Smart retornou erro ao registrar ou sincronizar o dispositivo. Confira a mensagem mantida na tela do Android."
+            : "O Smart recusou o registro do dispositivo: " + string.Join(" | ", visibleMessages);
+    }
 
     private static bool IsSynchronizationInProgress(IEnumerable<UiNode> nodes) =>
         ContainsLabel(nodes, "sincronizando seus dados") ||
         ContainsLabel(nodes, "aguarde a sincronizacao") ||
         ContainsLabel(nodes, "sincronizando cadeias de certificados") ||
         ContainsLabel(nodes, "sincronizando");
+
+    private static bool IsInitialProvisioningState(IEnumerable<UiNode> nodes, string moduleLabel)
+    {
+        // Estado inicial apos limpar os dados do APK. A deteccao e feita pela tela,
+        // nao apenas pela versao, para permitir retomar uma configuracao interrompida.
+        return ContainsLabel(nodes, "bem vindo ao smart") ||
+               FindByLabels(nodes, StartConfigurationLabels) is not null ||
+               ContainsLabel(nodes, "selecione o modulo") ||
+               IsExpectedModuleConfiguration(nodes, moduleLabel);
+    }
 
     private static bool IsExpectedModuleConfiguration(IEnumerable<UiNode> nodes, string moduleLabel)
     {
@@ -1688,6 +4710,25 @@ public sealed class SmartUiAutomationService
 
     private sealed record DisplaySizeResult(bool Success, int Width, int Height, string Message);
 
+    private sealed record ActivityDumpView(
+        int Indent,
+        int AbsoluteLeft,
+        int AbsoluteTop,
+        int AbsoluteRight,
+        int AbsoluteBottom);
+
+    private sealed record ActivityViewBoundsResult(
+        bool Success,
+        int Left,
+        int Top,
+        int Right,
+        int Bottom,
+        string Message)
+    {
+        public int CenterX => Left + Math.Max(1, Right - Left) / 2;
+        public int CenterY => Top + Math.Max(1, Bottom - Top) / 2;
+    }
+
     private sealed class ReferenceScaler
     {
         private readonly int _width;
@@ -1719,7 +4760,9 @@ public sealed class SmartUiAutomationService
     private sealed record UiNode(
         string Text,
         string ContentDescription,
+        string ResourceId,
         string ClassName,
+        string PackageName,
         string SearchText,
         bool Clickable,
         bool Enabled,

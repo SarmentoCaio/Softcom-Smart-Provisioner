@@ -201,9 +201,13 @@
                 <label class="field">
                   <span id="device-source-label">Dispositivo Softcomshop</span>
                   <div class="device-select-row">
-                    <select id="oauth-select" disabled>
-                      <option value="">Selecione empresa primeiro</option>
-                    </select>
+                    <div class="database-combobox device-combobox" id="oauth-combobox">
+                      <input id="oauth-input" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="oauth-suggestions" placeholder="Digite o nome do dispositivo" disabled>
+                      <div class="database-suggestions hidden" id="oauth-suggestions" role="listbox"></div>
+                      <select id="oauth-select" class="hidden" disabled aria-hidden="true" tabindex="-1">
+                        <option value="">Selecione empresa primeiro</option>
+                      </select>
+                    </div>
                     <button type="button" class="secondary compact-button hidden" id="selfhost-new-device">+ Novo</button>
                   </div>
                 </label>
@@ -228,6 +232,7 @@
                   </div>
 
                   <div class="series-content collapsed" id="series-content">
+                  <div class="inline-error-message hidden" id="series-error" role="alert"></div>
                   <div class="series-grid">
                     <div class="series-card" data-type="nfce">
                       <div class="series-card-title"><strong>NFC-e</strong><span>Modelo 65</span></div>
@@ -443,6 +448,19 @@
           </article>
         </div>
 
+        <article class="panel saved-clients-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">SOFTCOMSHOP ONLINE</span>
+              <h2>Clientes salvos</h2>
+            </div>
+          </div>
+          <p class="muted">Clientes autenticados ficam salvos localmente para aparecer na pesquisa da tela Provisionar. Remover aqui apaga somente o atalho salvo no Provisioner; nenhum cadastro do Softcomshop e excluido.</p>
+          <div class="saved-client-list" id="saved-online-clients">
+            <div class="saved-client-empty">Nenhum cliente Online salvo.</div>
+          </div>
+        </article>
+
         <article class="panel update-panel">
           <div class="panel-heading">
             <div>
@@ -535,7 +553,7 @@
         <input id="selfhost-create-name" autocomplete="off" placeholder="Ex.: SELFHOST_SMART_01">
       </label>
       <div class="selfhost-create-doc-block">
-        <div class="selfhost-create-doc-title">NFC-e</div>
+        <div class="selfhost-create-doc-title">NFC-e <span class="optional-tag">preferencial</span></div>
         <div class="selfhost-create-fiscal-row">
           <label class="field">
             <span>Série</span>
@@ -548,7 +566,7 @@
         </div>
       </div>
       <div class="selfhost-create-doc-block">
-        <div class="selfhost-create-doc-title">NF-e <span class="optional-tag">opcional</span></div>
+        <div class="selfhost-create-doc-title">NF-e <span class="optional-tag">fallback</span></div>
         <div class="selfhost-create-fiscal-row">
           <label class="field">
             <span>Série</span>
@@ -560,7 +578,8 @@
           </label>
         </div>
       </div>
-      <small class="modal-helper">A NFC-e é usada na criação do dispositivo. Se a NF-e for informada, ela é vinculada em seguida usando o mesmo cadastro fiscal do dispositivo.</small>
+      <div class="inline-error-message hidden" id="selfhost-create-error" role="alert"></div>
+      <small class="modal-helper">A NFC-e é usada quando informada. Deixe-a vazia para usar a NF-e como fallback; série e numeração são enviadas no próprio cadastro do dispositivo.</small>
       <div class="inline-actions modal-actions">
         <button type="button" class="secondary" id="selfhost-create-cancel">Cancelar</button>
         <button type="button" class="primary" id="selfhost-create-confirm">Criar</button>

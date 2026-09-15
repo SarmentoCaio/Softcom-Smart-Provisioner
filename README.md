@@ -1,3 +1,27 @@
+
+## v1.0.3 - SelfHost 4.1 e Smart 8.0/8.1
+
+- Detecta a versão instalada do SelfHost pelo `Selfhost.exe` e classifica automaticamente `4.0` ou `4.1+`.
+- SelfHost 4.0 preserva o fluxo legado com `Config2.json`.
+- SelfHost 4.1+ não depende de `Config2.json`: as credenciais raiz são lidas do `data\selfhost-config.db` com o mecanismo SQLCipher instalado pelo próprio SelfHost, sem registrar segredos.
+- A criação e a listagem 4.1+ usam a API administrativa real de dispositivos NFC-e/NF-e e exibem somente cadastros com prefixo `SELFHOST_`.
+- Antes de abrir o Smart, o Provisioner consulta e desvincula conflitos do Device ID real; a mesma condição é confirmada novamente antes do último `Confirmar`.
+- Depois da sincronização, o vínculo é validado pelo `client_id` administrativo, o Device ID confirmado é associado ao Android selecionado e o resultado final permanece visível na interface.
+- Consultas administrativas de leitura são repetidas uma vez quando o Softcomshop atinge o timeout, sem repetir automaticamente criação ou desvinculação.
+- No SelfHost 4.1+, a URL entregue ao Smart continua sendo `/device/add`; os parâmetros do vínculo real do Softcomshop são preservados.
+- Bases SelfHost com prefixo de relay preservam o caminho: `/{relayId}/device/add`, permitindo derivar `/{relayId}/authentication/token` como no pre-request do Postman.
+- Detecta `versionName` do Smart em cada Android via ADB.
+- Classifica automaticamente o fluxo como `Smart 8.1+` ou `Smart legado (< 8.1)`.
+- Smart 8.1+ diferencia o estado da tela: na primeira configuração mantém o onboarding validado da v1.0.2 (`Selecionar módulo > Avançar > URL`); fora do onboarding usa `Configurações > Nova Empresa > Confirmar > DIGITAR > Host`, com toque prolongado de 5 segundos e validação da revisão.
+- Smart legado (`< 8.1`) usa o fluxo mapeado do Smart 8.0: `Configurações > Nova Empresa > selecionar módulo > Confirmar > DIGITAR > Host > limpar/preencher URL > Confirmar por 5 segundos > Confirmar final`, preservando a validação de Activity entre as etapas.
+- No Smart 8.0, Totem/AutoPagamento usam o perfil de tela grande já validado; PDV, Comanda, Pré-Venda, Minimercado e TEF usam um perfil separado de celular/GPOS. No Android 7 permanecem os pontos proporcionais mapeados; em Android moderno a tela final usa a arvore da interface para confirmar DIGITAR e o Host editavel antes de prosseguir.
+- O fluxo do Smart padrão força o package `softcom.mobile.smart2` e valida a árvore visível antes de qualquer fallback por posição; se o Smart não permanecer em primeiro plano, a automação para sem tocar em outro aplicativo.
+- O seletor de dispositivo passou a aceitar digitação e filtra a lista conforme o nome informado, seguindo o mesmo padrão do seletor de clientes.
+- Em **Configurações > Clientes salvos**, clientes Online lembrados podem ser removidos da lista local sem excluir dados no Softcomshop.
+- Exibe as versões do SelfHost e do Smart na interface e registra o diagnóstico nos Logs.
+
+O roteiro usado para validar compatibilidade está em `VALIDAR-v1.0.3-SELFHOST41-SMART81.md`.
+
 ## v1.0.1 - Vínculo opcional pelo SelfHost
 
 - Adicionada a opção **Origem do vínculo: Softcomshop / SelfHost** para Smart PDV, Pré-Venda, Minimercado e Totem.
@@ -593,3 +617,55 @@ Se a copia da nova versao ou o reinicio falhar, ele tenta restaurar automaticame
 
 ### Correcao do publicador automatico
 O script de publicacao trata corretamente comandos Git sem saida (por exemplo, quando a tag ainda nao existe), evitando erro de metodo em valor nulo no PowerShell.
+
+### Ajuste Smart 8.0 - permissao Android 7
+
+No fluxo legado do Smart 8.0, o Provisioner tenta conceder via ADB as permissoes `READ_EXTERNAL_STORAGE` e `WRITE_EXTERNAL_STORAGE` apos a limpeza dos dados e antes de abrir o aplicativo. Isso evita que a solicitacao de fotos, midia e arquivos interrompa a abertura das configuracoes. Caso a ROM ainda apresente o dialogo, existe um fallback para a tela de permissao do Android.
+
+### Ajuste adicional Smart 8.0 - Configurar Empresas -> Nova Empresa
+
+No Smart 8.0 legado, apos abrir a engrenagem e chegar em **Softcom Smart - Configurar Empresas**, o Provisioner deve obrigatoriamente acionar **NOVA EMPRESA** antes de procurar o campo da URL. O mapeamento real do K2_MINI confirmou o controle `softcom.mobile.smart2:id/btn_novo`.
+
+Nesta validacao o fluxo prioriza esse `resource-id`; se ele nao estiver exposto no dump atual, o fallback proporcional so e permitido enquanto a `EmpresaActivity` estiver confirmada. A automacao tambem espera a tela **Empresas Cadastradas** sair antes de continuar, evitando preencher ou validar o vinculo na tela errada.
+
+### Fluxo completo mapeado do Smart 8.0
+
+O mapeamento manual de 14/09/2026 confirmou estas Activities:
+
+- login: `softcom.mobile.smart.views.activities.login.LoginActivity`;
+- lista Configurar Empresas: `softcom.mobile.smart.views.activities.empresa.EmpresaActivity`;
+- Nova Empresa / seleção do módulo: `softcom.mobile.smart.views.activities.EmpresaAddConfigActivity`;
+- DIGITAR, Host e confirmação: `softcom.mobile.smart.views.activities.device.EmpresaAddActivity`.
+
+O Provisioner segue o fluxo: `Configurações > Nova Empresa > selecionar módulo > Confirmar > DIGITAR > Host > limpar > informar URL > manter Confirmar pressionado por 5 segundos > Confirmar novamente > sincronização`. No Android 7, `uiautomator dump` continua bloqueado na `LoginActivity`. Para **Smart Totem** e **Smart Autopagamento** no dispositivo de autoatendimento de tela grande, ele também não é usado em `EmpresaAddConfigActivity` nem na etapa `EmpresaAddActivity`: essas telas seguem o mapeamento proporcional validado em 1080x1920, sempre com confirmação da Activity por `dumpsys` antes de cada ação. Os demais módulos continuam no fluxo de celular/GPOS e podem usar a árvore de acessibilidade após a tela de login.
+
+A revisão também corrige o erro de compilação `CS0136` causado por duas variáveis locais chamadas `display` no fluxo de fallback do Smart 8.0.
+
+
+### Smart 8.0 / NOVA EMPRESA sem UIAutomator
+
+No Android 7 mapeado, a tela `EmpresaActivity` pode perder o primeiro plano durante leituras de UIAutomator. Nesta revisao da v1.0.3, a transicao `Configurar Empresas -> NOVA EMPRESA` usa apenas `dumpsys` + o ponto proporcional ja mapeado do botao. O UIAutomator so volta a ser usado depois que `EmpresaAddConfigActivity` estiver confirmada.
+
+### Smart 8.0 - Totem e AutoPagamento em tela grande
+
+O fluxo de autoatendimento foi separado do fluxo de celular/GPOS. Para `smart_totem` e `smart_autopagamento`, o mapeamento real do dispositivo 1080x1920 é usado proporcionalmente para selecionar o módulo, confirmar, abrir **DIGITAR**, focar **Host** e acionar os dois **CONFIRMAR**. Essa separação evita que o UIAutomator faça o Smart 8.0 recuar até a tela inicial no Android 7.
+
+Os outros módulos (`Smart PDV`, `Smart Comanda`, `Smart Pre-Venda`, `Smart Minimercado` e demais fluxos de celular/GPOS) não recebem essas coordenadas de tela grande.
+
+### Smart 8.0 - celular/GPOS em Android moderno
+
+No perfil celular/GPOS, Android com SDK > 25 localiza a engrenagem da tela de login pela arvore de acessibilidade. O perfil Android 7 continua usando o ponto mapeado para evitar a falha conhecida do UIAutomator na LoginActivity. A transicao para Configurar Empresas tambem reconhece janelas de permissao do Android antes de validar a EmpresaActivity.
+
+### Smart 8.0 em Android moderno - permissao no primeiro acesso
+Se o primeiro toque em Configuracoes abrir a permissao de fotos/videos, a automacao aceita a solicitacao, aguarda o retorno ao login e aciona Configuracoes novamente antes de continuar.
+
+### Smart 8.0 celular/GPOS - DIGITAR antes do Host
+
+No perfil celular/GPOS, a etapa `EmpresaAddActivity` agora valida explicitamente a entrada no modo manual antes de alterar o Host. O Provisioner toca em **DIGITAR**, toca no campo **Host** e confirma que o teclado de edicao ficou ativo. Se o primeiro toque nao ativar a edicao, repete `DIGITAR > Host` uma unica vez. Somente depois dessa validacao o Host e limpo, a URL e informada e o fluxo segue para `Confirmar` por 5 segundos e `Confirmar` final.
+
+### Smart 8.0 - celular/GPOS: DIGITAR e Host
+
+No perfil celular/GPOS, a tela final `EmpresaAddActivity` permanece na mesma Activity antes e depois de `DIGITAR`. O Provisioner usa os pontos proporcionais mapeados para `DIGITAR` e `Host` e valida a entrada no campo pelo aparecimento do teclado, evitando depender de UIAutomator nessa etapa.
+
+### Validacao Smart 8.0 celular/GPOS - DIGITAR
+A v1.0.3 de validacao exige confirmar `EmpresaAddActivity` antes de clicar em DIGITAR. Em Android moderno, a verificacao usa primeiro plano/WindowManager; no Android 7 permanece o tratamento legado. Apos colar o Host, o fluxo nao envia BACK para ocultar o teclado.

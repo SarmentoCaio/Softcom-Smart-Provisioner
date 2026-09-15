@@ -20,6 +20,7 @@
     fiscalSeries: [],
     seriesExpanded: false,
     databaseSuggestionIndex: -1,
+    oauthSuggestionIndex: -1,
     logs: [],
     updateAvailable: false,
     updateRequired: false,
@@ -38,6 +39,23 @@
     el.textContent = message;
     host.appendChild(el);
     setTimeout(() => el.remove(), 4200);
+  }
+
+  function showInlineError(id, message) {
+    const el = $(id);
+    if (!el) {
+      toast(message, "error");
+      return;
+    }
+    el.textContent = message || "Ocorreu um erro.";
+    el.classList.remove("hidden");
+  }
+
+  function clearInlineError(id) {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = "";
+    el.classList.add("hidden");
   }
 
   function setBusy(key, active) {
@@ -64,6 +82,15 @@
       if (key === "online") el.textContent = active ? "Conectando..." : (state.accessMode === "online" ? "Conectar" : "Usar");
       if (key === "update") el.textContent = active ? "Verificando..." : "Verificar agora";
       if (key === "updateInstall") el.textContent = active ? "Atualizando..." : "Atualizar agora";
+    }
+
+    if (key === "createDevice") {
+      const modalButton = $("selfhost-create-confirm");
+      if (modalButton) {
+        modalButton.disabled = active;
+        modalButton.classList.toggle("busy", active);
+        modalButton.textContent = active ? "Criando..." : "Criar";
+      }
     }
 
     if (key === "series") {
@@ -115,6 +142,7 @@
     state.environment = b.settings.lastEnvironment || "aws1";
     state.accessMode = ["online", "docker", "database"].includes(b.settings.accessMode) ? b.settings.accessMode : "online";
     if (state.accessMode === "online") {
+      state.databases = rememberedOnlineClients();
       const lastOnline = b.settings.lastOnlineClient || b.settings.lastDatabase || "";
       if (lastOnline) {
         state.database = normalizeDatabaseName(lastOnline);
@@ -137,6 +165,15 @@
     }
     state.selfHostBaseUrl = b.selfHost?.defaultBaseUrl || "";
     if ($("selfhost-base-url")) $("selfhost-base-url").value = state.selfHostBaseUrl;
+    if ($("selfhost-status")) {
+      const sh = b.selfHost || {};
+      if (sh.installed) {
+        $("selfhost-status").textContent = `SelfHost ${sh.version || "?"} · ${sh.generation || "versão identificada"}`;
+        $("selfhost-status").title = `${sh.installPath || ""}${sh.configDescription ? ` · ${sh.configDescription}` : ""}`;
+      } else {
+        $("selfhost-status").textContent = "SelfHost não localizado.";
+      }
+    }
 
     document.querySelectorAll("#environment-switch button").forEach(btn => {
       btn.classList.toggle("active", btn.dataset.env === state.environment);
@@ -167,6 +204,7 @@
     $("global-status").textContent = essentials ? "Componentes locais OK" : "Verificar instalação";
     $("global-substatus").textContent = state.accessMode === "online" ? "Modo Online" : (state.accessMode === "docker" ? "Banco via Docker isolado" : (dbOk ? "Banco via VPN local" : "Importe as credenciais"));
     renderAccessMode();
+    renderSavedOnlineClients();
   }
 
   function renderAccessMode() {
@@ -203,7 +241,6 @@
       : docker
         ? (state.bootstrap?.capabilities?.dockerAvailable ? "Banco via Docker isolado" : "Docker Desktop não localizado")
         : (state.bootstrap?.capabilities?.databaseCredentials ? "Banco via VPN local" : "Banco direto requer credenciais");
-    if (online) hideDatabaseSuggestions();
     renderCompanyPreview();
     renderModuleMode();
     updateActions();
@@ -217,6 +254,56 @@
     const typed = String(value || "").trim();
     if (!typed) return "";
     return /^softcoms_softcomshop_/i.test(typed) ? typed : `${databasePrefix}${typed}`;
+  }
+
+  function rememberedOnlineClients() {
+    const settings = state.bootstrap?.settings || {};
+    const recent = Array.isArray(settings.recentOnlineClients) ? settings.recentOnlineClients : [];
+    const last = settings.lastOnlineClient || settings.lastDatabase || "";
+    const values = [...recent];
+    if (last) values.unshift(last);
+    const seen = new Set();
+    return values
+      .map(normalizeDatabaseName)
+      .filter(Boolean)
+      .filter(value => {
+        const key = value.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
+  function renderSavedOnlineClients() {
+    const host = $("saved-online-clients");
+    if (!host) return;
+
+    const clients = rememberedOnlineClients();
+    if (!clients.length) {
+      host.innerHTML = `<div class="saved-client-empty">Nenhum cliente Online salvo.</div>`;
+      return;
+    }
+
+    host.innerHTML = clients.map(client => {
+      const display = displayDatabaseName(client);
+      return `
+        <div class="saved-client-row">
+          <div class="saved-client-copy">
+            <strong>${escapeHtml(display)}</strong>
+            <small>Salvo localmente para pesquisa rápida</small>
+          </div>
+          <button type="button" class="ghost compact saved-client-remove" data-database="${escapeAttr(client)}">Excluir</button>
+        </div>`;
+    }).join("");
+
+    host.querySelectorAll(".saved-client-remove").forEach(button => {
+      button.addEventListener("click", () => {
+        const database = button.dataset.database || "";
+        const display = displayDatabaseName(database);
+        if (!database || !confirm(`Remover ${display} da lista de clientes salvos neste computador?`)) return;
+        send("removeOnlineClient", { database });
+      });
+    });
   }
 
   function resetDatabaseDependents() {
@@ -356,20 +443,119 @@
     el.innerHTML = `<div class="company-avatar">${escapeHtml(initials)}</div><div><strong>${escapeHtml(c.name)}</strong><span>${escapeHtml(c.cnpj || "CNPJ não identificado")}</span></div>`;
   }
 
-  function renderOauthClients() {
-    const select = $("oauth-select");
-    select.disabled = state.oauthClients.length === 0;
-    select.innerHTML = `<option value="">Selecione um dispositivo...</option>`;
-    state.oauthClients.forEach((item, idx) => {
-      const opt = document.createElement("option");
-      opt.value = String(idx);
-      const status = item.deviceId ? "vinculado" : "disponível";
-      opt.textContent = `${item.name} · ${status}`;
-      select.appendChild(opt);
-    });
+  function getFilteredOauthClients() {
+    const input = $("oauth-input");
+    const query = String(input?.value || "").trim().toLowerCase();
+    return state.oauthClients
+      .map((item, idx) => ({ item, idx }))
+      .filter(({ item }) => !query || String(item.name || "").toLowerCase().includes(query))
+      .sort((a, b) => {
+        const aName = String(a.item.name || "");
+        const bName = String(b.item.name || "");
+        const aStarts = query && aName.toLowerCase().startsWith(query) ? 0 : 1;
+        const bStarts = query && bName.toLowerCase().startsWith(query) ? 0 : 1;
+        return aStarts - bStarts || aName.localeCompare(bName, "pt-BR", { sensitivity: "base" });
+      })
+      .slice(0, 30);
   }
 
-  function renderOauthPreview() {
+  function hideOauthSuggestions() {
+    const host = $("oauth-suggestions");
+    const input = $("oauth-input");
+    if (!host || !input) return;
+    host.classList.add("hidden");
+    input.setAttribute("aria-expanded", "false");
+    state.oauthSuggestionIndex = -1;
+  }
+
+  function renderOauthSuggestions(forceOpen = false) {
+    const host = $("oauth-suggestions");
+    const input = $("oauth-input");
+    if (!host || !input || input.disabled || !state.oauthClients.length) {
+      hideOauthSuggestions();
+      return;
+    }
+
+    const items = getFilteredOauthClients();
+    if (!items.length) {
+      host.innerHTML = `<div class="database-suggestion-empty">Nenhum dispositivo encontrado para <strong>${escapeHtml(input.value.trim())}</strong>.</div>`;
+    } else {
+      host.innerHTML = items.map(({ item, idx }, suggestionIndex) => {
+        const status = item.deviceId ? "vinculado" : "disponível";
+        const detail = item.deviceId ? `${status} · ${escapeHtml(item.deviceId)}` : status;
+        return `
+          <button type="button" class="database-suggestion device-suggestion ${suggestionIndex === state.oauthSuggestionIndex ? "active" : ""}" data-index="${idx}" role="option">
+            <span class="device-suggestion-line">
+              <strong>${escapeHtml(item.name || "Sem nome")}</strong>
+              <small> · ${detail}</small>
+            </span>
+          </button>`;
+      }).join("");
+    }
+
+    host.querySelectorAll(".database-suggestion").forEach(el => {
+      el.addEventListener("mousedown", e => e.preventDefault());
+      el.addEventListener("click", () => selectOauthSuggestion(Number(el.dataset.index)));
+    });
+
+    if (forceOpen || document.activeElement === input) {
+      host.classList.remove("hidden");
+      input.setAttribute("aria-expanded", "true");
+    }
+  }
+
+  function selectOauthSuggestion(index) {
+    if (!Number.isInteger(index) || !state.oauthClients[index]) return;
+    state.oauthClient = state.oauthClients[index];
+    state.fiscalSeries = [];
+    clearInlineError("series-error");
+    const select = $("oauth-select");
+    if (select) select.value = String(index);
+    const input = $("oauth-input");
+    if (input) input.value = state.oauthClient.name || "";
+    hideOauthSuggestions();
+    renderOauthPreview();
+    loadFiscalSeries();
+  }
+
+  function renderOauthClients() {
+    const select = $("oauth-select");
+    const input = $("oauth-input");
+    if (select) {
+      select.disabled = state.oauthClients.length === 0;
+      select.innerHTML = `<option value="">Selecione um dispositivo...</option>`;
+      state.oauthClients.forEach((item, idx) => {
+        const opt = document.createElement("option");
+        opt.value = String(idx);
+        const status = item.deviceId ? "vinculado" : "disponível";
+        opt.textContent = `${item.name} · ${status}`;
+        select.appendChild(opt);
+      });
+    }
+
+    if (input) {
+      input.disabled = state.oauthClients.length === 0;
+      input.placeholder = state.oauthClients.length
+        ? `Digite o nome do dispositivo (${state.oauthClients.length} disponível(is))`
+        : (state.company ? "Nenhum dispositivo localizado" : "Selecione a empresa primeiro");
+
+      if (state.oauthClient) {
+        const idx = state.oauthClients.findIndex(x => x.clientId === state.oauthClient.clientId);
+        if (idx >= 0) {
+          if (select) select.value = String(idx);
+          input.value = state.oauthClients[idx].name || "";
+        } else if (document.activeElement !== input) {
+          input.value = "";
+        }
+      } else if (document.activeElement !== input) {
+        input.value = "";
+      }
+    }
+
+    renderOauthSuggestions(false);
+  }
+
+  function renderOauthPreview(evaluateCurrentLink = true) {
     const el = $("oauth-preview");
     const o = state.oauthClient;
     if (!o) {
@@ -384,7 +570,7 @@
     el.innerHTML = `<div><strong>${escapeHtml(o.name)}</strong><span>${escapeHtml(detail)}</span></div>`;
     renderFiscalSeries();
     updateActions();
-    evaluate();
+    if (evaluateCurrentLink) evaluate();
   }
 
   function renderDeviceMode() {
@@ -412,6 +598,7 @@
     $("selfhost-create-number").value = "1";
     $("selfhost-create-nfe-series").value = "";
     $("selfhost-create-nfe-number").value = "1";
+    clearInlineError("selfhost-create-error");
     modal.classList.remove("hidden");
     setTimeout(() => input.focus(), 0);
   }
@@ -421,6 +608,7 @@
   }
 
   function createSelfHostDevice() {
+    clearInlineError("selfhost-create-error");
     const name = $("selfhost-create-name")?.value.trim() || "";
     const seriesText = $("selfhost-create-series")?.value.trim() || "";
     const numberText = $("selfhost-create-number")?.value.trim() || "";
@@ -430,26 +618,51 @@
     const initialNumber = Number(numberText);
     const nfeSeries = Number(nfeSeriesText);
     const nfeInitialNumber = Number(nfeNumberText);
+    const modernSelfHost = state.bootstrap?.selfHost?.generation === "SelfHost 4.1+";
+
     if (!state.database || !state.company || !name) {
-      toast("Selecione cliente e empresa e informe o nome do dispositivo.", "error");
+      showInlineError("selfhost-create-error", "Selecione cliente e empresa e informe o nome do dispositivo.");
       return;
     }
-    if (!/^\d+$/.test(seriesText) || !Number.isInteger(series) || series < 0) {
-      toast("Informe uma série NFC-e válida.", "error");
+    const normalizedName = `SELFHOST_${name.replace(/^(SELFHOST_)+/i, "").trim()}`.toLowerCase();
+    if (state.oauthClients.some(x => {
+      const currentName = String(x.name || "").trim().toLowerCase();
+      return currentName === name.toLowerCase() || currentName === normalizedName;
+    })) {
+      showInlineError("selfhost-create-error", `Já existe um cadastro chamado ${name} na lista atual.`);
       return;
     }
-    if (!/^\d+$/.test(numberText) || !Number.isInteger(initialNumber) || initialNumber < 1) {
-      toast("Informe um próximo número NFC-e válido.", "error");
+    if (seriesText) {
+      if (!/^\d+$/.test(seriesText) || !Number.isInteger(series) || series < 0) {
+        showInlineError("selfhost-create-error", "Informe uma série NFC-e válida.");
+        return;
+      }
+      if (!/^\d+$/.test(numberText) || !Number.isInteger(initialNumber) || initialNumber < 1) {
+        showInlineError("selfhost-create-error", "Informe uma numeração inicial NFC-e válida.");
+        return;
+      }
+    } else if (modernSelfHost) {
+      if (!/^\d+$/.test(nfeSeriesText) || !Number.isInteger(nfeSeries) || nfeSeries < 0) {
+        showInlineError("selfhost-create-error", "Informe a série NFC-e ou, como alternativa, uma série NF-e válida.");
+        return;
+      }
+      if (!/^\d+$/.test(nfeNumberText) || !Number.isInteger(nfeInitialNumber) || nfeInitialNumber < 1) {
+        showInlineError("selfhost-create-error", "Informe uma numeração inicial NF-e válida.");
+        return;
+      }
+    } else {
+      showInlineError("selfhost-create-error", "Informe uma série NFC-e válida.");
       return;
     }
-    if (nfeSeriesText && (!/^\d+$/.test(nfeSeriesText) || !Number.isInteger(nfeSeries) || nfeSeries < 0)) {
-      toast("Informe uma série NF-e válida ou deixe a NF-e em branco.", "error");
+    if (!modernSelfHost && nfeSeriesText && (!/^\d+$/.test(nfeSeriesText) || !Number.isInteger(nfeSeries) || nfeSeries < 0)) {
+      showInlineError("selfhost-create-error", "Informe uma série NF-e válida ou deixe a NF-e em branco.");
       return;
     }
-    if (nfeSeriesText && (!/^\d+$/.test(nfeNumberText) || !Number.isInteger(nfeInitialNumber) || nfeInitialNumber < 1)) {
-      toast("Informe um próximo número NF-e válido.", "error");
+    if (!modernSelfHost && nfeSeriesText && (!/^\d+$/.test(nfeNumberText) || !Number.isInteger(nfeInitialNumber) || nfeInitialNumber < 1)) {
+      showInlineError("selfhost-create-error", "Informe uma numeração inicial NF-e válida.");
       return;
     }
+
     send("createOauthClient", {
       accessMode: state.accessMode,
       environment: state.environment,
@@ -466,7 +679,7 @@
   }
 
   function loadFiscalSeries() {
-    if (isTefMode() || isSelfHostMode() || !state.database || !state.company || !state.oauthClient) {
+    if (isTefMode() || !state.database || !state.company || !state.oauthClient) {
       state.fiscalSeries = [];
       renderFiscalSeries();
       return;
@@ -547,20 +760,33 @@
   }
 
   function saveFiscalSeries(type) {
+    clearInlineError("series-error");
     if (!state.database || !state.company || !state.oauthClient) {
-      toast("Selecione cliente, empresa e dispositivo Softcomshop.", "error");
+      showInlineError("series-error", "Selecione cliente, empresa e dispositivo Softcomshop.");
       return;
     }
+
     const series = $(`${type}-series`).value.trim();
     const initialNumber = Number($(`${type}-number`).value);
     const fiscalEnvironment = Number($(`${type}-environment`).value);
     const idText = $(`${type}-record`).value;
-    if (!series || !Number.isInteger(initialNumber) || initialNumber < 1) {
-      toast("Informe a série e um número inicial válido.", "error");
+    if (!/^\d+$/.test(series) || !Number.isInteger(initialNumber) || initialNumber < 1) {
+      showInlineError("series-error", "Informe a série e um número inicial válido.");
       return;
     }
+    if (![1, 2].includes(fiscalEnvironment)) {
+      showInlineError("series-error", "Selecione Produção ou Homologação.");
+      return;
+    }
+
+    const selected = seriesItems(type).find(x => String(x.id) === String(idText));
+    const selectedSeries = String(selected?.series ?? "").trim();
+    const changingSeries = !!selected && selectedSeries !== series;
+    const effectiveId = !changingSeries && idText ? Number(idText) : null;
     const label = type === "nfce" ? "NFC-e" : "NF-e";
-    if (!confirm(`${label}: salvar série ${series}, número inicial ${initialNumber}, vinculada ao dispositivo ${state.oauthClient.name}?`)) return;
+    const action = changingSeries ? `alterar a série ${selectedSeries} para ${series}` : `salvar série ${series}`;
+
+    if (!confirm(`${label}: ${action}, número inicial ${initialNumber}, vinculada ao dispositivo ${state.oauthClient.name}?`)) return;
     send("saveFiscalSeries", {
       accessMode: state.accessMode,
       environment: state.environment,
@@ -568,7 +794,7 @@
       companyId: state.company.id,
       clientId: state.oauthClient.clientId,
       documentType: type,
-      id: idText ? Number(idText) : null,
+      id: effectiveId,
       series,
       initialNumber,
       fiscalEnvironment
@@ -597,11 +823,13 @@
         <div class="android-radio"></div>
         <div>
           <strong>${escapeHtml(d.model || d.serial)}</strong>
-          <span>${escapeHtml(d.transport)} · Android ${escapeHtml(d.androidVersion || "?")} · ${escapeHtml(d.serial)}</span>
+          <span>${escapeHtml(d.transport)} · Android ${escapeHtml(d.androidVersion || "?")} · Smart ${escapeHtml(d.smartVersion || "não detectado")} · ${escapeHtml(d.serial)}</span>
         </div>
         <div class="device-meta">
           <b>ONLINE</b>
-          <span>${escapeHtml(d.androidId || "Android ID não lido")}</span>
+          <span>${d.confirmedSmartDeviceId
+            ? `Smart ID ${escapeHtml(d.confirmedSmartDeviceId)}`
+            : `ADB ID ${escapeHtml(d.androidId || "não lido")} (não autoritativo)`}</span>
         </div>
       </div>
     `).join("");
@@ -623,10 +851,12 @@
         <div class="device-details">
           <div><span>Conexão</span><strong>${escapeHtml(d.transport)}</strong></div>
           <div><span>Android</span><strong>${escapeHtml(d.androidVersion || "?")}</strong></div>
+          <div><span>Smart</span><strong>${escapeHtml(d.smartVersion || "Não detectado")}</strong></div>
+          <div><span>Fluxo</span><strong>${escapeHtml(d.smartFlow || "—")}</strong></div>
           <div><span>Bateria</span><strong>${d.battery ?? "—"}${d.battery != null ? "%" : ""}</strong></div>
         </div>
         <div class="device-details">
-          <div style="grid-column:1/-1"><span>Android ID</span><strong>${escapeHtml(d.androidId || "Não identificado")}</strong></div>
+          <div style="grid-column:1/-1"><span>${d.confirmedSmartDeviceId ? "Device ID real do Smart" : "Android ID do shell ADB"}</span><strong>${escapeHtml(d.confirmedSmartDeviceId || d.androidId || "Não identificado")}${d.confirmedSmartDeviceId ? "" : " (não autoritativo em Android 8+)"}</strong></div>
         </div>
         <div class="device-card-actions">
           <button class="secondary compact device-scrcpy" data-serial="${escapeAttr(d.serial)}">Abrir scrcpy</button>
@@ -731,7 +961,9 @@
     if (deviceLabel) deviceLabel.textContent = selfHost ? "Dispositivo SelfHost" : "Dispositivo Softcomshop";
     if (selfHost && $("selfhost-status")) {
       const base = getSelfHostBaseUrl();
-      $("selfhost-status").textContent = base ? `Selfhost: ${base}` : "Selfhost: IP local será detectado automaticamente.";
+      const sh = state.bootstrap?.selfHost || {};
+      const version = sh.installed ? `SelfHost ${sh.version || "?"} · ${sh.generation || ""}` : "SelfHost não localizado";
+      $("selfhost-status").textContent = base ? `${version} · ${base}` : `${version} · IP local automático`;
     }
     $("tef-config").classList.toggle("hidden", !tef);
     $("generate-url").classList.toggle("hidden", tef);
@@ -751,7 +983,7 @@
           ? `Use <strong>Validar</strong> para conferir o cenário ou <strong>Preparar Smart</strong> para criar/reutilizar o vínculo pela sessão Web, abrir o APK e confirmar o dispositivo no Softcomshop — sem VPN/MySQL.`
           : `Use <strong>Validar</strong> para conferir o cenário ou <strong>Preparar Smart</strong> para executar de fato: abrir o APK, informar a URL pelo ADB e confirmar o vínculo no banco.`);
       if (state.oauthClient && state.androidSerial) evaluate();
-      else renderValidation({ status: "neutral", title: selfHost ? "Selecione um dispositivo SelfHost e um Android" : "Selecione um dispositivo WEB e um Android", detail: selfHost ? "A lista é carregada usando o dispositivo raiz configurado no SelfHost instalado." : (state.accessMode === "online" ? "O vínculo será consultado diretamente na tela de Dispositivos do Softcomshop." : "O programa vai comparar oauth_clients.device_id com o Device ID exibido pelo Smart.") });
+      else renderValidation({ status: "neutral", title: selfHost ? "Selecione um dispositivo SelfHost e um Android" : "Selecione um dispositivo WEB e um Android", detail: selfHost ? "No SelfHost 4.1+ a lista usa a sessão Web do Softcomshop; no 4.0 o Provisioner preserva o fluxo legado pela configuração raiz instalada." : (state.accessMode === "online" ? "O vínculo será consultado diretamente na tela de Dispositivos do Softcomshop." : "O programa vai comparar oauth_clients.device_id com o Device ID exibido pelo Smart.") });
     }
     renderDeviceMode();
     renderFiscalSeries();
@@ -819,7 +1051,7 @@
         state.accessMode = next;
         state.onlineConnected = false;
         resetDatabaseDependents();
-        state.databases = [];
+        state.databases = next === "online" ? rememberedOnlineClients() : [];
         if (next === "online") {
           const last = state.bootstrap?.settings?.lastOnlineClient || state.bootstrap?.settings?.lastDatabase || "";
           state.database = last ? normalizeDatabaseName(last) : "";
@@ -899,6 +1131,8 @@
 
     document.addEventListener("mousedown", e => {
       if (!$("database-combobox").contains(e.target)) hideDatabaseSuggestions();
+      const oauthCombo = $("oauth-combobox");
+      if (oauthCombo && !oauthCombo.contains(e.target)) hideOauthSuggestions();
     });
 
     $("company-select").addEventListener("change", (e) => {
@@ -915,11 +1149,56 @@
       if (state.company) loadOauth();
     });
 
+    $("oauth-input")?.addEventListener("focus", () => renderOauthSuggestions(true));
+    $("oauth-input")?.addEventListener("input", () => {
+      const input = $("oauth-input");
+      if (state.oauthClient && String(input?.value || "").trim() !== String(state.oauthClient.name || "").trim()) {
+        state.oauthClient = null;
+        state.fiscalSeries = [];
+        const select = $("oauth-select");
+        if (select) select.value = "";
+        renderOauthPreview();
+        renderFiscalSeries();
+      }
+      state.oauthSuggestionIndex = -1;
+      renderOauthSuggestions(true);
+    });
+    $("oauth-input")?.addEventListener("keydown", e => {
+      const items = getFilteredOauthClients();
+      if (e.key === "ArrowDown" && items.length) {
+        e.preventDefault();
+        state.oauthSuggestionIndex = Math.min(state.oauthSuggestionIndex + 1, items.length - 1);
+        renderOauthSuggestions(true);
+        return;
+      }
+      if (e.key === "ArrowUp" && items.length) {
+        e.preventDefault();
+        state.oauthSuggestionIndex = Math.max(state.oauthSuggestionIndex - 1, 0);
+        renderOauthSuggestions(true);
+        return;
+      }
+      if (e.key === "Escape") {
+        hideOauthSuggestions();
+        return;
+      }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        let selected = state.oauthSuggestionIndex >= 0 ? items[state.oauthSuggestionIndex] : null;
+        if (!selected) {
+          const query = String($("oauth-input")?.value || "").trim().toLowerCase();
+          selected = items.find(x => String(x.item.name || "").trim().toLowerCase() === query) || (items.length === 1 ? items[0] : null);
+        }
+        if (selected) selectOauthSuggestion(selected.idx);
+      }
+    });
+
     $("oauth-select").addEventListener("change", (e) => {
       const raw = e.target.value;
       const idx = raw === "" ? null : Number(raw);
       state.oauthClient = idx != null && Number.isInteger(idx) && state.oauthClients[idx] ? state.oauthClients[idx] : null;
       state.fiscalSeries = [];
+      clearInlineError("series-error");
+      if ($("oauth-input")) $("oauth-input").value = state.oauthClient?.name || "";
       renderOauthPreview();
       loadFiscalSeries();
     });
@@ -956,6 +1235,7 @@
     $("selfhost-create-cancel")?.addEventListener("click", closeSelfHostCreateModal);
     $("selfhost-create-confirm")?.addEventListener("click", createSelfHostDevice);
     ["selfhost-create-name", "selfhost-create-series", "selfhost-create-number", "selfhost-create-nfe-series", "selfhost-create-nfe-number"].forEach(id => {
+      $(id)?.addEventListener("input", () => clearInlineError("selfhost-create-error"));
       $(id)?.addEventListener("keydown", e => {
         if (e.key === "Enter") { e.preventDefault(); createSelfHostDevice(); }
         if (e.key === "Escape") closeSelfHostCreateModal();
@@ -973,8 +1253,12 @@
       e.stopPropagation();
       loadFiscalSeries();
     });
-    $("nfce-record").addEventListener("change", () => applySeriesRecord("nfce"));
-    $("nfe-record").addEventListener("change", () => applySeriesRecord("nfe"));
+    $("nfce-record").addEventListener("change", () => { clearInlineError("series-error"); applySeriesRecord("nfce"); });
+    $("nfe-record").addEventListener("change", () => { clearInlineError("series-error"); applySeriesRecord("nfe"); });
+    ["nfce-series", "nfce-number", "nfce-environment", "nfe-series", "nfe-number", "nfe-environment"].forEach(id => {
+      $(id)?.addEventListener("input", () => clearInlineError("series-error"));
+      $(id)?.addEventListener("change", () => clearInlineError("series-error"));
+    });
     $("save-nfce-series").addEventListener("click", () => saveFiscalSeries("nfce"));
     $("save-nfe-series").addEventListener("click", () => saveFiscalSeries("nfe"));
 
@@ -991,13 +1275,27 @@
     });
 
     $("module-select").addEventListener("change", e => {
+      const wasSelfHost = isSelfHostMode();
       state.module = e.target.value;
+      const remainsSelfHost = wasSelfHost && isSelfHostMode();
+
+      // Trocar apenas o modulo nao altera a origem dos dispositivos quando o SelfHost
+      // continua ativo. Preservamos a lista/selecionado e evitamos nova consulta remota.
+      if (remainsSelfHost) {
+        renderModuleMode();
+        renderOauthClients();
+        renderOauthPreview();
+        renderFiscalSeries();
+        return;
+      }
+
       state.oauthClient = null;
       state.oauthClients = [];
       state.fiscalSeries = [];
       renderModuleMode();
       renderOauthClients();
       renderOauthPreview();
+      renderFiscalSeries();
       if (state.company) loadOauth();
     });
 
@@ -1102,7 +1400,7 @@
 
       const moduleLabel = $("module-select").selectedOptions[0]?.textContent || "Smart";
       const modeInfo = isSelfHostMode()
-        ? "usando o vínculo local do SelfHost"
+        ? "usando o /device/add do SelfHost"
         : state.accessMode === "online"
           ? "usando a sessão WEB do Softcomshop"
           : state.accessMode === "docker"
@@ -1203,6 +1501,45 @@
         el.innerHTML = `${escapeHtml(payload.message)}${accessHint}`;
         break;
       }
+      case "onlineClients": {
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        const recent = items.map(normalizeDatabaseName).filter(Boolean);
+        const merged = [...recent, ...state.databases].map(normalizeDatabaseName).filter(Boolean);
+        state.databases = [...new Map(merged.map(x => [x.toLowerCase(), x])).values()].slice(0, 30);
+        if (state.bootstrap?.settings) {
+          state.bootstrap.settings.recentOnlineClients = recent;
+          if (payload.current) state.bootstrap.settings.lastOnlineClient = normalizeDatabaseName(payload.current);
+        }
+        renderSavedOnlineClients();
+        if (state.accessMode === "online" && document.activeElement === $("database-input")) {
+          renderDatabaseSuggestions(true);
+        }
+        break;
+      }
+      case "onlineClientRemoved": {
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        const recent = items.map(normalizeDatabaseName).filter(Boolean);
+        const removed = normalizeDatabaseName(payload.removed || "");
+        if (state.bootstrap?.settings) {
+          state.bootstrap.settings.recentOnlineClients = recent;
+          state.bootstrap.settings.lastOnlineClient = payload.current ? normalizeDatabaseName(payload.current) : "";
+          if (removed && normalizeDatabaseName(state.bootstrap.settings.lastDatabase || "").toLowerCase() === removed.toLowerCase()) {
+            state.bootstrap.settings.lastDatabase = "";
+          }
+        }
+        state.databases = recent;
+        if (removed && state.database && normalizeDatabaseName(state.database).toLowerCase() === removed.toLowerCase()) {
+          state.database = "";
+          state.onlineConnected = false;
+          $("database-input").value = "";
+          resetDatabaseDependents();
+          renderAccessMode();
+        }
+        renderSavedOnlineClients();
+        renderDatabaseSuggestions(document.activeElement === $("database-input"));
+        toast(`${payload.removed || "Cliente"} removido da lista local.`, "success");
+        break;
+      }
       case "onlineState":
         state.onlineConnected = !!payload.connected;
         renderAccessMode();
@@ -1223,48 +1560,55 @@
       case "oauthClients": {
         const currentClientId = state.oauthClient?.clientId || "";
         state.oauthClients = payload.items || [];
-        renderOauthClients();
         if (currentClientId) {
           const idx = state.oauthClients.findIndex(x => x.clientId === currentClientId);
-          if (idx >= 0) {
-            state.oauthClient = state.oauthClients[idx];
-            $("oauth-select").value = String(idx);
-            renderOauthPreview();
-            loadFiscalSeries();
-          }
+          state.oauthClient = idx >= 0 ? state.oauthClients[idx] : null;
+        }
+        renderOauthClients();
+        if (state.oauthClient) {
+          // A lista atualizada ao final do provisionamento deve refletir o novo
+          // device_id sem iniciar outra avaliacao que sobrescreva o resultado final.
+          renderOauthPreview(!payload.preservePreparationResult);
+          loadFiscalSeries();
         }
         toast(`${state.oauthClients.length} dispositivo(s) ${isSelfHostMode() ? "SelfHost" : "ativo(s)"} localizado(s).`, "success");
         break;
       }
       case "oauthClientCreated": {
         state.oauthClients = payload.items || [];
-        renderOauthClients();
         const createdId = payload.item?.clientId || "";
         const idx = state.oauthClients.findIndex(x => x.clientId === createdId);
-        if (idx >= 0) {
-          state.oauthClient = state.oauthClients[idx];
-          $("oauth-select").value = String(idx);
-        }
+        const createdName = String(payload.item?.name || "").toLowerCase();
+        const nameIdx = idx >= 0 ? idx : state.oauthClients.findIndex(x => String(x.name || "").toLowerCase() === createdName);
+        state.oauthClient = nameIdx >= 0 ? state.oauthClients[nameIdx] : null;
+        renderOauthClients();
         state.deviceMode = "existing";
         const existingRadio = document.querySelector('input[name="device-mode"][value="existing"]');
         if (existingRadio) existingRadio.checked = true;
         $("new-device-name").value = "";
+        clearInlineError("selfhost-create-error");
         closeSelfHostCreateModal();
         state.fiscalSeries = [];
         renderDeviceMode();
         renderOauthPreview();
         loadFiscalSeries();
-        toast(`Dispositivo ${payload.item?.name || ""} criado e selecionado.`, "success");
+        toast(
+          nameIdx >= 0
+            ? `Dispositivo ${payload.item?.name || ""} criado e selecionado.`
+            : `Dispositivo ${payload.item?.name || ""} criado; ele ainda não apareceu na listagem atualizada.`,
+          "success");
         break;
       }
       case "fiscalSeries":
         if (!state.oauthClient || payload.clientId === state.oauthClient.clientId) {
           state.fiscalSeries = payload.items || [];
+          clearInlineError("series-error");
           renderFiscalSeries();
         }
         break;
       case "fiscalSeriesSaved": {
         state.fiscalSeries = payload.items || [];
+        clearInlineError("series-error");
         renderFiscalSeries();
         const type = payload.item?.documentType === "NFCe" ? "nfce" : "nfe";
         if (payload.item?.id && $(`${type}-record`)) {
@@ -1274,6 +1618,16 @@
         toast(`Série ${payload.item?.documentType || "fiscal"} salva com sucesso.`, "success");
         break;
       }
+      case "fiscalSeriesError":
+        if (!state.oauthClient || !payload.clientId || payload.clientId === state.oauthClient.clientId) {
+          state.seriesExpanded = true;
+          renderFiscalSeries();
+          showInlineError("series-error", payload.message || "Não foi possível salvar a série.");
+        }
+        break;
+      case "selfHostCreateError":
+        showInlineError("selfhost-create-error", payload.message || "Não foi possível criar o dispositivo SelfHost.");
+        break;
       case "androidDevices":
         state.androidDevices = payload.items || [];
         renderAndroid();
@@ -1305,8 +1659,8 @@
         setBusy("provision", false);
         const tef = payload.module === "smart_tef";
         renderValidation({
-          status: payload.success ? "success" : "warning",
-          title: payload.success ? (tef ? "Smart TEF configurado" : "Smart vinculado") : (tef ? "Smart TEF precisa de verificação" : "Vinculo precisa de verificacao"),
+          status: payload.success ? "success" : "danger",
+          title: payload.success ? (tef ? "Smart TEF configurado" : "Smart vinculado") : (tef ? "Erro ao configurar Smart TEF" : "Erro ao vincular dispositivo"),
           detail: payload.message || "Processo finalizado."
         });
         if (!tef && payload.url) {
@@ -1319,7 +1673,9 @@
             ? "Smart TEF configurado. Validação concluída e botão Concluir acionado."
             : (payload.accessMode === "online"
               ? "Vínculo confirmado pelo Softcomshop. Smart preparado para a próxima etapa."
-              : "Vínculo confirmado no banco. Smart preparado para a próxima etapa.");
+              : (payload.accessMode === "selfhost"
+                ? "Vínculo confirmado pela API administrativa do SelfHost."
+                : "Vínculo confirmado no banco. Smart preparado para a próxima etapa."));
           toast(successText, "success");
         } else {
           const extra = payload.uiSummary ? ` Tela detectada: ${payload.uiSummary}` : "";

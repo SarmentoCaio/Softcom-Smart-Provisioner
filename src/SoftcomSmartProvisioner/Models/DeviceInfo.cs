@@ -9,7 +9,10 @@ public sealed record DeviceInfo(
     string AndroidVersion,
     int? Battery,
     long? LatencyMs,
-    string AndroidId)
+    string AndroidId,
+    string SmartVersion,
+    string SmartFlow)
 {
     public bool IsOnline => string.Equals(State, "device", StringComparison.OrdinalIgnoreCase);
+    public string ConfirmedSmartDeviceId { get; init; } = string.Empty;
 }
