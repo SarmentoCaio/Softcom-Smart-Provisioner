@@ -136,5 +136,5 @@ jobs:
           "## Release publicada" >> $env:GITHUB_STEP_SUMMARY
           "- Versao: **${{ steps.version.outputs.version }}**" >> $env:GITHUB_STEP_SUMMARY
           "- Pacote: **${{ steps.package.outputs.zipName }}**" >> $env:GITHUB_STEP_SUMMARY
-          "- SHA-256: `${{ steps.package.outputs.sha256 }}`" >> $env:GITHUB_STEP_SUMMARY
+          "- SHA-256: ${{ steps.package.outputs.sha256 }}" >> $env:GITHUB_STEP_SUMMARY
           "- update/latest.json atualizado automaticamente na branch main." >> $env:GITHUB_STEP_SUMMARY
