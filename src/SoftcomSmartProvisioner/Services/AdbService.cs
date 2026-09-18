@@ -59,8 +59,17 @@ public sealed class AdbService
             var transport = GetTransport(serial);
 
             string androidVersion = string.Empty;
+            string androidSdk = string.Empty;
+            string manufacturer = string.Empty;
+            string productModel = model;
             string androidId = string.Empty;
             string smartVersion = string.Empty;
+            string smartPackage = string.Empty;
+            IReadOnlyList<string> smartPackageCandidates = Array.Empty<string>();
+            string currentActivity = string.Empty;
+            string resolution = string.Empty;
+            string density = string.Empty;
+            IReadOnlyDictionary<string, string> permissions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             string smartFlow = "Nao detectado";
             int? battery = null;
             long? latency = null;
@@ -80,6 +89,14 @@ public sealed class AdbService
                 {
                     androidVersion = versionResult.StandardOutput.Trim();
                 }
+
+                manufacturer = await ReadShellValueAsync(serial, "getprop ro.product.manufacturer", cancellationToken);
+                var reportedModel = await ReadShellValueAsync(serial, "getprop ro.product.model", cancellationToken);
+                if (!string.IsNullOrWhiteSpace(reportedModel)) productModel = reportedModel;
+                androidSdk = await ReadShellValueAsync(serial, "getprop ro.build.version.sdk", cancellationToken);
+                resolution = await ReadShellValueAsync(serial, "wm size", cancellationToken);
+                density = await ReadShellValueAsync(serial, "wm density", cancellationToken);
+                currentActivity = await GetForegroundActivityAsync(serial, cancellationToken);
 
                 var idResult = await ShellAsync(serial, "settings get secure android_id", cancellationToken, 6000);
                 if (idResult.Success)
@@ -101,14 +118,15 @@ public sealed class AdbService
                     }
                 }
 
-                // Detecta a versao instalada do Smart para escolher o fluxo de automacao.
-                // Primeiro tenta o package padrao; se nao existir, tenta a variante RedeFlex/TEF.
-                smartVersion = await GetPackageVersionNameAsync(serial, "softcom.mobile.smart2", cancellationToken);
-                if (string.IsNullOrWhiteSpace(smartVersion))
-                {
-                    smartVersion = await GetPackageVersionNameAsync(serial, "softcom.mobile.smart2.redeflex", cancellationToken);
-                }
+                // O package varia por adquirente. Primeiro enumera no proprio aparelho e
+                // valida cada candidato por dumpsys; nunca reutiliza o package de outro UDID.
+                var detectedSmart = await DetectSmartPackageAsync(serial, cancellationToken);
+                smartPackage = detectedSmart.PackageName;
+                smartVersion = detectedSmart.VersionName;
+                smartPackageCandidates = detectedSmart.Candidates;
                 smartFlow = ClassifySmartFlow(smartVersion);
+                if (!string.IsNullOrWhiteSpace(smartPackage))
+                    permissions = await GetRelevantPermissionsAsync(serial, smartPackage, cancellationToken);
             }
 
             devices.Add(new DeviceInfo(
@@ -122,7 +140,18 @@ public sealed class AdbService
                 latency,
                 androidId,
                 smartVersion,
-                smartFlow));
+                smartFlow)
+            {
+                Manufacturer = manufacturer,
+                Model = productModel,
+                AndroidSdk = androidSdk,
+                Resolution = resolution,
+                Density = density,
+                SmartPackage = smartPackage,
+                SmartPackageCandidates = smartPackageCandidates,
+                CurrentActivity = currentActivity,
+                RelevantPermissions = permissions
+            });
         }
 
         return devices;
@@ -133,7 +162,21 @@ public sealed class AdbService
         string command,
         CancellationToken cancellationToken = default,
         int timeoutMilliseconds = 30000) =>
-        RunAsync(new[] { "-s", serial, "shell", command }, cancellationToken, timeoutMilliseconds);
+        RunAsync(BuildShellArguments(serial, command), cancellationToken, timeoutMilliseconds);
+
+    public static string[] BuildShellArguments(string serial, string command)
+    {
+        if (string.IsNullOrWhiteSpace(serial)) throw new ArgumentException("O serial ADB é obrigatório.", nameof(serial));
+        return new[] { "-s", serial.Trim(), "shell", command };
+    }
+
+    public static IReadOnlyList<string> ParseConnectedSerials(string adbDevicesOutput) =>
+        (adbDevicesOutput ?? string.Empty)
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => Regex.Split(x.Trim(), "\\s+"))
+            .Where(x => x.Length >= 2 && !x[0].Equals("List", StringComparison.OrdinalIgnoreCase))
+            .Select(x => x[0])
+            .ToArray();
 
     public Task<ProcessResult> ClearPackageAsync(
         string serial,
@@ -345,6 +388,46 @@ public sealed class AdbService
         return string.Empty;
     }
 
+    public async Task<string> GetForegroundActivityAsync(string serial, CancellationToken cancellationToken = default)
+    {
+        foreach (var command in new[] { "dumpsys window windows", "dumpsys activity activities" })
+        {
+            var result = await ShellAsync(serial, command, cancellationToken, 12000);
+            if (!result.Success) continue;
+            foreach (var pattern in new[]
+            {
+                @"mCurrentFocus=.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)",
+                @"mResumedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)",
+                @"ResumedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)"
+            })
+            {
+                var match = Regex.Match(result.StandardOutput, pattern, RegexOptions.IgnoreCase);
+                if (match.Success) return match.Groups[1].Value.Trim();
+            }
+        }
+        return string.Empty;
+    }
+
+    public async Task<IReadOnlyDictionary<string, string>> GetRelevantPermissionsAsync(
+        string serial,
+        string packageName,
+        CancellationToken cancellationToken = default)
+    {
+        var result = await ShellAsync(serial, $"dumpsys package {packageName}", cancellationToken, 12000);
+        var output = result.CombinedOutput ?? string.Empty;
+        var names = new[]
+        {
+            "android.permission.READ_EXTERNAL_STORAGE",
+            "android.permission.WRITE_EXTERNAL_STORAGE",
+            "android.permission.POST_NOTIFICATIONS",
+            "android.permission.CAMERA"
+        };
+        return names.ToDictionary(
+            name => name[(name.LastIndexOf('.') + 1)..],
+            name => Regex.IsMatch(output, $@"{Regex.Escape(name)}:\s*granted=true", RegexOptions.IgnoreCase) ? "Concedida" : "Não concedida",
+            StringComparer.OrdinalIgnoreCase);
+    }
+
     public Task<ProcessResult> TapAsync(
         string serial,
         int x,
@@ -362,9 +445,19 @@ public sealed class AdbService
         durationMs = Math.Clamp(durationMs, 500, 15000);
         return ShellAsync(
             serial,
-            $"input swipe {x} {y} {x} {y} {durationMs}",
+            BuildLongPressCommand(x, y, durationMs),
             cancellationToken,
             durationMs + 10000);
+    }
+
+    public static string BuildLongPressCommand(int x, int y, int durationMs = 5000)
+    {
+        durationMs = Math.Clamp(durationMs, 500, 15000);
+        // Alguns firmwares tratam swipe com inicio e fim identicos como um tap
+        // comum. Um deslocamento de apenas um pixel continua dentro do touch-slop
+        // do botao, mas obriga o Android a manter o gesto durante todo o periodo.
+        var endX = x < int.MaxValue ? x + 1 : x - 1;
+        return $"input touchscreen swipe {x} {y} {endX} {y} {durationMs}";
     }
 
     public async Task<string> GetPackageVersionNameAsync(
@@ -447,10 +540,32 @@ public sealed class AdbService
         }
 
         var output = result.CombinedOutput ?? string.Empty;
+        return IsSoftKeyboardActuallyVisible(output);
+    }
+
+    private static bool IsSoftKeyboardActuallyVisible(string? dumpsysOutput)
+    {
+        var output = dumpsysOutput ?? string.Empty;
+
+        // Android 11/12 pode manter mInputShown/mShowRequested=true mesmo depois de o
+        // IME perder a janela visivel. Enviar BACK nesse estado volta a Activity do
+        // Smart em vez de apenas recolher o teclado. Quando o dump expoe o estado da
+        // janela, ele e a fonte de verdade; mInputShown fica apenas como compatibilidade
+        // para ROMs antigas que nao publicam nenhum dos indicadores visuais.
+        var publishesWindowState =
+            output.Contains("mIsInputViewShown=", StringComparison.OrdinalIgnoreCase) ||
+            output.Contains("mWindowVisible=", StringComparison.OrdinalIgnoreCase) ||
+            output.Contains("mDecorViewVisible=", StringComparison.OrdinalIgnoreCase);
+
+        if (publishesWindowState)
+        {
+            return output.Contains("mIsInputViewShown=true", StringComparison.OrdinalIgnoreCase) ||
+                   output.Contains("mWindowVisible=true", StringComparison.OrdinalIgnoreCase) ||
+                   output.Contains("mDecorViewVisible=true", StringComparison.OrdinalIgnoreCase);
+        }
+
         return output.Contains("mInputShown=true", StringComparison.OrdinalIgnoreCase) ||
-               output.Contains("mIsInputViewShown=true", StringComparison.OrdinalIgnoreCase) ||
-               output.Contains("inputShown=true", StringComparison.OrdinalIgnoreCase) ||
-               output.Contains("showRequested=true", StringComparison.OrdinalIgnoreCase);
+               output.Contains("inputShown=true", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -584,6 +699,63 @@ public sealed class AdbService
             .ToArray();
     }
 
+    public async Task<SmartPackageDetection> DetectSmartPackageAsync(
+        string serial,
+        CancellationToken cancellationToken = default)
+    {
+        var candidates = await FindLikelySmartPackagesAsync(serial, cancellationToken);
+        var validated = new List<(string Package, string Version)>();
+        foreach (var packageName in candidates)
+        {
+            var version = await GetPackageVersionNameAsync(serial, packageName, cancellationToken);
+            if (!string.IsNullOrWhiteSpace(version)) validated.Add((packageName, version));
+        }
+
+        if (validated.Count == 0)
+            return new SmartPackageDetection(string.Empty, string.Empty, candidates);
+
+        var foreground = await GetForegroundPackageAsync(serial, cancellationToken);
+        var selectedPackage = SelectPreferredSmartPackage(
+            validated.Select(x => x.Package),
+            foreground);
+        var selected = validated.First(x => x.Package.Equals(selectedPackage, StringComparison.OrdinalIgnoreCase));
+
+        return new SmartPackageDetection(selected.Package, selected.Version, validated.Select(x => x.Package).ToArray());
+    }
+
+    public static int SmartPackageScore(string packageName)
+    {
+        if (packageName.Equals("softcom.mobile.smart2", StringComparison.OrdinalIgnoreCase)) return 100;
+        if (packageName.Contains("mobile.smart", StringComparison.OrdinalIgnoreCase)) return 90;
+        if (packageName.Contains("smart2", StringComparison.OrdinalIgnoreCase)) return 80;
+        if (packageName.Contains("smart", StringComparison.OrdinalIgnoreCase)) return 60;
+        if (packageName.Contains("softcom", StringComparison.OrdinalIgnoreCase)) return 20;
+        return 0;
+    }
+
+    public static string SelectPreferredSmartPackage(IEnumerable<string> packages, string? foregroundPackage)
+    {
+        var candidates = packages
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(SmartPackageScore)
+            .ThenBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (candidates.Length == 0) return string.Empty;
+
+        var selected = candidates[0];
+        var foreground = candidates.FirstOrDefault(x =>
+            x.Equals(foregroundPackage, StringComparison.OrdinalIgnoreCase));
+
+        // Estar em primeiro plano nao torna um package o Smart. Adquirentes podem
+        // manter launchers próprios com "smart" no nome (ex.: Mercado Pago SmartPOS).
+        // O foreground só desempata candidatos com a mesma confiança do melhor package.
+        return !string.IsNullOrWhiteSpace(foreground) &&
+               SmartPackageScore(foreground) >= SmartPackageScore(selected)
+            ? foreground
+            : selected;
+    }
+
     private Task<ProcessResult> RunAsync(
         IEnumerable<string> arguments,
         CancellationToken cancellationToken,
@@ -600,6 +772,12 @@ public sealed class AdbService
             _toolsDirectory,
             cancellationToken,
             timeoutMilliseconds);
+    }
+
+    private async Task<string> ReadShellValueAsync(string serial, string command, CancellationToken cancellationToken)
+    {
+        var result = await ShellAsync(serial, command, cancellationToken, 8000);
+        return result.Success ? result.StandardOutput.Trim() : string.Empty;
     }
 
     private static Dictionary<string, string> ParseProperties(IEnumerable<string> columns)
@@ -639,3 +817,8 @@ public sealed class AdbService
         return serial.Contains(':') ? "Wi-Fi" : "USB";
     }
 }
+
+public sealed record SmartPackageDetection(
+    string PackageName,
+    string VersionName,
+    IReadOnlyList<string> Candidates);

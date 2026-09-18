@@ -36,6 +36,13 @@ public sealed class MainForm : Form
     private CoreWebView2Environment? _webEnvironment;
     private OnlineSoftcomshopService? _onlineSoftcomshopService;
     private readonly SelfHostDeviceService _selfHostDeviceService;
+    private readonly DeviceCatalogService _deviceCatalogService;
+    private readonly MultiDeviceProvisioningService _multiDeviceProvisioningService = new();
+    private readonly AsyncLocal<ProvisioningExecutionContext?> _provisioningContext = new();
+    private readonly SemaphoreSlim _sharedInfrastructureGate = new(1, 1);
+    private readonly object _settingsMutationGate = new();
+    private DeviceCatalogSnapshot _deviceCatalog = new(null, Array.Empty<DeviceCatalogEntry>(), Array.Empty<string>(),
+        new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase));
 
     private IReadOnlyList<DeviceInfo> _androidDevices = Array.Empty<DeviceInfo>();
     private bool _pageReady;
@@ -55,6 +62,14 @@ public sealed class MainForm : Form
         _secretStore = new SecretStore(_appDataDirectory);
         _databaseService = new DatabaseService(_secretStore);
         _selfHostDeviceService = new SelfHostDeviceService(message => WriteLog("SELFHOST", message));
+        _deviceCatalogService = new DeviceCatalogService();
+        _deviceCatalog = _deviceCatalogService.Load();
+        WriteLog("CATALOGO", _deviceCatalog.SourcePath is null
+            ? "Arquivo .env de UDIDs não localizado; dispositivos serão marcados como não identificados."
+            : $"Catálogo de UDIDs carregado com {_deviceCatalog.Entries.Count} mapeamento(s); somente variáveis *_UDID foram lidas.");
+        if (_deviceCatalog.DuplicateSerials.Count > 0)
+            WriteLog("CATALOGO", $"{_deviceCatalog.DuplicateSerials.Count} UDID(s) duplicado(s) serão marcados para validação.", "WARN");
+        _multiDeviceProvisioningService.JobChanged += snapshot => PostEvent("provisionJob", snapshot);
         _adbService = new AdbService(toolsDirectory);
         _scrcpyService = new ScrcpyService(toolsDirectory);
         _smartAutomationService = new SmartUiAutomationService(_adbService);
@@ -73,6 +88,7 @@ public sealed class MainForm : Form
         Width = 1480;
         Height = 920;
         MinimumSize = new Size(1100, 720);
+        WindowState = FormWindowState.Maximized;
         BackColor = Color.FromArgb(10, 16, 28);
 
         var iconPath = Path.Combine(baseDirectory, "Assets", "App.ico");
@@ -176,6 +192,10 @@ public sealed class MainForm : Form
                     await LoadDatabasesAsync(request.Payload);
                     break;
 
+                case "resolveDockerClient":
+                    await ResolveDockerClientAsync(request.Payload);
+                    break;
+
                 case "loadCompanies":
                     await LoadCompaniesAsync(request.Payload);
                     break;
@@ -228,6 +248,10 @@ public sealed class MainForm : Form
                     SaveSmartPackage(request.Payload);
                     break;
 
+                case "saveSmartTefSettings":
+                    SaveSmartTefSettings(request.Payload, notify: true);
+                    break;
+
                 case "detectSmartPackages":
                     await DetectSmartPackagesAsync(request.Payload);
                     break;
@@ -250,6 +274,15 @@ public sealed class MainForm : Form
 
                 case "prepareSmart":
                     await PrepareSmartAsync(request.Payload);
+                    break;
+
+                case "cancelProvisioningJob":
+                    if (ReadString(request.Payload, "serial") is { } cancelSerial)
+                        _multiDeviceProvisioningService.Cancel(cancelSerial);
+                    break;
+
+                case "cancelAllProvisioning":
+                    _multiDeviceProvisioningService.CancelAll();
                     break;
 
                 case "copyText":
@@ -300,7 +333,7 @@ public sealed class MainForm : Form
                 name = "Softcom Smart Provisioner",
                 version = AppVersion,
                 architecture = ".NET 8 + WebView2",
-                phase = "Fase 7 - Atualizacao automatica"
+                phase = "Desenvolvimento 1.0.4"
             },
             environments = EnvironmentCatalog.Environments.Values,
             selfHost = new
@@ -319,6 +352,10 @@ public sealed class MainForm : Form
                     : "SelfHost nao localizado."
             },
             settings,
+            smartTef = new
+            {
+                hasSavedToken = !string.IsNullOrWhiteSpace(_secretStore.Get(SecretStore.SmartTefToken))
+            },
             logs = _logService.GetRecent(),
             capabilities = new
             {
@@ -355,9 +392,20 @@ public sealed class MainForm : Form
             }, _shutdown.Token);
 
             _androidDevices = devices
-                .Select(x => x with
+                .Select(x =>
                 {
-                    ConfirmedSmartDeviceId = GetConfirmedSmartDeviceId(x.Serial, x.AndroidId)
+                    var identity = DeviceCatalogService.Identify(x.Serial, _deviceCatalog, x.Model);
+                    return x with
+                    {
+                        ConfirmedSmartDeviceId = GetConfirmedSmartDeviceId(x.Serial, x.AndroidId),
+                        Acquirer = identity.Acquirer,
+                        TerminalModel = identity.TerminalModel,
+                        FriendlyName = identity.FriendlyName,
+                        IsKnownDevice = identity.IsKnownDevice,
+                        IsAmbiguousIdentity = identity.IsAmbiguous,
+                        IdentificationStatus = identity.Status,
+                        ProvisioningProfile = identity.ProvisioningProfile
+                    };
                 })
                 .ToArray();
             foreach (var device in _androidDevices.Where(x => x.IsOnline))
@@ -365,7 +413,8 @@ public sealed class MainForm : Form
                 var smartInfo = string.IsNullOrWhiteSpace(device.SmartVersion)
                     ? "Smart nao detectado"
                     : $"Smart {device.SmartVersion} ({device.SmartFlow})";
-                WriteLog("ADB", $"{device.Model} / {device.Serial}: Android {device.AndroidVersion}; {smartInfo}.");
+                var packageInfo = string.IsNullOrWhiteSpace(device.SmartPackage) ? "nao detectado" : device.SmartPackage;
+                WriteLog("ADB", $"{device.FriendlyName} / {device.Serial}: modelo Android {device.Model}; Android {device.AndroidVersion} (SDK {device.AndroidSdk}); package {packageInfo}; {smartInfo}.");
             }
             PostEvent("androidDevices", new
             {
@@ -651,47 +700,12 @@ public sealed class MainForm : Form
                         throw new InvalidOperationException("Informe uma numeração inicial NFC-e válida.");
                 }
 
-                int? legacyNfeInitialNumber = null;
-                if (!modernSelfHost && !string.IsNullOrWhiteSpace(nfeSeries))
-                {
-                    if (!int.TryParse(nfeSeries, out var parsedNfeSeries) || parsedNfeSeries < 0)
-                        throw new InvalidOperationException("Informe uma série NF-e válida ou deixe a NF-e em branco.");
-                    if (!int.TryParse(nfeInitialNumberText, out var parsedNfeNumber) || parsedNfeNumber < 1)
-                        throw new InvalidOperationException("Informe uma numeração inicial NF-e válida.");
-                    legacyNfeInitialNumber = parsedNfeNumber;
-                }
-
                 item = await _selfHostDeviceService.CreateDeviceAsync(
                     name, effectiveSeries, effectiveInitialNumber, _shutdown.Token);
 
-                // Preserva o cadastro opcional de NF-e do fluxo 4.0. No 4.1+, o
-                // Gerenciador envia apenas a série efetiva no POST administrativo.
-                if (!modernSelfHost && legacyNfeInitialNumber.HasValue)
-                {
-                    var currentSeries = await ExecuteOnlineAsync(
-                        normalizedDatabase,
-                        "consultar ambiente fiscal do dispositivo SelfHost",
-                        service => service.GetFiscalSeriesAsync(normalizedDatabase, companyId, item.ClientId, _shutdown.Token));
-                    var fiscalEnvironment = currentSeries
-                        .FirstOrDefault(x => x.DocumentType.Equals("NFCe", StringComparison.OrdinalIgnoreCase))?.Environment
-                        ?? currentSeries.FirstOrDefault()?.Environment;
-                    if (fiscalEnvironment is not (1 or 2))
-                        throw new InvalidOperationException("O dispositivo SelfHost foi criado, mas não foi possível determinar o ambiente fiscal para vincular a NF-e.");
-
-                    await ExecuteOnlineAsync(
-                        normalizedDatabase,
-                        "salvar série NF-e do dispositivo SelfHost",
-                        service => service.SaveFiscalSeriesAsync(
-                            normalizedDatabase,
-                            companyId,
-                            item.ClientId,
-                            "nfe",
-                            null,
-                            nfeSeries,
-                            legacyNfeInitialNumber.Value,
-                            fiscalEnvironment.Value,
-                            _shutdown.Token));
-                }
+                // O endpoint administrativo oficial do SelfHost recebe uma única série.
+                // No 4.0 ela é a NFC-e; no 4.1+ a NF-e funciona apenas como fallback
+                // quando a NFC-e não foi informada. Não há uma segunda gravação fiscal.
 
                 items = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
                 var listedItem = items.FirstOrDefault(x =>
@@ -904,15 +918,14 @@ public sealed class MainForm : Form
 
     private string GetConfirmedSmartDeviceId(string serial, string adbAndroidId)
     {
-        var settings = _settingsService.Load();
-        settings.ConfirmedSmartDeviceIds ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var key in BuildSmartDeviceIdentityKeys(serial, adbAndroidId))
+        lock (_settingsMutationGate)
         {
-            if (settings.ConfirmedSmartDeviceIds.TryGetValue(key, out var deviceId) &&
-                IsSafeDeviceId(deviceId))
+            var settings = _settingsService.Load();
+            settings.ConfirmedSmartDeviceIds ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var key in BuildSmartDeviceIdentityKeys(serial, adbAndroidId))
             {
-                return deviceId.Trim();
+                if (settings.ConfirmedSmartDeviceIds.TryGetValue(key, out var deviceId) &&
+                    IsSafeDeviceId(deviceId)) return deviceId.Trim();
             }
         }
 
@@ -924,21 +937,22 @@ public sealed class MainForm : Form
         if (!IsSafeDeviceId(deviceId)) return;
 
         var confirmedDeviceId = deviceId.Trim();
-        var settings = _settingsService.Load();
-        settings.ConfirmedSmartDeviceIds ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var key in BuildSmartDeviceIdentityKeys(serial, adbAndroidId))
+        lock (_settingsMutationGate)
         {
-            settings.ConfirmedSmartDeviceIds[key] = confirmedDeviceId;
-        }
-        _settingsService.Save(settings);
+            var settings = _settingsService.Load();
+            settings.ConfirmedSmartDeviceIds ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var key in BuildSmartDeviceIdentityKeys(serial, adbAndroidId))
+                settings.ConfirmedSmartDeviceIds[key] = confirmedDeviceId;
+            _settingsService.Save(settings);
 
-        // Mantem a leitura usada por EvaluateLink coerente imediatamente apos o
-        // vinculo, sem depender de uma nova atualizacao ADB da tela.
-        _androidDevices = _androidDevices
-            .Select(x => string.Equals(x.Serial, serial, StringComparison.OrdinalIgnoreCase)
-                ? x with { ConfirmedSmartDeviceId = confirmedDeviceId }
-                : x)
-            .ToArray();
+            // Mantem a leitura usada por EvaluateLink coerente imediatamente apos o
+            // vinculo, sem depender de uma nova atualizacao ADB da tela.
+            _androidDevices = _androidDevices
+                .Select(x => string.Equals(x.Serial, serial, StringComparison.OrdinalIgnoreCase)
+                    ? x with { ConfirmedSmartDeviceId = confirmedDeviceId }
+                    : x)
+                .ToArray();
+        }
     }
 
     private static IEnumerable<string> BuildSmartDeviceIdentityKeys(string serial, string adbAndroidId)
@@ -1240,11 +1254,56 @@ public sealed class MainForm : Form
     private void SaveSmartPackage(JsonElement payload)
     {
         var packageName = ReadString(payload, "packageName")?.Trim() ?? string.Empty;
+        var serial = ReadString(payload, "serial")?.Trim();
         var settings = _settingsService.Load();
-        settings.SmartPackageName = packageName;
+        settings.SmartPackageNamesBySerial ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(serial)) settings.SmartPackageNamesBySerial[serial] = packageName;
+        else settings.SmartPackageName = packageName;
         _settingsService.Save(settings);
         SendBootstrap();
         PostEvent("toast", new { type = "success", message = "Package name salvo." });
+    }
+
+    private void SaveSmartTefSettings(JsonElement payload, bool notify)
+    {
+        var deviceName = ReadString(payload, "tefDeviceName")?.Trim();
+        var cnpj = ReadString(payload, "tefCnpj")?.Trim();
+        var empresaId = ReadString(payload, "tefEmpresaId")?.Trim();
+        var token = ReadString(payload, "tefToken")?.Trim();
+
+        if (string.IsNullOrWhiteSpace(deviceName))
+            throw new InvalidOperationException("Informe o Nome do dispositivo do Smart TEF.");
+        if (string.IsNullOrWhiteSpace(cnpj))
+            throw new InvalidOperationException("Informe o CNPJ do Smart TEF.");
+        if (string.IsNullOrWhiteSpace(empresaId))
+            throw new InvalidOperationException("Informe o Empresa ID do Smart TEF.");
+        if (string.IsNullOrWhiteSpace(token) &&
+            string.IsNullOrWhiteSpace(_secretStore.Get(SecretStore.SmartTefToken)))
+        {
+            throw new InvalidOperationException("Informe o Token do Smart TEF antes de salvar.");
+        }
+
+        lock (_settingsMutationGate)
+        {
+            var settings = _settingsService.Load();
+            settings.SmartTefDeviceName = deviceName;
+            settings.SmartTefCnpj = cnpj;
+            settings.SmartTefEmpresaId = empresaId;
+            settings.SaveSmartTefConfiguration = true;
+            _settingsService.Save(settings);
+            if (!string.IsNullOrWhiteSpace(token))
+                _secretStore.Set(SecretStore.SmartTefToken, token);
+        }
+
+        if (!notify) return;
+
+        SendBootstrap();
+        PostEvent("smartTefSettingsSaved", new { hasSavedToken = true });
+        PostEvent("toast", new
+        {
+            type = "success",
+            message = "Configuracao do Smart TEF salva neste usuario do Windows."
+        });
     }
 
     private async Task DetectSmartPackagesAsync(JsonElement payload)
@@ -1255,19 +1314,19 @@ public sealed class MainForm : Form
         PostBusy("packages", true);
         try
         {
-            var items = await _adbService.FindLikelySmartPackagesAsync(serial, _shutdown.Token);
+            var detection = await _adbService.DetectSmartPackageAsync(serial, _shutdown.Token);
+            var items = detection.Candidates;
             var foregroundPackage = await _adbService.GetForegroundPackageAsync(serial, _shutdown.Token);
-
-            if (!string.IsNullOrWhiteSpace(foregroundPackage) &&
-                items.Contains(foregroundPackage, StringComparer.OrdinalIgnoreCase))
+            if (!string.IsNullOrWhiteSpace(detection.PackageName))
             {
                 var settings = _settingsService.Load();
-                settings.SmartPackageName = foregroundPackage;
+                settings.SmartPackageNamesBySerial ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                settings.SmartPackageNamesBySerial[serial] = detection.PackageName;
                 _settingsService.Save(settings);
                 SendBootstrap();
             }
 
-            PostEvent("smartPackages", new { items, serial, foregroundPackage });
+            PostEvent("smartPackages", new { items, serial, foregroundPackage, selectedPackage = detection.PackageName, version = detection.VersionName });
         }
         finally
         {
@@ -1280,21 +1339,12 @@ public sealed class MainForm : Form
         var serial = ReadString(payload, "serial")
             ?? throw new InvalidOperationException("Selecione um Android.");
         var settings = _settingsService.Load();
-        var packageName = settings.SmartPackageName;
+        var android = _androidDevices.FirstOrDefault(x => x.Serial.Equals(serial, StringComparison.OrdinalIgnoreCase));
+        var packageName = android is null ? string.Empty : ResolveDevicePackage(android, settings);
 
         if (string.IsNullOrWhiteSpace(packageName))
         {
-            var foregroundPackage = await _adbService.GetForegroundPackageAsync(serial, _shutdown.Token);
-            if (!string.IsNullOrWhiteSpace(foregroundPackage) &&
-                (foregroundPackage.Contains("softcom", StringComparison.OrdinalIgnoreCase) ||
-                 foregroundPackage.Contains("smart", StringComparison.OrdinalIgnoreCase)))
-            {
-                packageName = foregroundPackage;
-            }
-            else if (await _adbService.IsPackageInstalledAsync(serial, "softcom.mobile.smart2", _shutdown.Token))
-            {
-                packageName = "softcom.mobile.smart2";
-            }
+            packageName = (await _adbService.DetectSmartPackageAsync(serial, _shutdown.Token)).PackageName;
         }
 
         if (string.IsNullOrWhiteSpace(packageName))
@@ -1303,12 +1353,9 @@ public sealed class MainForm : Form
                 "Nao foi possivel identificar automaticamente o package do Smart. Abra o Smart no Android e tente novamente.");
         }
 
-        if (!string.Equals(settings.SmartPackageName, packageName, StringComparison.OrdinalIgnoreCase))
-        {
-            settings.SmartPackageName = packageName;
-            _settingsService.Save(settings);
-            SendBootstrap();
-        }
+        settings.SmartPackageNamesBySerial ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        settings.SmartPackageNamesBySerial[serial] = packageName;
+        _settingsService.Save(settings);
 
         var result = await _adbService.ClearPackageAsync(serial, packageName, _shutdown.Token);
         if (!result.Success || !result.StandardOutput.Contains("Success", StringComparison.OrdinalIgnoreCase))
@@ -1480,6 +1527,164 @@ public sealed class MainForm : Form
     private async Task PrepareSmartAsync(JsonElement payload)
     {
         PostBusy("provision", true);
+        try
+        {
+            var serials = ReadStringArray(payload, "serials");
+            if (serials.Count == 0 && ReadString(payload, "serial") is { } singleSerial)
+                serials = new[] { singleSerial };
+            if (serials.Count == 0) throw new InvalidOperationException("Selecione ao menos um Android.");
+
+            var devices = serials
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(serial => _androidDevices.FirstOrDefault(x => x.Serial.Equals(serial, StringComparison.OrdinalIgnoreCase)))
+                .Where(x => x is not null && x.IsOnline)
+                .Cast<DeviceInfo>()
+                .ToArray();
+            if (devices.Length != serials.Distinct(StringComparer.OrdinalIgnoreCase).Count())
+                throw new InvalidOperationException("Um ou mais Androids selecionados não estão mais online. Atualize a lista.");
+
+            // Congela o payload e o cadastro de cada Android antes de iniciar qualquer
+            // operacao assÃ­ncrona. Assim, atualizacoes da lista durante um job nao podem
+            // fazer outro job herdar o ultimo cadastro selecionado na interface.
+            var requests = devices.Select(device =>
+            {
+                var individualPayload = WithSerial(payload, device.Serial, devices.Length > 1);
+                var module = ReadString(individualPayload, "module") ?? "smart_pdv";
+                var target = string.Equals(module, "smart_tef", StringComparison.OrdinalIgnoreCase)
+                    ? null
+                    : ReadObject<OAuthClientInfo>(individualPayload, "oauthClient");
+                if (!string.Equals(module, "smart_tef", StringComparison.OrdinalIgnoreCase) && target is null)
+                    throw new InvalidOperationException($"Selecione o cadastro que sera vinculado ao Android {device.FriendlyName} ({device.Serial}).");
+                return new ProvisioningRequest(
+                    new ProvisioningJob(device, target?.Name ?? string.Empty),
+                    individualPayload,
+                    target?.ClientId ?? string.Empty);
+            }).ToArray();
+
+            var duplicateTargets = requests
+                .Where(x => !string.IsNullOrWhiteSpace(x.TargetClientId))
+                .GroupBy(x => x.TargetClientId, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault(x => x.Count() > 1);
+            if (duplicateTargets is not null)
+                throw new InvalidOperationException("Cada Android deve usar um cadastro diferente. Revise a selecao multidispositivo.");
+
+            var requestBySerial = requests.ToDictionary(x => x.Job.Serial, StringComparer.OrdinalIgnoreCase);
+            var jobs = requests.Select(x => x.Job).ToArray();
+            PostEvent("provisioningStarted", new { count = jobs.Length, maxParallelism = MultiDeviceProvisioningService.DefaultMaxParallelism });
+            var results = await _multiDeviceProvisioningService.RunAsync(
+                jobs,
+                async (job, token) =>
+                {
+                    var context = new ProvisioningExecutionContext(job, token);
+                    _provisioningContext.Value = context;
+                    var individualPayload = requestBySerial[job.Serial].Payload;
+                    var accessMode = ReadAccessMode(individualPayload);
+                    var jobModule = ReadString(individualPayload, "module") ?? "smart_pdv";
+                    // A API administrativa do SelfHost e todas as chamadas ADB sao
+                    // independentes por client_id/serial. Somente VPN/DB Bridge locais
+                    // continuam serializados, pois alteram infraestrutura compartilhada.
+                    var usesSharedInfrastructure = !ShouldUseSelfHost(individualPayload, jobModule) &&
+                                                   !IsOnlineMode(accessMode);
+                    var infrastructureAcquired = false;
+                    try
+                    {
+                        context.Job.Progress("target", string.IsNullOrWhiteSpace(context.Job.TargetDeviceName)
+                            ? "Destino individual confirmado."
+                            : $"Cadastro reservado para este Android: {context.Job.TargetDeviceName}.");
+                        _multiDeviceProvisioningService.NotifyChanged(context.Job);
+                        if (usesSharedInfrastructure)
+                        {
+                            await _sharedInfrastructureGate.WaitAsync(token);
+                            infrastructureAcquired = true;
+                        }
+                        await PrepareSmartDeviceAsync(individualPayload);
+                        return context.Outcome ?? new ProvisioningJobOutcome(false, "unknown", "O fluxo terminou sem resultado individual.");
+                    }
+                    finally
+                    {
+                        if (infrastructureAcquired) _sharedInfrastructureGate.Release();
+                        _provisioningContext.Value = null;
+                    }
+                },
+                _shutdown.Token);
+
+            PostEvent("provisioningFinished", new
+            {
+                success = results.Count(x => x.Status == ProvisioningJobStatus.Succeeded),
+                failed = results.Count(x => x.Status == ProvisioningJobStatus.Failed),
+                canceled = results.Count(x => x.Status == ProvisioningJobStatus.Canceled),
+                items = results
+            });
+        }
+        finally
+        {
+            PostBusy("provision", false);
+        }
+    }
+
+    private async Task ResolveDockerClientAsync(JsonElement payload)
+    {
+        var database = EnvironmentCatalog.NormalizeDatabaseName(
+            ReadString(payload, "database") ?? throw new InvalidOperationException("Informe o cliente."));
+        var matches = new List<string>();
+        var unavailable = new List<string>();
+
+        PostBusy("databases", true);
+        try
+        {
+            foreach (var environmentKey in EnvironmentCatalog.Environments.Keys)
+            {
+                try
+                {
+                    WriteLog("DOCKER", $"Procurando {EnvironmentCatalog.DatabaseDisplayName(database)} em {EnvironmentCatalog.Get(environmentKey).Label}.");
+                    await EnsureDatabaseAccessAsync(environmentKey, "localizar o cliente nos ambientes AWS", "docker");
+                    var databases = await _databaseService.GetDatabasesAsync(environmentKey, _shutdown.Token);
+                    if (databases.Contains(database, StringComparer.OrdinalIgnoreCase))
+                        matches.Add(environmentKey);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    unavailable.Add(environmentKey);
+                    WriteLog("DOCKER", $"Nao foi possivel consultar {EnvironmentCatalog.Get(environmentKey).Label}: {SanitizeSensitiveText(ex.Message)}", "WARN");
+                }
+            }
+
+            if (matches.Count == 0)
+            {
+                var suffix = unavailable.Count == EnvironmentCatalog.Environments.Count
+                    ? " Nenhum dos dois ambientes pôde ser consultado; verifique Docker, VPN e credenciais."
+                    : string.Empty;
+                throw new InvalidOperationException(
+                    $"O cliente {EnvironmentCatalog.DatabaseDisplayName(database)} nao foi localizado em AWS 1 nem AWS 2.{suffix}");
+            }
+
+            if (matches.Count > 1)
+                throw new InvalidOperationException(
+                    $"O cliente {EnvironmentCatalog.DatabaseDisplayName(database)} existe em mais de um ambiente AWS. [VALIDAR] Informe qual cadastro deve ser utilizado.");
+
+            // A busca termina com o bridge apontando para o ultimo ambiente consultado.
+            // Reativa o ambiente vencedor antes de carregar empresa/dispositivos.
+            var selectedEnvironment = matches[0];
+            await EnsureDatabaseAccessAsync(selectedEnvironment, "usar o cliente localizado", "docker");
+            PostEvent("databaseResolved", new { database, environment = selectedEnvironment });
+        }
+        finally
+        {
+            PostBusy("databases", false);
+        }
+    }
+
+    private async Task PrepareSmartDeviceAsync(JsonElement payload)
+    {
+        // Mantem o fluxo legado intacto, mas faz todas as operacoes desta execucao
+        // obedecerem tambem ao cancelamento do job individual.
+        using var _shutdown = CancellationTokenSource.CreateLinkedTokenSource(
+            this._shutdown.Token,
+            _provisioningContext.Value?.CancellationToken ?? CancellationToken.None);
         var vpnDisconnected = false;
         try
         {
@@ -1501,7 +1706,7 @@ public sealed class MainForm : Form
 
             void Progress(string stage, string message)
             {
-                WriteLog("SMART", $"[{stage}] {message}");
+                WriteLog("SMART", $"[{serial}][{stage}] {message}");
                 PostEvent("provisionProgress", new { stage, message });
             }
 
@@ -1514,6 +1719,9 @@ public sealed class MainForm : Form
                 var empresaId = ReadString(payload, "tefEmpresaId")?.Trim();
                 var token = ReadString(payload, "tefToken")?.Trim();
 
+                if (string.IsNullOrWhiteSpace(token) && ReadBool(payload, "useSavedTefToken", false))
+                    token = _secretStore.Get(SecretStore.SmartTefToken)?.Trim();
+
                 if (string.IsNullOrWhiteSpace(deviceName))
                     throw new InvalidOperationException("Informe o Nome do dispositivo do Smart TEF.");
                 if (string.IsNullOrWhiteSpace(cnpj))
@@ -1522,6 +1730,9 @@ public sealed class MainForm : Form
                     throw new InvalidOperationException("Informe o Empresa ID do Smart TEF.");
                 if (string.IsNullOrWhiteSpace(token))
                     throw new InvalidOperationException("Informe o Token do Smart TEF.");
+
+                if (ReadBool(payload, "saveTefConfiguration", false))
+                    SaveSmartTefSettings(payload, notify: false);
 
                 if (_vpnService.IsOpenVpnRunning())
                 {
@@ -1539,6 +1750,8 @@ public sealed class MainForm : Form
                     empresaId,
                     token,
                     clearData,
+                    ResolveDevicePackage(android, _settingsService.Load()),
+                    android.ProvisioningProfile,
                     Progress,
                     _shutdown.Token);
 
@@ -1577,16 +1790,66 @@ public sealed class MainForm : Form
 
             if (useSelfHost && !modernSelfHost)
             {
+                if (!oauthClient.Name.StartsWith("SELFHOST_", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"O cadastro {oauthClient.Name} nao e um dispositivo filho valido do SelfHost. Atualize a lista e selecione ou crie um cadastro com prefixo SELFHOST_.");
+                }
+
                 // Quando o vínculo usa SelfHost, ele precisa ser liberado no conjunto de
                 // dispositivos do próprio SelfHost antes de enviar a URL ao Smart. Não abortamos
                 // mais apenas porque o cadastro selecionado já possui device_id.
-                if (oauthClient.IsLinked)
+                Progress(
+                    "selfhost-preflight",
+                    $"Atualizando o estado de {oauthClient.Name} e verificando vinculos antes de abrir o Smart...");
+                var preflightDevices = await _selfHostDeviceService.ListAllDevicesAsync(_shutdown.Token);
+                var selectedCurrent = preflightDevices.FirstOrDefault(x =>
+                    string.Equals(x.ClientId, oauthClient.ClientId, StringComparison.Ordinal));
+                if (selectedCurrent?.IsLinked == true)
                 {
-                    Progress("selfhost-unlink-selected", $"Desvinculando {oauthClient.Name} do Device ID {oauthClient.DeviceId}...");
+                    Progress(
+                        "selfhost-unlink-selected",
+                        $"Desvinculando {selectedCurrent.Name} do vinculo atual antes de iniciar este Android...");
                     var selectedUnlinked = await _selfHostDeviceService.UnlinkDeviceAsync(oauthClient.ClientId, _shutdown.Token);
                     if (!selectedUnlinked)
                         throw new InvalidOperationException($"O SelfHost não confirmou a desvinculação de {oauthClient.Name}.");
-                    Progress("selfhost-unlink-selected", "Cadastro SelfHost selecionado desvinculado com sucesso.");
+                    Progress(
+                        "selfhost-unlink-selected",
+                        "Cadastro SelfHost selecionado confirmado como desvinculado pela API.");
+                    preflightDevices = await _selfHostDeviceService.ListAllDevicesAsync(_shutdown.Token);
+                }
+
+                // Quando esse Android ja foi observado em uma execucao anterior, o ID
+                // real do APK permite liberar o cadastro antigo antes mesmo de abrir o
+                // Smart. O ANDROID_ID do shell nao e usado nessa comparacao.
+                if (!string.IsNullOrWhiteSpace(confirmedSmartDeviceId))
+                {
+                    Progress(
+                        "selfhost-preflight",
+                        $"Verificando se o Device ID real {confirmedSmartDeviceId} esta vinculado a outro cadastro SelfHost...");
+                    var preflightConflicts = preflightDevices
+                        .Where(x => x.IsLinked &&
+                                    string.Equals(x.DeviceId, confirmedSmartDeviceId, StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+
+                    foreach (var conflict in preflightConflicts)
+                    {
+                        Progress(
+                            "selfhost-unlink-conflict",
+                            $"Device ID real localizado em {conflict.Name}. Desvinculando antes de abrir o Smart...");
+                        if (!await _selfHostDeviceService.UnlinkDeviceAsync(conflict.ClientId, _shutdown.Token))
+                        {
+                            throw new InvalidOperationException(
+                                $"Nao foi possivel liberar o Device ID real do cadastro SelfHost {conflict.Name}.");
+                        }
+                    }
+
+                    if (preflightConflicts.Length > 0)
+                    {
+                        Progress(
+                            "selfhost-unlink-conflict",
+                            "Vinculo anterior confirmado como removido antes de abrir o Smart.");
+                    }
                 }
 
                 var selfHostUrl = _selfHostDeviceService.BuildUrl(oauthClient, company, selfHostBaseUrl);
@@ -1602,7 +1865,7 @@ public sealed class MainForm : Form
                     // O mesmo Device ID pode estar preso em outro cadastro SelfHost. Esse é o
                     // cenário que faz /device/add responder que o dispositivo já está em uso.
                     // Localizamos e liberamos todos os conflitos ANTES de confirmar a URL.
-                    var currentDevices = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
+                    var currentDevices = await _selfHostDeviceService.ListAllDevicesAsync(_shutdown.Token);
                     var conflicts = currentDevices
                         .Where(x => !string.IsNullOrWhiteSpace(x.DeviceId) &&
                                     string.Equals(x.DeviceId, smartDeviceId, StringComparison.OrdinalIgnoreCase))
@@ -1627,33 +1890,67 @@ public sealed class MainForm : Form
                     }
                 }
 
-                var selfHostAutomation = await _smartAutomationService.SubmitDeviceUrlAsync(
-                    serial, selfHostUrl, module, selfHostSettings.SmartPackageName, clearData, Progress, BeforeSubmitSelfHostAsync, _shutdown.Token);
+                Task<SmartAutomationResult> RunSelfHostAutomationAsync(string? knownDeviceId) =>
+                    _smartAutomationService.SubmitDeviceUrlAsync(
+                        serial,
+                        selfHostUrl,
+                        module,
+                        ResolveDevicePackage(android, selfHostSettings),
+                        clearData,
+                        Progress,
+                        BeforeSubmitSelfHostAsync,
+                        _shutdown.Token,
+                        knownDeviceId,
+                        android.ProvisioningProfile);
+
+                var selfHostAutomation = await RunSelfHostAutomationAsync(confirmedSmartDeviceId);
 
                 if (!selfHostAutomation.Success)
                 {
+                    if (IsSafeDeviceId(selfHostAutomation.SmartDeviceId))
+                    {
+                        RememberConfirmedSmartDeviceId(
+                            serial,
+                            android.AndroidId,
+                            selfHostAutomation.SmartDeviceId);
+                    }
                     PostEvent("smartPreparationFinished", new { success = false, module, accessMode = "selfhost", selfHostAutomation.Stage, message = selfHostAutomation.Message, selfHostAutomation.PackageName, selfHostAutomation.UiSummary, selfHostAutomation.SmartDeviceId, adbAndroidId = android.AndroidId, url = selfHostUrl });
                     return;
                 }
 
                 var selfHostExpectedDeviceId = !string.IsNullOrWhiteSpace(selfHostAutomation.SmartDeviceId) ? selfHostAutomation.SmartDeviceId : android.AndroidId;
                 Progress("selfhost-verify", $"Aguardando o SelfHost registrar o Device ID {selfHostExpectedDeviceId}...");
-                OAuthClientInfo? selfHostRefreshed = null;
-                IReadOnlyList<OAuthClientInfo> selfHostItems = Array.Empty<OAuthClientInfo>();
-                for (var attempt = 0; attempt < 15; attempt++)
-                {
-                    await Task.Delay(1000, _shutdown.Token);
-                    selfHostItems = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
-                    selfHostRefreshed = selfHostItems.FirstOrDefault(x => string.Equals(x.ClientId, oauthClient.ClientId, StringComparison.Ordinal));
-                    if (selfHostRefreshed is not null && !string.IsNullOrWhiteSpace(selfHostRefreshed.DeviceId)) break;
-                }
-
+                var selfHostRefreshed = await _selfHostDeviceService.WaitForDeviceLinkAsync(
+                    oauthClient.ClientId,
+                    40,
+                    TimeSpan.FromMilliseconds(750),
+                    _shutdown.Token);
                 var selfHostLinked = selfHostRefreshed is not null && string.Equals(selfHostRefreshed.DeviceId, selfHostExpectedDeviceId, StringComparison.OrdinalIgnoreCase);
+                var smartUiFinalized = false;
+                if (selfHostLinked)
+                {
+                    // Fecha o OK assim que a consulta direta confirmar o device_id.
+                    // A listagem completa e paginada pode levar varios segundos e deixava
+                    // o emulador parado no dialogo mesmo com o vinculo ja concluido.
+                    smartUiFinalized = await _smartAutomationService.DismissConfirmedSynchronizationAsync(
+                        serial,
+                        selfHostAutomation.PackageName,
+                        Progress,
+                        _shutdown.Token);
+                }
+                var selfHostItems = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
+                var selfHostFailure = selfHostRefreshed is null || string.IsNullOrWhiteSpace(selfHostRefreshed.DeviceId)
+                    ? $"A URL foi confirmada no Smart, mas o SelfHost nao registrou um Device ID em {oauthClient.Name}."
+                    : $"O SelfHost registrou outro Device ID em {oauthClient.Name}; esperado {selfHostExpectedDeviceId}.";
                 PostEvent("oauthClients", new { items = selfHostItems, companyId = company.Id, accessMode = "selfhost" });
                 PostEvent("smartPreparationFinished", new
                 {
                     success = selfHostLinked, module, accessMode = "selfhost", stage = selfHostLinked ? "linked" : "verify",
-                    message = selfHostLinked ? $"Dispositivo SelfHost vinculado com sucesso. device_id = {selfHostExpectedDeviceId}." : $"A URL do SelfHost foi enviada, mas o vínculo ainda não foi confirmado para {selfHostExpectedDeviceId}.",
+                    message = selfHostLinked
+                        ? smartUiFinalized
+                            ? $"Dispositivo SelfHost vinculado com sucesso. device_id = {selfHostExpectedDeviceId}; confirmacao final encerrada no Smart."
+                            : $"Dispositivo SelfHost vinculado com sucesso. device_id = {selfHostExpectedDeviceId}; o Android nao expos o botao OK para fechamento automatico."
+                        : selfHostFailure,
                     packageName = selfHostAutomation.PackageName, smartDeviceId = selfHostAutomation.SmartDeviceId, adbAndroidId = android.AndroidId, url = selfHostUrl
                 });
                 return;
@@ -1932,15 +2229,23 @@ public sealed class MainForm : Form
                     serial,
                     onlineUrl,
                     module,
-                    onlineSettings.SmartPackageName,
+                    ResolveDevicePackage(android, onlineSettings),
                     clearData,
                     Progress,
                     BeforeSubmitOnlineAsync,
                     _shutdown.Token,
-                    authoritativeSmartDeviceId);
+                    authoritativeSmartDeviceId,
+                    android.ProvisioningProfile);
 
                 if (!onlineAutomation.Success)
                 {
+                    if (IsSafeDeviceId(onlineAutomation.SmartDeviceId))
+                    {
+                        RememberConfirmedSmartDeviceId(
+                            serial,
+                            android.AndroidId,
+                            onlineAutomation.SmartDeviceId);
+                    }
                     PostEvent("smartPreparationFinished", new
                     {
                         success = false,
@@ -1957,11 +2262,11 @@ public sealed class MainForm : Form
                     return;
                 }
 
-                if (!string.Equals(onlineSettings.SmartPackageName, onlineAutomation.PackageName, StringComparison.OrdinalIgnoreCase))
+                onlineSettings.SmartPackageNamesBySerial ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (!onlineSettings.SmartPackageNamesBySerial.TryGetValue(serial, out var savedPackage) ||
+                    !string.Equals(savedPackage, onlineAutomation.PackageName, StringComparison.OrdinalIgnoreCase))
                 {
-                    onlineSettings.SmartPackageName = onlineAutomation.PackageName;
-                    _settingsService.Save(onlineSettings);
-                    SendBootstrap();
+                    RememberSmartPackage(serial, onlineAutomation.PackageName);
                 }
 
                 Progress(
@@ -1979,7 +2284,7 @@ public sealed class MainForm : Form
                     // propagados imediatamente, sem aguardar a listagem paginada inteira.
                     refreshedClient = await _selfHostDeviceService.WaitForDeviceLinkAsync(
                         oauthClient.ClientId,
-                        8,
+                        40,
                         TimeSpan.FromMilliseconds(750),
                         _shutdown.Token);
 
@@ -1999,7 +2304,7 @@ public sealed class MainForm : Form
                 }
                 else
                 {
-                    for (var attempt = 0; attempt < 15; attempt++)
+                    for (var attempt = 0; attempt < 30; attempt++)
                     {
                         await Task.Delay(1000, _shutdown.Token);
                         refreshedItems = await LoadManagedDevicesAsync("validar vinculo");
@@ -2246,7 +2551,9 @@ public sealed class MainForm : Form
                 clearData,
                 Progress,
                 BeforeSubmitAsync,
-                _shutdown.Token);
+                _shutdown.Token,
+                confirmedSmartDeviceId: null,
+                provisioningProfile: android.ProvisioningProfile);
 
             if (!automation.Success)
             {
@@ -2267,8 +2574,7 @@ public sealed class MainForm : Form
 
             if (!string.Equals(settings.SmartPackageName, automation.PackageName, StringComparison.OrdinalIgnoreCase))
             {
-                settings.SmartPackageName = automation.PackageName;
-                _settingsService.Save(settings);
+                RememberSmartPackage(serial, automation.PackageName);
                 SendBootstrap();
             }
 
@@ -2363,9 +2669,13 @@ public sealed class MainForm : Form
                 url
             });
         }
-        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        catch (OperationCanceledException) when (this._shutdown.IsCancellationRequested)
         {
             // Encerramento normal da aplicacao.
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -2415,7 +2725,6 @@ public sealed class MainForm : Form
                 });
             }
 
-            PostBusy("provision", false);
         }
     }
 
@@ -2457,6 +2766,40 @@ public sealed class MainForm : Form
     {
         if (!_pageReady || _webView.CoreWebView2 is null)
         {
+            return;
+        }
+
+        var context = _provisioningContext.Value;
+        // Listagens administrativas emitidas no meio de jobs paralelos nao podem
+        // substituir os dropdowns globais e dar a impressao de que todos os Androids
+        // usam o cadastro do ultimo job. Cada job ja possui um snapshot imutavel.
+        if (context is not null && type == "oauthClients") return;
+        if (context is not null && type is "provisionProgress" or "smartPreparationFinished")
+        {
+            var element = JsonSerializer.SerializeToElement(payload, JsonOptions);
+            var stage = element.TryGetProperty("stage", out var stageElement) ? stageElement.GetString() ?? "processando" : "processando";
+            var message = element.TryGetProperty("message", out var messageElement) ? messageElement.GetString() ?? string.Empty : string.Empty;
+            if (type == "provisionProgress")
+            {
+                context.Job.Progress(stage, message);
+                _multiDeviceProvisioningService.NotifyChanged(context.Job);
+            }
+            else
+            {
+                var success = element.TryGetProperty("success", out var successElement) && successElement.ValueKind == JsonValueKind.True;
+                context.Outcome = new ProvisioningJobOutcome(success, stage, message);
+            }
+
+            var enriched = element.EnumerateObject().ToDictionary(x => x.Name, x => x.Value.Clone(), StringComparer.OrdinalIgnoreCase);
+            enriched["serial"] = JsonSerializer.SerializeToElement(context.Job.Serial);
+            enriched["friendlyName"] = JsonSerializer.SerializeToElement(context.Job.FriendlyName);
+            payload = enriched;
+        }
+
+        if (InvokeRequired)
+        {
+            var capturedPayload = payload;
+            BeginInvoke(new Action(() => PostEvent(type, capturedPayload)));
             return;
         }
 
@@ -2625,6 +2968,77 @@ public sealed class MainForm : Form
         return "http://127.0.0.1:7711";
     }
 
+    private static IReadOnlyList<string> ReadStringArray(JsonElement payload, string propertyName)
+    {
+        if (payload.ValueKind != JsonValueKind.Object ||
+            !payload.TryGetProperty(propertyName, out var element) ||
+            element.ValueKind != JsonValueKind.Array) return Array.Empty<string>();
+        return element.EnumerateArray()
+            .Where(x => x.ValueKind == JsonValueKind.String)
+            .Select(x => x.GetString()?.Trim() ?? string.Empty)
+            .Where(x => x.Length > 0)
+            .ToArray();
+    }
+
+    private static JsonElement WithSerial(JsonElement payload, string serial, bool requireMappedClient = false)
+    {
+        var values = payload.ValueKind == JsonValueKind.Object
+            ? payload.EnumerateObject().ToDictionary(x => x.Name, x => x.Value.Clone(), StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+        values.Remove("serials");
+        values["serial"] = JsonSerializer.SerializeToElement(serial);
+        var mapped = false;
+        if (payload.TryGetProperty("oauthClientsBySerial", out var mappings) &&
+            mappings.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in mappings.EnumerateObject())
+            {
+                if (!property.Name.Equals(serial, StringComparison.OrdinalIgnoreCase) ||
+                    property.Value.ValueKind != JsonValueKind.Object) continue;
+                values["oauthClient"] = property.Value.Clone();
+                mapped = true;
+                break;
+            }
+        }
+        values.Remove("oauthClientsBySerial");
+        if (requireMappedClient && !mapped)
+            values.Remove("oauthClient");
+        return JsonSerializer.SerializeToElement(values, JsonOptions);
+    }
+
+    private sealed record ProvisioningRequest(
+        ProvisioningJob Job,
+        JsonElement Payload,
+        string TargetClientId);
+
+    private sealed class ProvisioningExecutionContext(ProvisioningJob job, CancellationToken cancellationToken)
+    {
+        public ProvisioningJob Job { get; } = job;
+        public CancellationToken CancellationToken { get; } = cancellationToken;
+        public ProvisioningJobOutcome? Outcome { get; set; }
+    }
+
+    private static string ResolveDevicePackage(DeviceInfo device, AppSettings settings)
+    {
+        if (!string.IsNullOrWhiteSpace(device.SmartPackage)) return device.SmartPackage;
+        settings.SmartPackageNamesBySerial ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (settings.SmartPackageNamesBySerial.TryGetValue(device.Serial, out var perDevice) &&
+            !string.IsNullOrWhiteSpace(perDevice)) return perDevice;
+        return settings.SmartPackageName;
+    }
+
+    private void RememberSmartPackage(string serial, string packageName)
+    {
+        if (string.IsNullOrWhiteSpace(serial) || string.IsNullOrWhiteSpace(packageName)) return;
+        lock (_settingsMutationGate)
+        {
+            var latest = _settingsService.Load();
+            latest.SmartPackageNamesBySerial ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            latest.SmartPackageNamesBySerial[serial] = packageName.Trim();
+            _settingsService.Save(latest);
+        }
+    }
+
     private static string? ReadString(JsonElement payload, string propertyName)
     {
         if (payload.ValueKind != JsonValueKind.Object ||
@@ -2671,6 +3085,8 @@ public sealed class MainForm : Form
         try { _ = Task.Run(() => _dockerDbBridgeService.StopAsync(CancellationToken.None)); } catch { }
         try { _scrcpyService.Dispose(); } catch { }
         try { _selfHostDeviceService.Dispose(); } catch { }
+        try { _multiDeviceProvisioningService.Dispose(); } catch { }
+        try { _sharedInfrastructureGate.Dispose(); } catch { }
         try { _shutdown.Dispose(); } catch { }
     }
 }

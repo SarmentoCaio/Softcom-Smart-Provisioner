@@ -66,32 +66,12 @@ public sealed class SmartUiAutomationService
         Action<string, string>? progress = null,
         Func<string, Task>? beforeSubmitAsync = null,
         CancellationToken cancellationToken = default,
-        string? confirmedSmartDeviceId = null)
+        string? confirmedSmartDeviceId = null,
+        string? provisioningProfile = null)
     {
-        // Todos os modulos deste fluxo (PDV, Pre-Venda, Minimercado, Totem,
-        // Comanda e Autopagamento) usam o package padrao do Smart. O Smart TEF
-        // possui um fluxo separado e nao passa por este metodo.
-        //
-        // Antes a preparacao tentava descobrir/validar o package por varios
-        // comandos ADB (pm path, foreground package, pm list packages). Em alguns
-        // emuladores isso podia ficar preso exatamente na etapa
-        // "Identificando o aplicativo Softcom Smart...", sem chegar ao pm clear.
-        // Agora usamos diretamente o package configurado (quando valido) ou o
-        // package padrao conhecido. Se o package estiver incorreto/ausente, a
-        // proxima operacao ADB retorna o erro normalmente em vez de travar aqui.
-        progress?.Invoke("package", "Preparando o aplicativo Softcom Smart...");
-        const string standardSmartPackage = "softcom.mobile.smart2";
-        // Este fluxo e exclusivo do Smart padrao. Smart TEF/RedeFlex possui rotina
-        // propria. Portanto nao reutilizamos um package salvo/detectado anteriormente:
-        // isso evita abrir outro APK quando uma configuracao local antiga estiver errada.
-        var packageName = standardSmartPackage;
-        if (!string.IsNullOrWhiteSpace(configuredPackage) &&
-            !configuredPackage.Trim().Equals(standardSmartPackage, StringComparison.OrdinalIgnoreCase))
-        {
-            progress?.Invoke(
-                "package",
-                $"Package salvo '{configuredPackage.Trim()}' ignorado neste fluxo. Usando {standardSmartPackage}.");
-        }
+        progress?.Invoke("package", "Identificando o package do Smart neste dispositivo...");
+        var packageName = await ResolvePackageAsync(serial, configuredPackage, cancellationToken);
+        progress?.Invoke("package", $"Package validado para este job: {packageName}.");
 
         // A versao e validada novamente no momento do provisionamento. A lista de Androids
         // tambem exibe essa informacao, mas a leitura aqui evita usar um diagnostico antigo
@@ -156,7 +136,9 @@ public sealed class SmartUiAutomationService
             progress?.Invoke(
                 "legacy-permissions",
                 permissionResult.Success
-                    ? "Permissoes de armazenamento do Smart 8.0 concedidas via ADB."
+                    ? (string.IsNullOrWhiteSpace(permissionResult.Detail)
+                        ? "Permissoes de armazenamento do Smart 8.0 concedidas via ADB."
+                        : permissionResult.Detail)
                     : "Nao foi possivel confirmar todas as permissoes de armazenamento via ADB. O fluxo continuara e validara uma eventual solicitacao do Android. " + permissionResult.Detail);
         }
 
@@ -473,7 +455,8 @@ public sealed class SmartUiAutomationService
                     smartDeviceId,
                     progress,
                     beforeSubmitAsync,
-                    cancellationToken);
+                    cancellationToken,
+                    provisioningProfile);
             }
             else if (IsLegacySmartPackageActivity(foregroundActivity))
             {
@@ -486,12 +469,22 @@ public sealed class SmartUiAutomationService
             }
             else
             {
+                var mercadoPagoLauncher = foregroundActivity.Contains(
+                    "com.mercadopago.smartpos/",
+                    StringComparison.OrdinalIgnoreCase);
+                var mercadoPagoLogin = foregroundActivity.Contains(
+                    "TestUserLoginActivity",
+                    StringComparison.OrdinalIgnoreCase);
                 return new SmartAutomationResult(
                     false,
                     packageName,
                     "legacy-launch-wait",
-                    string.IsNullOrWhiteSpace(foregroundActivity)
-                        ? "O Smart 8.0 foi iniciado, mas nenhuma Activity do softcom.mobile.smart2 ficou em primeiro plano. A automacao foi interrompida sem executar UIAutomator na tela de login."
+                    mercadoPagoLauncher
+                        ? mercadoPagoLogin
+                            ? "O Softcom Smart foi iniciado, mas o launcher do Mercado Pago retomou o primeiro plano. O terminal esta na tela de login de usuario de teste do Mercado Pago; conclua esse login e tente novamente."
+                            : "O Softcom Smart foi iniciado, mas o launcher do Mercado Pago retomou o primeiro plano. Desbloqueie o aplicativo da adquirente e tente novamente."
+                        : string.IsNullOrWhiteSpace(foregroundActivity)
+                        ? $"O Smart 8.0 foi iniciado, mas nenhuma Activity de {packageName} ficou em primeiro plano. A automacao foi interrompida sem executar UIAutomator na tela de login."
                         : $"O Smart 8.0 foi iniciado, mas a Activity do package nao estabilizou. Primeiro plano observado: {foregroundActivity}. A automacao foi interrompida sem executar UIAutomator.",
                     foregroundActivity,
                     smartDeviceId);
@@ -519,7 +512,7 @@ public sealed class SmartUiAutomationService
                 packageName,
                 "legacy-launch-verify",
                 string.IsNullOrWhiteSpace(foreground)
-                    ? "A interface atual nao pertence ao package softcom.mobile.smart2. A automacao foi interrompida sem tocar em outro aplicativo."
+                    ? $"A interface atual nao pertence ao package {packageName}. A automacao foi interrompida sem tocar em outro aplicativo."
                     : $"O primeiro plano atual e {foreground}. A automacao foi interrompida sem tocar em outro aplicativo.",
                 BuildSummary(snapshot.Nodes),
                 smartDeviceId);
@@ -853,7 +846,8 @@ public sealed class SmartUiAutomationService
         string smartDeviceId,
         Action<string, string>? progress,
         Func<string, Task>? beforeSubmitAsync,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? provisioningProfile)
     {
         var moduleLabel = GetModuleLabel(module);
         progress?.Invoke(
@@ -905,7 +899,8 @@ public sealed class SmartUiAutomationService
             smartDeviceId,
             progress,
             beforeSubmitAsync,
-            cancellationToken);
+            cancellationToken,
+            provisioningProfile);
     }
 
     private async Task<SmartAutomationResult> SubmitDeviceUrlLegacy80MobileAsync(
@@ -916,8 +911,10 @@ public sealed class SmartUiAutomationService
         string smartDeviceId,
         Action<string, string>? progress,
         Func<string, Task>? beforeSubmitAsync,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? provisioningProfile)
     {
+        var preserveKeyboardForN950 = ShouldPreserveLegacy80Keyboard(provisioningProfile);
         var moduleLabel = GetModuleLabel(module);
         var display = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
         if (!display.Success)
@@ -1073,6 +1070,37 @@ public sealed class SmartUiAutomationService
         progress?.Invoke(
             "legacy80-mobile-device-screen",
             $"EmpresaAddActivity confirmada em primeiro plano ({deviceActivity}). Iniciando agora a etapa obrigatoria DIGITAR -> Host...");
+
+        var beforeSubmitCompleted = false;
+        if (sdkLevel > 25)
+        {
+            progress?.Invoke(
+                "legacy80-mobile-device-id",
+                "Lendo o Device ID exibido pelo proprio Smart antes de alterar ou confirmar o Host...");
+            smartDeviceId = await ResolveSmartDeviceIdFromCurrentScreenAsync(
+                serial,
+                packageName,
+                smartDeviceId,
+                cancellationToken);
+
+            if (!string.IsNullOrWhiteSpace(smartDeviceId))
+            {
+                progress?.Invoke(
+                    "legacy80-mobile-device-id",
+                    $"Device ID real do Smart localizado antes do envio: {smartDeviceId}.");
+                if (beforeSubmitAsync is not null)
+                {
+                    await beforeSubmitAsync(smartDeviceId);
+                    beforeSubmitCompleted = true;
+                }
+            }
+            else
+            {
+                progress?.Invoke(
+                    "legacy80-mobile-device-id",
+                    "O Device ID ainda nao ficou legivel na tela inicial de configuracao; uma ultima leitura sera feita antes de alterar o Host.");
+            }
+        }
 
         await Task.Delay(450, cancellationToken);
 
@@ -1234,20 +1262,29 @@ public sealed class SmartUiAutomationService
         {
             smartDeviceId = FirstNonEmpty(smartDeviceId, await GetAndroidIdFallbackAsync(serial, cancellationToken));
         }
-        if (beforeSubmitAsync is not null)
+        if (beforeSubmitAsync is not null && !beforeSubmitCompleted)
         {
+            smartDeviceId = await ResolveSmartDeviceIdFromCurrentScreenAsync(
+                serial,
+                packageName,
+                smartDeviceId,
+                cancellationToken);
             if (string.IsNullOrWhiteSpace(smartDeviceId))
             {
                 return new SmartAutomationResult(
                     false,
                     packageName,
                     "legacy80-mobile-device-id",
-                    "O Device ID do Smart 8.0 nao foi localizado antes de enviar a URL.",
+                    "O Device ID real nao ficou legivel antes do envio. O Host nao foi alterado e o procedimento nao sera repetido automaticamente.",
                     currentActivity,
                     string.Empty);
             }
 
+            progress?.Invoke(
+                "legacy80-mobile-device-id",
+                $"Device ID real confirmado antes do envio: {smartDeviceId}. Procurando o vinculo em todos os dispositivos...");
             await beforeSubmitAsync(smartDeviceId);
+            beforeSubmitCompleted = true;
         }
 
         if (sdkLevel > 25)
@@ -1305,9 +1342,18 @@ public sealed class SmartUiAutomationService
                 smartDeviceId);
         }
 
-        // Nao envia KEYCODE_BACK para fechar o teclado neste fluxo. No Smart 8.0
-        // esse comando pode ser interpretado como VOLTAR e retornar para a selecao do modulo.
-        // O processo manual validado mantem o teclado aberto e segue direto para Confirmar.
+        // O fluxo validado do Mercado Pago N950 mantem o teclado aberto. Enviar BACK
+        // aqui pode ser interpretado pela Activity como navegacao e voltar para a
+        // selecao de modulo enquanto o texto ainda esta sendo renderizado na tela.
+        // Nos demais perfis preservamos o fechamento explicito que ja funciona.
+        if (!preserveKeyboardForN950 &&
+            await _adb.IsSoftKeyboardVisibleAsync(serial, cancellationToken))
+        {
+            progress?.Invoke(
+                "legacy80-mobile-keyboard",
+                "URL informada. Fechando somente o teclado deste Android antes do toque prolongado...");
+            await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
+        }
         await Task.Delay(350, cancellationToken);
 
         currentActivity = sdkLevel > 25
@@ -1322,6 +1368,23 @@ public sealed class SmartUiAutomationService
                 $"A URL foi informada, mas a EmpresaAddActivity deixou o primeiro plano antes do Confirmar. Activity atual: {currentActivity}.",
                 currentActivity,
                 smartDeviceId);
+        }
+
+        // Quando fechamos o teclado, rele o botao no layout ja redimensionado. No
+        // N950 o teclado permanece como no fluxo anteriormente validado, portanto
+        // mantemos a coordenada obtida nesse mesmo estado antes da digitacao.
+        if (sdkLevel > 25 && !preserveKeyboardForN950)
+        {
+            var currentConfirmBounds = await FindViewBoundsFromActivityDumpAsync(
+                serial,
+                "app:id/btn_confirmar",
+                cancellationToken);
+            if (IsActivityPointInsideDisplay(currentConfirmBounds, display))
+            {
+                confirmX = currentConfirmBounds.CenterX;
+                confirmY = currentConfirmBounds.CenterY;
+                confirmSource = "dumpsys activity top atualizado (app:id/btn_confirmar)";
+            }
         }
 
         progress?.Invoke(
@@ -1343,20 +1406,45 @@ public sealed class SmartUiAutomationService
         currentActivity = sdkLevel > 25
             ? await GetForegroundActivityAsync(serial, cancellationToken)
             : await GetLegacySmartActivityAsync(serial, cancellationToken);
+        if (IsLegacyCompanyAddConfigActivity(currentActivity))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "legacy80-mobile-hold-confirm",
+                "O Android tratou o toque prolongado como clique comum e voltou para a selecao de modulo. O Provisioner nao acionou outro Confirmar nem abriu uma configuracao vazia.",
+                currentActivity,
+                smartDeviceId);
+        }
+
         if (!IsLegacyCompanyAddActivity(currentActivity))
         {
             return new SmartAutomationResult(
                 false,
                 packageName,
                 "legacy80-mobile-review",
-                $"O toque prolongado foi executado, mas a tela de revisao nao permaneceu na EmpresaAddActivity. Activity atual: {currentActivity}.",
+                $"O toque prolongado foi executado, mas o Smart nao permaneceu na configuracao nem retornou para a confirmacao do modulo. Activity atual: {currentActivity}.",
                 currentActivity,
                 smartDeviceId);
         }
 
+        if (sdkLevel > 25)
+        {
+            var finalConfirmBounds = await FindViewBoundsFromActivityDumpAsync(
+                serial,
+                "app:id/btn_confirmar",
+                cancellationToken);
+            if (IsActivityPointInsideDisplay(finalConfirmBounds, display))
+            {
+                confirmX = finalConfirmBounds.CenterX;
+                confirmY = finalConfirmBounds.CenterY;
+                confirmSource = "dumpsys activity top atualizado (app:id/btn_confirmar)";
+            }
+        }
+
         progress?.Invoke(
             "legacy80-mobile-final-confirm",
-            "Toque prolongado concluido. Acionando o Confirmar final uma unica vez...");
+            $"Toque prolongado concluido. Acionando o Confirmar final uma unica vez em {confirmX},{confirmY} via {confirmSource}...");
         var finalTap = await _adb.TapAsync(serial, confirmX, confirmY, cancellationToken);
         if (!finalTap.Success)
         {
@@ -1487,20 +1575,21 @@ public sealed class SmartUiAutomationService
 
         await Task.Delay(350, cancellationToken);
 
+        smartDeviceId = await ResolveSmartDeviceIdFromCurrentScreenAsync(
+            serial, packageName, smartDeviceId, cancellationToken);
+
         if (beforeSubmitAsync is not null)
         {
             if (string.IsNullOrWhiteSpace(smartDeviceId))
             {
-                return new SmartAutomationResult(
-                    false,
-                    packageName,
+                progress?.Invoke(
                     "legacy80-mobile-device-id",
-                    "O Device ID do Smart 8.0 nao foi localizado antes de enviar a URL.",
-                    BuildSummary(editSnapshot.Nodes),
-                    string.Empty);
+                    "O Smart 8.0 nao expos o Device ID antes do envio. A confirmacao remota do cadastro selecionado sera usada ao final.");
             }
-
-            await beforeSubmitAsync(smartDeviceId);
+            else
+            {
+                await beforeSubmitAsync(smartDeviceId);
+            }
         }
 
         progress?.Invoke(
@@ -1786,20 +1875,23 @@ public sealed class SmartUiAutomationService
         {
             smartDeviceId = FirstNonEmpty(smartDeviceId, await GetAndroidIdFallbackAsync(serial, cancellationToken));
         }
+        else
+        {
+            smartDeviceId = await ResolveSmartDeviceIdFromCurrentScreenAsync(
+                serial, packageName, smartDeviceId, cancellationToken);
+        }
         if (beforeSubmitAsync is not null)
         {
             if (string.IsNullOrWhiteSpace(smartDeviceId))
             {
-                return new SmartAutomationResult(
-                    false,
-                    packageName,
+                progress?.Invoke(
                     "legacy80-large-device-id",
-                    "O Device ID do Smart 8.0 nao foi localizado antes de enviar a URL.",
-                    currentActivity,
-                    string.Empty);
+                    "O Smart 8.0 nao expos o Device ID antes do envio. A confirmacao remota sera usada ao final.");
             }
-
-            await beforeSubmitAsync(smartDeviceId);
+            else
+            {
+                await beforeSubmitAsync(smartDeviceId);
+            }
         }
 
         progress?.Invoke(
@@ -1954,8 +2046,26 @@ public sealed class SmartUiAutomationService
                 : consecutiveUnavailableSnapshots + 1;
             if (consecutiveUnavailableSnapshots >= 2)
             {
+                // O dialogo de erro 62 da Stone fica disponivel em cerca de 3 segundos,
+                // acima do limite da leitura rapida. Faz uma unica leitura estendida
+                // antes de desistir; assim o DeviceId pode ser extraido e apenas este
+                // job pode liberar o vinculo antigo e repetir o procedimento.
+                finalSnapshot = await ReadUiQuickAsync(
+                    serial,
+                    cancellationToken,
+                    dumpTimeoutMilliseconds: 8000);
                 break;
             }
+        }
+
+        if (finalSnapshot.Success)
+        {
+            // A mensagem funcional de erro 62 tambem informa o DeviceId real.
+            // Conserva esse identificador no resultado para que o chamador possa
+            // memoriza-lo por ADB e liberar o vinculo correto na proxima tentativa.
+            smartDeviceId = FirstNonEmpty(
+                smartDeviceId,
+                ExtractSmartDeviceId(finalSnapshot.Nodes));
         }
 
         if (finalSnapshot.Success && IsSynchronizationSuccess(finalSnapshot.Nodes))
@@ -2013,12 +2123,18 @@ public sealed class SmartUiAutomationService
 
         if (finalSnapshot.Success && IsSynchronizationInProgress(finalSnapshot.Nodes))
         {
-            progress?.Invoke("legacy80-sync-timeout", "O Smart nao concluiu a sincronizacao no tempo esperado.");
+            // A sincronizacao do Smart 8.0 pode levar mais tempo em algumas
+            // adquirentes. Estar na tela "Sincronizando" nao e falha: o envio ja
+            // ocorreu e o chamador ainda fara a verificacao autoritativa pelo
+            // cadastro remoto antes de decidir o resultado do job.
+            progress?.Invoke(
+                "legacy80-sync-pending",
+                "O Smart continua sincronizando. Mantendo o job em validacao ate o cadastro remoto confirmar o Device ID...");
             return new SmartAutomationResult(
-                false,
+                true,
                 packageName,
-                "legacy80-sync-timeout",
-                "O Smart permaneceu sincronizando e nao confirmou o registro do dispositivo. A tela foi mantida aberta para exibir o erro ou estado real.",
+                "legacy80-sync-pending",
+                "A sincronizacao ainda esta em andamento; o vinculo sera confirmado pelo cadastro remoto antes de finalizar o provisionamento.",
                 BuildSummary(finalSnapshot.Nodes),
                 smartDeviceId);
         }
@@ -2055,6 +2171,7 @@ public sealed class SmartUiAutomationService
         // dialog_button pertence ao custom_dialog.xml do Smart 8.0.1. button1 cobre
         // o AlertDialog padrao usado por outras compilacoes sem afetar o formulario,
         // pois ambos sao procurados somente apos a confirmacao remota do vinculo.
+        var dialogResourceIds = new[] { "app:id/dialog_button", "android:id/button1" };
         for (var attempt = 0; attempt < 3; attempt++)
         {
             var foregroundActivity = await GetForegroundActivityAsync(serial, cancellationToken);
@@ -2072,7 +2189,7 @@ public sealed class SmartUiAutomationService
                 return false;
             }
 
-            foreach (var resourceId in new[] { "app:id/dialog_button", "android:id/button1" })
+            foreach (var resourceId in dialogResourceIds)
             {
                 var bounds = await FindViewBoundsFromActivityDumpAsync(serial, resourceId, cancellationToken);
                 if (!IsActivityPointInsideDisplay(bounds, display))
@@ -2090,7 +2207,53 @@ public sealed class SmartUiAutomationService
                     "legacy80-sync-ok",
                     $"Vinculo confirmado pela API. Acionando OK da sincronizacao via {resourceId} em {bounds.CenterX},{bounds.CenterY}...");
                 await Task.Delay(700, cancellationToken);
-                return true;
+
+                var afterTap = await _adb.ShellAsync(
+                    serial,
+                    "dumpsys activity top",
+                    cancellationToken,
+                    12000);
+                if (!ContainsSynchronizationDialogResource(afterTap.CombinedOutput))
+                {
+                    return true;
+                }
+            }
+
+            // No N950 o botao pode aparecer no dump da Activity, mas o retangulo
+            // informado pelo Android nao corresponder a janela modal. Como o vinculo
+            // ja foi confirmado pelo servidor, e seguro mover o foco dentro desse
+            // dialogo conhecido e acionar o unico botao com ENTER. O fallback jamais
+            // e executado apenas pela Activity: exige o resource-id do dialogo final.
+            var dialogDump = await _adb.ShellAsync(
+                serial,
+                "dumpsys activity top",
+                cancellationToken,
+                12000);
+            if (ContainsSynchronizationDialogResource(dialogDump.CombinedOutput))
+            {
+                progress?.Invoke(
+                    "legacy80-sync-ok-fallback",
+                    "OK ainda visivel apos a confirmacao remota. Focando e acionando o botao final do dialogo...");
+
+                var focus = await _adb.KeyEventAsync(serial, "KEYCODE_TAB", cancellationToken);
+                if (focus.Success)
+                {
+                    await Task.Delay(180, cancellationToken);
+                    var enter = await _adb.KeyEventAsync(serial, "KEYCODE_ENTER", cancellationToken);
+                    if (enter.Success)
+                    {
+                        await Task.Delay(700, cancellationToken);
+                        var afterEnter = await _adb.ShellAsync(
+                            serial,
+                            "dumpsys activity top",
+                            cancellationToken,
+                            12000);
+                        if (!ContainsSynchronizationDialogResource(afterEnter.CombinedOutput))
+                        {
+                            return true;
+                        }
+                    }
+                }
             }
 
             if (attempt < 2)
@@ -2127,6 +2290,11 @@ public sealed class SmartUiAutomationService
         await Task.Delay(700, cancellationToken);
         return true;
     }
+
+    private static bool ContainsSynchronizationDialogResource(string? activityDump) =>
+        !string.IsNullOrWhiteSpace(activityDump) &&
+        (activityDump.Contains("app:id/dialog_button", StringComparison.OrdinalIgnoreCase) ||
+         activityDump.Contains("android:id/button1", StringComparison.OrdinalIgnoreCase));
 
     private async Task<SmartAutomationResult> SubmitDeviceUrlSmart81Async(
         string serial,
@@ -2604,6 +2772,44 @@ public sealed class SmartUiAutomationService
             : value;
     }
 
+    private async Task<string> ResolveSmartDeviceIdFromCurrentScreenAsync(
+        string serial,
+        string packageName,
+        string current,
+        CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(current)) return current.Trim();
+
+        // Em Android moderno, settings secure android_id pertence ao shell e pode ser
+        // diferente do identificador enxergado pelo APK. Consultamos somente as telas do
+        // próprio package/job e o dump da Activity, sem ler arquivos de outro aplicativo.
+        var ui = await ReadUiQuickAsync(
+            serial,
+            cancellationToken,
+            dumpTimeoutMilliseconds: 8000);
+        if (ui.Success && IsUiFromPackage(ui.Nodes, packageName))
+        {
+            var fromUi = ExtractSmartDeviceId(ui.Nodes);
+            if (!string.IsNullOrWhiteSpace(fromUi)) return fromUi;
+        }
+
+        var activity = await _adb.ShellAsync(serial, "dumpsys activity top", cancellationToken, 10000);
+        if (activity.Success)
+        {
+            var output = activity.StandardOutput ?? string.Empty;
+            if (output.Contains(packageName, StringComparison.OrdinalIgnoreCase))
+            {
+                var match = Regex.Match(
+                    output,
+                    @"Device\s*ID\s*[:=]?\s*([A-Za-z0-9._-]{6,})",
+                    RegexOptions.IgnoreCase);
+                if (match.Success) return match.Groups[1].Value.Trim();
+            }
+        }
+
+        return string.Empty;
+    }
+
     private static UiNode? FindSmart81HostEditable(IEnumerable<UiNode> nodes) =>
         FindEditableByHints(nodes, new[] { "host" }) ??
         FindEditableBelowLabels(nodes, new[] { "host" });
@@ -2749,11 +2955,14 @@ public sealed class SmartUiAutomationService
         string empresaId,
         string token,
         bool clearData,
+        string? configuredPackage = null,
+        string? provisioningProfile = null,
         Action<string, string>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        progress?.Invoke("package", "Identificando o aplicativo Smart TEF (RedeFlex)...");
-        var packageName = await ResolveTefPackageAsync(serial, cancellationToken);
+        progress?.Invoke("package", "Identificando o package do Smart TEF neste dispositivo...");
+        var packageName = await ResolveTefPackageAsync(serial, configuredPackage, cancellationToken);
+        progress?.Invoke("package", $"Package TEF validado para este job: {packageName}.");
 
         if (clearData)
         {
@@ -2790,6 +2999,25 @@ public sealed class SmartUiAutomationService
             await Task.Delay(500, cancellationToken);
         }
 
+        // O fluxo por Activity/resource-id pertence ao Smart 8.0 oficial e nao ao
+        // perfil do Mercado Pago. O perfil altera somente layout/coordenadas. Assim
+        // Stone/L400 e outras variantes softcom.mobile.smart* percorrem suas proprias
+        // Activities sem herdar o layout especial do N950.
+        var useActivityNavigation = IsActivityBasedSmartTefPackage(packageName);
+        if (useActivityNavigation)
+        {
+            progress?.Invoke(
+                "tef-permissions",
+                "Preparando as permissoes declaradas pelo Smart TEF antes de abrir o aplicativo...");
+            var permissions = await EnsureLegacyStoragePermissionsAsync(serial, packageName, cancellationToken);
+            if (!permissions.Success)
+            {
+                progress?.Invoke(
+                    "tef-permissions",
+                    "Nem todas as permissoes puderam ser confirmadas por ADB; a navegacao continuara e validara a Activity real. " + permissions.Detail);
+            }
+        }
+
         progress?.Invoke("launch", "Abrindo o Smart TEF no Android selecionado...");
         var launch = await _adb.LaunchPackageAsync(serial, packageName, cancellationToken);
         if (!launch.Success)
@@ -2806,6 +3034,66 @@ public sealed class SmartUiAutomationService
         }
 
         await Task.Delay(1500, cancellationToken);
+
+        if (useActivityNavigation)
+        {
+            var navigation = await NavigateToSmartTefSetupByActivityAsync(
+                serial,
+                packageName,
+                progress,
+                cancellationToken);
+            if (!navigation.Success)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    navigation.Stage,
+                    navigation.Message,
+                    navigation.Summary,
+                    string.Empty);
+            }
+
+            progress?.Invoke(
+                "tef-direct",
+                "Tela Configurar Smart TEF confirmada pela Activity. Preenchendo sem depender do UIAutomator...");
+            var activityDirectResult = await FillSmartTefKnownLayoutAsync(
+                serial,
+                packageName,
+                deviceName,
+                cnpj,
+                empresaId,
+                token,
+                provisioningProfile,
+                progress,
+                cancellationToken);
+            if (!activityDirectResult.Success)
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    activityDirectResult.Stage,
+                    activityDirectResult.Message,
+                    activityDirectResult.Summary,
+                    string.Empty);
+            }
+
+            var finalActivity = await WaitForLegacyActivityAsync(
+                serial,
+                activity => IsLegacyLoginActivity(activity) || IsSmartTefMainActivity(activity),
+                12,
+                cancellationToken);
+            var completed = IsLegacyLoginActivity(finalActivity) || IsSmartTefMainActivity(finalActivity);
+            return new SmartAutomationResult(
+                true,
+                packageName,
+                completed ? "tef-complete" : "tef-submitted",
+                completed
+                    ? "Smart TEF configurado com sucesso. A tela operacional foi localizada."
+                    : "Os dados do Smart TEF foram enviados e a conclusao foi acionada. A Activity de login ainda nao foi confirmada automaticamente.",
+                string.IsNullOrWhiteSpace(finalActivity) ? activityDirectResult.Summary : finalActivity,
+                string.Empty);
+        }
+
         var snapshot = await ReadUiAsync(serial, cancellationToken);
         if (!snapshot.Success)
         {
@@ -2916,10 +3204,12 @@ public sealed class SmartUiAutomationService
 
         var directResult = await FillSmartTefKnownLayoutAsync(
             serial,
+            packageName,
             deviceName,
             cnpj,
             empresaId,
             token,
+            provisioningProfile,
             progress,
             cancellationToken);
 
@@ -2976,12 +3266,156 @@ public sealed class SmartUiAutomationService
             smartDeviceId);
     }
 
+    private async Task<TefDirectResult> NavigateToSmartTefSetupByActivityAsync(
+        string serial,
+        string packageName,
+        Action<string, string>? progress,
+        CancellationToken cancellationToken)
+    {
+        var activity = await WaitForLegacySmartActivityAsync(serial, 18, cancellationToken);
+        if (!string.IsNullOrWhiteSpace(activity) &&
+            !activity.StartsWith(packageName + "/", StringComparison.OrdinalIgnoreCase))
+        {
+            return new TefDirectResult(
+                false,
+                "tef-activity",
+                $"O package do Smart TEF foi aberto, mas outra Activity permaneceu em primeiro plano: {activity}.",
+                activity);
+        }
+
+        if (IsSmartTefSetupActivity(activity))
+        {
+            return new TefDirectResult(true, "tef-setup", string.Empty, activity);
+        }
+
+        if (IsLegacyLoginActivity(activity))
+        {
+            progress?.Invoke(
+                "tef-settings",
+                "LoginActivity confirmada. Abrindo Configuracoes pelo controle oficial do Smart...");
+            var settingsTap = await TapActivityViewAsync(
+                serial,
+                "app:id/btn_config",
+                600,
+                723,
+                cancellationToken);
+            if (!settingsTap.Success)
+            {
+                return new TefDirectResult(false, "tef-settings", settingsTap.Message, settingsTap.Summary);
+            }
+
+            activity = await WaitForLegacyActivityAsync(
+                serial,
+                IsLegacyCompanyActivity,
+                30,
+                cancellationToken);
+        }
+
+        if (IsLegacyCompanyActivity(activity))
+        {
+            progress?.Invoke(
+                "tef-new-company",
+                "EmpresaActivity confirmada. Abrindo Nova Empresa pelo controle oficial do Smart...");
+            var newCompanyTap = await TapActivityViewAsync(
+                serial,
+                "app:id/btn_novo",
+                532,
+                1256,
+                cancellationToken);
+            if (!newCompanyTap.Success)
+            {
+                return new TefDirectResult(false, "tef-new-company", newCompanyTap.Message, newCompanyTap.Summary);
+            }
+
+            activity = await WaitForLegacyActivityAsync(
+                serial,
+                IsLegacyCompanyAddConfigActivity,
+                30,
+                cancellationToken);
+        }
+
+        if (IsLegacyCompanyAddConfigActivity(activity))
+        {
+            progress?.Invoke(
+                "tef-module",
+                "Selecionando o modo Smart TEF na EmpresaAddConfigActivity...");
+            var moduleTap = await TapActivityViewAsync(
+                serial,
+                "app:id/swt_config_modo_tef",
+                625,
+                1165,
+                cancellationToken);
+            if (!moduleTap.Success)
+            {
+                return new TefDirectResult(false, "tef-module", moduleTap.Message, moduleTap.Summary);
+            }
+
+            await Task.Delay(350, cancellationToken);
+            var confirmTap = await TapActivityViewAsync(
+                serial,
+                "app:id/btn_confirmar",
+                536,
+                1256,
+                cancellationToken);
+            if (!confirmTap.Success)
+            {
+                return new TefDirectResult(false, "tef-module-confirm", confirmTap.Message, confirmTap.Summary);
+            }
+
+            activity = await WaitForLegacyActivityAsync(
+                serial,
+                IsSmartTefSetupActivity,
+                30,
+                cancellationToken);
+        }
+
+        if (!IsSmartTefSetupActivity(activity))
+        {
+            return new TefDirectResult(
+                false,
+                "tef-setup",
+                "O fluxo oficial foi acionado, mas a TefSetupActivity nao ficou em primeiro plano. Activity atual: " +
+                (string.IsNullOrWhiteSpace(activity) ? "nao identificada" : activity) + ".",
+                activity);
+        }
+
+        progress?.Invoke("tef-setup", "TefSetupActivity confirmada. A tela esta pronta para preenchimento.");
+        return new TefDirectResult(true, "tef-setup", string.Empty, activity);
+    }
+
+    private async Task<FieldFillResult> TapActivityViewAsync(
+        string serial,
+        string resourceId,
+        int fallbackX,
+        int fallbackY,
+        CancellationToken cancellationToken)
+    {
+        var bounds = await FindViewBoundsFromActivityDumpAsync(serial, resourceId, cancellationToken);
+        var x = bounds.Success ? bounds.CenterX : fallbackX;
+        var y = bounds.Success ? bounds.CenterY : fallbackY;
+        var source = bounds.Success
+            ? $"dumpsys activity top ({resourceId})"
+            : "coordenada de compatibilidade do package Smart";
+        var tap = await _adb.TapAsync(serial, x, y, cancellationToken);
+        if (!tap.Success)
+        {
+            return new FieldFillResult(
+                false,
+                $"Nao foi possivel acionar {resourceId} em {x},{y}.",
+                tap.CombinedOutput.Trim());
+        }
+
+        return new FieldFillResult(true, string.Empty, $"{resourceId} em {x},{y} via {source}");
+    }
+
     private async Task<TefDirectResult> FillSmartTefKnownLayoutAsync(
         string serial,
+        string packageName,
         string deviceName,
         string cnpj,
         string empresaId,
         string token,
+        string? provisioningProfile,
         Action<string, string>? progress,
         CancellationToken cancellationToken)
     {
@@ -2995,21 +3429,30 @@ public sealed class SmartUiAutomationService
         // (720x1600) nao renderiza o Compose com uma escala puramente proporcional:
         // os campos do card ficam mais abaixo. Por isso o L400 tem um perfil proprio,
         // levantado a partir da tela real enviada durante os testes.
-        var layout = GetSmartTefLayout(sizeResult.Width, sizeResult.Height);
+        var layout = GetSmartTefLayout(sizeResult.Width, sizeResult.Height, provisioningProfile);
 
         progress?.Invoke(
             "tef-layout",
             $"Layout TEF: {layout.Name} ({sizeResult.Width}x{sizeResult.Height}). Campo Nome do dispositivo em {layout.NameX},{layout.NameY}.");
 
-        // Antes de qualquer toque por coordenada, confirma que o RedeFlex continua
+        // Antes de qualquer toque por coordenada, confirma que o package escolhido
         // em primeiro plano. Se algo mudou, interrompe sem enviar BACK ou novos toques.
         var foreground = await _adb.GetForegroundPackageAsync(serial, cancellationToken);
-        if (!string.Equals(foreground, "softcom.mobile.smart2.redeflex", StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(foreground, packageName, StringComparison.OrdinalIgnoreCase))
         {
             return new TefDirectResult(
                 false,
                 "tef-foreground",
                 $"O Smart TEF nao esta em primeiro plano. Aplicativo atual: {foreground}.",
+                string.Empty);
+        }
+
+        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        {
+            return new TefDirectResult(
+                false,
+                "tef-activity",
+                "A TefSetupActivity deixou de ficar em primeiro plano antes do preenchimento.",
                 string.Empty);
         }
 
@@ -3020,6 +3463,7 @@ public sealed class SmartUiAutomationService
             layout.NameY,
             deviceName,
             "Nome do dispositivo",
+            layout.UseUiFieldBounds,
             cancellationToken);
         if (!name.Success)
         {
@@ -3036,7 +3480,10 @@ public sealed class SmartUiAutomationService
             // deslocamentos em torno do ponto calibrado. Isso cobre alteracoes de fonte
             // ou densidade sem sair clicando pela tela inteira.
             var retried = false;
-            foreach (var offsetY in new[] { -34, 34, -58, 58 })
+            var retryOffsets = layout.UseUiFieldBounds
+                ? new[] { 0 }
+                : new[] { -34, 34, -58, 58 };
+            foreach (var offsetY in retryOffsets)
             {
                 var y = Math.Clamp(layout.NameY + offsetY, 1, sizeResult.Height - 1);
                 var retry = await TapAndTypeTefFieldAsync(
@@ -3045,6 +3492,7 @@ public sealed class SmartUiAutomationService
                     y,
                     deviceName,
                     "Nome do dispositivo",
+                    layout.UseUiFieldBounds,
                     cancellationToken);
                 if (!retry.Success)
                 {
@@ -3075,24 +3523,49 @@ public sealed class SmartUiAutomationService
         await Task.Delay(250, cancellationToken);
 
         progress?.Invoke("tef-manual", "Abrindo Digitar dados manualmente...");
-        var manualTap = await _adb.TapAsync(serial, layout.ManualX, layout.ManualY, cancellationToken);
+        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        {
+            return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes de abrir os dados manuais.", string.Empty);
+        }
+        var manualPoint = await ResolveSmartTefActionPointAsync(
+            serial,
+            new[] { "digitar dados manualmente" },
+            layout.ManualX,
+            layout.ManualY,
+            layout.UseUiFieldBounds,
+            cancellationToken);
+        var manualTap = await _adb.TapAsync(serial, manualPoint.X, manualPoint.Y, cancellationToken);
         if (!manualTap.Success)
         {
             return new TefDirectResult(false, "tef-manual", "Nao foi possivel acionar Digitar dados manualmente.", manualTap.CombinedOutput.Trim());
         }
         await Task.Delay(750, cancellationToken);
 
-        // Depois que a secao e expandida, usamos pontos conhecidos dos campos. Nao
-        // dependemos de UIAutomator nem da abertura do teclado para considerar o campo
-        // encontrado: em POS fisicos o TextField recebe os eventos ADB mesmo quando o
-        // UiTestAutomationBridge nao publica root node.
+        if (!await NormalizeSmartTefManualScrollAsync(serial, layout, cancellationToken))
+        {
+            return new TefDirectResult(
+                false,
+                "tef-scroll",
+                "A secao manual foi aberta, mas nao foi possivel posicionar os campos do Smart TEF.",
+                $"layout={layout.Name}");
+        }
+
+        // Depois que a secao e expandida, usamos os limites reais publicados pelo
+        // Android. Os pontos calibrados de cada perfil ficam como fallback quando um
+        // POS nao disponibiliza temporariamente a arvore de acessibilidade.
         progress?.Invoke("tef-cnpj", "Informando CNPJ do Smart TEF...");
+        await NormalizeSmartTefManualScrollAsync(serial, layout, cancellationToken);
+        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        {
+            return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes do preenchimento do CNPJ.", string.Empty);
+        }
         var cnpjFill = await TapAndTypeTefFieldAsync(
             serial,
             layout.CnpjX,
             layout.CnpjY,
             cnpj,
             "CNPJ",
+            layout.UseUiFieldBounds,
             cancellationToken);
         if (!cnpjFill.Success)
         {
@@ -3101,12 +3574,18 @@ public sealed class SmartUiAutomationService
         await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
 
         progress?.Invoke("tef-company", "Informando Empresa ID do Smart TEF...");
+        await NormalizeSmartTefManualScrollAsync(serial, layout, cancellationToken);
+        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        {
+            return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes do preenchimento da Empresa ID.", string.Empty);
+        }
         var companyFill = await TapAndTypeTefFieldAsync(
             serial,
             layout.CompanyX,
             layout.CompanyY,
             empresaId,
             "Empresa ID",
+            layout.UseUiFieldBounds,
             cancellationToken);
         if (!companyFill.Success)
         {
@@ -3115,12 +3594,18 @@ public sealed class SmartUiAutomationService
         await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
 
         progress?.Invoke("tef-token", "Informando token do Smart TEF...");
+        await NormalizeSmartTefManualScrollAsync(serial, layout, cancellationToken);
+        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        {
+            return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes do preenchimento do Token.", string.Empty);
+        }
         var tokenFill = await TapAndTypeTefFieldAsync(
             serial,
             layout.TokenX,
             layout.TokenY,
             token,
             "Token",
+            layout.UseUiFieldBounds,
             cancellationToken);
         if (!tokenFill.Success)
         {
@@ -3131,6 +3616,10 @@ public sealed class SmartUiAutomationService
         await Task.Delay(300, cancellationToken);
 
         progress?.Invoke("tef-submit", "Confirmando a configuracao do Smart TEF...");
+        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        {
+            return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes da confirmacao.", string.Empty);
+        }
         var confirmTap = await _adb.TapAsync(serial, layout.ConfirmX, layout.ConfirmY, cancellationToken);
         if (!confirmTap.Success)
         {
@@ -3140,6 +3629,7 @@ public sealed class SmartUiAutomationService
         progress?.Invoke("tef-validating", "Aguardando a validacao das chaves do Smart TEF...");
         var concludeResult = await WaitAndConcludeSmartTefAsync(
             serial,
+            packageName,
             layout,
             progress,
             cancellationToken);
@@ -3157,6 +3647,7 @@ public sealed class SmartUiAutomationService
 
     private async Task<TefDirectResult> WaitAndConcludeSmartTefAsync(
         string serial,
+        string packageName,
         SmartTefLayout layout,
         Action<string, string>? progress,
         CancellationToken cancellationToken)
@@ -3176,11 +3667,29 @@ public sealed class SmartUiAutomationService
         // a validacao e fazemos toques periodicos somente na area do Concluir. Enquanto
         // o modal "Validando configuracao" estiver aberto, o toque nao executa acao;
         // assim que o modal de sucesso aparecer, o proximo toque conclui o fluxo.
-        if (layout.Name.StartsWith("Positivo L400", StringComparison.OrdinalIgnoreCase))
+        if (layout.UseCoordinateConclusion)
         {
             await Task.Delay(2600, cancellationToken);
             for (var attempt = 1; attempt <= 7; attempt++)
             {
+                if (layout.RequiresActivityGuard)
+                {
+                    var beforeTapActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+                    if (IsSmartTefMainActivity(beforeTapActivity))
+                    {
+                        return new TefDirectResult(true, "tef-concluded", string.Empty, beforeTapActivity);
+                    }
+                    if (!IsSmartTefSetupActivity(beforeTapActivity))
+                    {
+                        return new TefDirectResult(
+                            false,
+                            "tef-conclude",
+                            "A tela Smart TEF foi fechada antes da conclusao. Activity atual: " +
+                            (string.IsNullOrWhiteSpace(beforeTapActivity) ? "nao identificada" : beforeTapActivity) + ".",
+                            beforeTapActivity);
+                    }
+                }
+
                 progress?.Invoke("tef-conclude", $"Aguardando validacao das chaves e Concluir... tentativa {attempt}/7.");
                 var tap = await _adb.TapAsync(serial, layout.ConcludeX, layout.ConcludeY, cancellationToken);
                 if (!tap.Success)
@@ -3189,8 +3698,26 @@ public sealed class SmartUiAutomationService
                 }
 
                 await Task.Delay(attempt == 7 ? 900 : 1200, cancellationToken);
+                if (layout.RequiresActivityGuard)
+                {
+                    var afterTapActivity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+                    if (IsSmartTefMainActivity(afterTapActivity))
+                    {
+                        return new TefDirectResult(true, "tef-concluded", string.Empty, afterTapActivity);
+                    }
+                    if (!IsSmartTefSetupActivity(afterTapActivity))
+                    {
+                        return new TefDirectResult(
+                            false,
+                            "tef-conclude",
+                            "A configuracao nao chegou a tela operacional do Smart TEF. Activity atual: " +
+                            (string.IsNullOrWhiteSpace(afterTapActivity) ? "nao identificada" : afterTapActivity) + ".",
+                            afterTapActivity);
+                    }
+                }
+
                 var foreground = await _adb.GetForegroundPackageAsync(serial, cancellationToken);
-                if (!string.Equals(foreground, "softcom.mobile.smart2.redeflex", StringComparison.OrdinalIgnoreCase))
+                if (!string.Equals(foreground, packageName, StringComparison.OrdinalIgnoreCase))
                 {
                     return new TefDirectResult(
                         false,
@@ -3218,11 +3745,17 @@ public sealed class SmartUiAutomationService
                 }
             }
 
-            return new TefDirectResult(
-                true,
-                "tef-concluded-l400",
-                string.Empty,
-                $"Concluir acionado no perfil {layout.Name} em {layout.ConcludeX},{layout.ConcludeY}. A validacao visual final sera feita em seguida quando o Android disponibilizar a arvore.");
+            return layout.RequiresActivityGuard
+                ? new TefDirectResult(
+                    false,
+                    "tef-conclude",
+                    "A validacao permaneceu na TefSetupActivity e nao confirmou a abertura da tela operacional.",
+                    layout.Name)
+                : new TefDirectResult(
+                    true,
+                    "tef-concluded-l400",
+                    string.Empty,
+                    $"Concluir acionado no perfil {layout.Name} em {layout.ConcludeX},{layout.ConcludeY}. A validacao visual final sera feita em seguida quando o Android disponibilizar a arvore.");
         }
 
         for (var attempt = 0; attempt < 18; attempt++)
@@ -3284,7 +3817,7 @@ public sealed class SmartUiAutomationService
 
                 await Task.Delay(700, cancellationToken);
                 var foreground = await _adb.GetForegroundPackageAsync(serial, cancellationToken);
-                if (!string.Equals(foreground, "softcom.mobile.smart2.redeflex", StringComparison.OrdinalIgnoreCase))
+                if (!string.Equals(foreground, packageName, StringComparison.OrdinalIgnoreCase))
                 {
                     return new TefDirectResult(
                         false,
@@ -3340,8 +3873,21 @@ public sealed class SmartUiAutomationService
         int y,
         string value,
         string fieldName,
+        bool useUiFieldBounds,
         CancellationToken cancellationToken)
     {
+        if (useUiFieldBounds)
+        {
+            var point = await ResolveSmartTefFieldPointAsync(
+                serial,
+                fieldName,
+                x,
+                y,
+                cancellationToken);
+            x = point.X;
+            y = point.Y;
+        }
+
         var tap = await _adb.TapAsync(serial, x, y, cancellationToken);
         if (!tap.Success)
         {
@@ -3371,21 +3917,110 @@ public sealed class SmartUiAutomationService
         return new FieldFillResult(true, string.Empty, $"campo={fieldName}; ponto={x},{y}");
     }
 
-    private static SmartTefLayout GetSmartTefLayout(int width, int height)
+    private async Task<(int X, int Y)> ResolveSmartTefFieldPointAsync(
+        string serial,
+        string fieldName,
+        int fallbackX,
+        int fallbackY,
+        CancellationToken cancellationToken)
     {
+        var snapshot = await ReadUiQuickAsync(serial, cancellationToken);
+        if (!snapshot.Success)
+        {
+            return (fallbackX, fallbackY);
+        }
+
+        var labels = fieldName switch
+        {
+            "Nome do dispositivo" => new[] { "nome do dispositivo" },
+            "CNPJ" => new[] { "cnpj" },
+            "Empresa ID" => new[] { "empresa id" },
+            "Token" => new[] { "token" },
+            _ => new[] { fieldName }
+        };
+        var field = FindEditableBelowLabels(snapshot.Nodes, labels);
+        if (field is null ||
+            field.Right <= field.Left ||
+            field.Bottom - field.Top < 24)
+        {
+            return (fallbackX, fallbackY);
+        }
+
+        return (field.CenterX, field.CenterY);
+    }
+
+    private async Task<(int X, int Y)> ResolveSmartTefActionPointAsync(
+        string serial,
+        IReadOnlyList<string> labels,
+        int fallbackX,
+        int fallbackY,
+        bool useUiBounds,
+        CancellationToken cancellationToken)
+    {
+        if (!useUiBounds)
+        {
+            return (fallbackX, fallbackY);
+        }
+
+        var snapshot = await ReadUiQuickAsync(serial, cancellationToken);
+        if (!snapshot.Success)
+        {
+            return (fallbackX, fallbackY);
+        }
+
+        var action = FindByLabelsIncludingText(snapshot.Nodes, labels);
+        if (action is null || action.Right <= action.Left || action.Bottom <= action.Top)
+        {
+            return (fallbackX, fallbackY);
+        }
+
+        return (action.CenterX, action.CenterY);
+    }
+
+    private static SmartTefLayout GetSmartTefLayout(int width, int height, string? provisioningProfile = null)
+    {
+        // O Mercado Pago N950 possui barra inferior propria e area util de 1320 px
+        // apesar da resolucao fisica 720x1440. Estes pontos foram medidos na tela real
+        // do TefSetupActivity. O botao de confirmar fica fixo acima da navegacao.
+        if (IsMercadoPagoN950Profile(provisioningProfile) &&
+            Math.Abs(width - 720) <= 24 && Math.Abs(height - 1440) <= 40)
+        {
+            return new SmartTefLayout(
+                "Mercado Pago N950 720x1440",
+                360, 534,
+                360, 912,
+                360, 695,
+                360, 860,
+                360, 1024,
+                360, 1248,
+                360, 930,
+                true,
+                360, 1080,
+                360, 620,
+                450,
+                true,
+                true,
+                true);
+        }
+
         // Perfil do Positivo L400 observado no teste real. O layout do Compose neste
         // aparelho nao coincide com a simples escala 1080x2400 -> 720x1600.
         if (Math.Abs(width - 720) <= 24 && Math.Abs(height - 1600) <= 40)
         {
             return new SmartTefLayout(
                 "Positivo L400 720x1600",
-                360, 497,
-                360, 862,
-                360, 1006,
-                360, 1154,
-                360, 1303,
-                360, 1496,
-                360, 1128);
+                360, 527,
+                360, 912,
+                360, 873,
+                360, 1037,
+                360, 1201,
+                360, 1432,
+                360, 1128,
+                true,
+                360, 1280, 360, 800, 450,
+                true,
+                true,
+                true);
         }
 
         // Layout de referencia extraido do XML do Smart TEF em 1080x2400.
@@ -3406,7 +4041,50 @@ public sealed class SmartUiAutomationService
             company.X, company.Y,
             token.X, token.Y,
             confirm.X, confirm.Y,
-            conclude.X, conclude.Y);
+            conclude.X, conclude.Y,
+            false,
+            0, 0, 0, 0, 0,
+            false,
+            false,
+            false);
+    }
+
+    private async Task<bool> NormalizeSmartTefManualScrollAsync(
+        string serial,
+        SmartTefLayout layout,
+        CancellationToken cancellationToken)
+    {
+        if (!layout.RequiresManualScroll)
+        {
+            return true;
+        }
+
+        var swipe = await _adb.ShellAsync(
+            serial,
+            $"input swipe {layout.ScrollStartX} {layout.ScrollStartY} {layout.ScrollEndX} {layout.ScrollEndY} {layout.ScrollDurationMilliseconds}",
+            cancellationToken,
+            8000);
+        if (!swipe.Success)
+        {
+            return false;
+        }
+
+        await Task.Delay(300, cancellationToken);
+        return true;
+    }
+
+    private async Task<bool> IsExpectedSmartTefActivityAsync(
+        string serial,
+        SmartTefLayout layout,
+        CancellationToken cancellationToken)
+    {
+        if (!layout.RequiresActivityGuard)
+        {
+            return true;
+        }
+
+        var activity = await GetLegacySmartActivityAsync(serial, cancellationToken);
+        return IsSmartTefSetupActivity(activity);
     }
 
     private async Task<string> GetForegroundActivityAsync(
@@ -3513,31 +4191,21 @@ public sealed class SmartUiAutomationService
         string serial,
         CancellationToken cancellationToken)
     {
-        // Primeiro tenta a consulta mais curta. Em Android moderno ela evita ficar
-        // processando o dump completo enquanto a tela final ja esta visivel.
-        var top = await _adb.ShellAsync(serial, "dumpsys activity top", cancellationToken, 6000);
-        if (top.Success)
-        {
-            var topMatch = System.Text.RegularExpressions.Regex.Match(
-                top.StandardOutput ?? string.Empty,
-                @"ACTIVITY\s+(softcom\.mobile\.smart2/[A-Za-z0-9._$]+)",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            if (topMatch.Success)
-            {
-                return topMatch.Groups[1].Value.Trim();
-            }
-        }
-
+        // Nao usa a primeira linha ACTIVITY de `dumpsys activity top`: em terminais
+        // kiosk (Mercado Pago/N950) esse dump mantem a task PARADA do Smart antes da
+        // task HOME realmente resumida. Isso fazia a automacao tocar no launcher da
+        // adquirente e parecer que o Smart abria e fechava.
+        //
         // No Android 7 observado, dumpsys window pode reportar o launcher durante uma
-        // transicao mesmo quando o Smart esta sendo retomado. Para o fluxo legado,
-        // priorizamos a Activity resumida informada por ActivityManager.
+        // transicao; por isso a Activity explicitamente RESUMIDA do ActivityManager
+        // continua sendo a fonte primaria.
         var activities = await _adb.ShellAsync(serial, "dumpsys activity activities", cancellationToken, 10000);
         if (activities.Success)
         {
             foreach (var pattern in new[]
             {
-                @"mResumedActivity:.*?\s(?:u\d+\s+)?(softcom\.mobile\.smart2/[A-Za-z0-9._$]+)",
-                @"ResumedActivity:.*?\s(?:u\d+\s+)?(softcom\.mobile\.smart2/[A-Za-z0-9._$]+)"
+                @"mResumedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)",
+                @"ResumedActivity:.*?\s(?:u\d+\s+)?([A-Za-z0-9._]+/[A-Za-z0-9._$]+)"
             })
             {
                 var match = System.Text.RegularExpressions.Regex.Match(
@@ -3584,12 +4252,31 @@ public sealed class SmartUiAutomationService
         string packageName,
         CancellationToken cancellationToken)
     {
-        var failures = new List<string>();
-        foreach (var permission in new[]
+        var packageInfo = await _adb.ShellAsync(
+            serial,
+            $"dumpsys package {packageName}",
+            cancellationToken,
+            12000);
+        var packageOutput = packageInfo.CombinedOutput ?? string.Empty;
+        var permissions = new[]
         {
             "android.permission.READ_EXTERNAL_STORAGE",
             "android.permission.WRITE_EXTERNAL_STORAGE"
-        })
+        }
+        .Where(permission => packageOutput.Contains(permission, StringComparison.OrdinalIgnoreCase))
+        .ToArray();
+
+        if (packageInfo.Success && permissions.Length == 0)
+        {
+            return new LegacyPermissionResult(
+                true,
+                "O package deste Smart 8.0 nao solicita permissoes legadas de armazenamento; nenhuma concessao ADB foi necessaria.");
+        }
+
+        var failures = new List<string>();
+        foreach (var permission in permissions.Length > 0
+                     ? permissions
+                     : new[] { "android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE" })
         {
             var grant = await _adb.ShellAsync(
                 serial,
@@ -3626,6 +4313,7 @@ public sealed class SmartUiAutomationService
         var last = string.Empty;
         var permissionWasHandled = false;
         var settingsRetriedAfterPermission = false;
+        var settingsRetriedWhileStillOnLogin = false;
 
         for (var attempt = 0; attempt < 24; attempt++)
         {
@@ -3742,6 +4430,41 @@ public sealed class SmartUiAutomationService
                 continue;
             }
 
+            // Alguns terminais nao disponibilizam a hierarquia no primeiro instante
+            // apos o launch. Nessa situacao o toque inicial pode ter usado apenas o
+            // ponto proporcional e ficar acima do botao (caso observado na Stone
+            // L400). Se o Smart continuar inequivocamente na LoginActivity, relê o
+            // retangulo real e repete o toque uma unica vez.
+            if (!permissionWasHandled &&
+                !settingsRetriedWhileStillOnLogin &&
+                attempt >= 3 &&
+                (IsLegacyLoginActivity(actualForeground) || IsLegacyLoginActivity(smartActivity)))
+            {
+                var currentSettingsBounds = await FindViewBoundsFromActivityDumpAsync(
+                    serial,
+                    "app:id/btn_config",
+                    cancellationToken);
+                var retryX = currentSettingsBounds.Success ? currentSettingsBounds.CenterX : settingsX;
+                var retryY = currentSettingsBounds.Success ? currentSettingsBounds.CenterY : settingsY;
+                var retrySource = currentSettingsBounds.Success
+                    ? "dumpsys activity top (app:id/btn_config)"
+                    : "ponto calculado anteriormente";
+
+                progress?.Invoke(
+                    "legacy-settings-retap",
+                    $"Smart ainda na LoginActivity. Repetindo Configuracoes uma unica vez em {retryX},{retryY} via {retrySource}...");
+
+                var retryTap = await _adb.TapAsync(serial, retryX, retryY, cancellationToken);
+                if (!retryTap.Success)
+                {
+                    return actualForeground;
+                }
+
+                settingsRetriedWhileStillOnLogin = true;
+                await Task.Delay(800, cancellationToken);
+                continue;
+            }
+
             last = !string.IsNullOrWhiteSpace(actualForeground)
                 ? actualForeground
                 : smartActivity;
@@ -3760,31 +4483,56 @@ public sealed class SmartUiAutomationService
 
     private static bool IsLegacySmartPackageActivity(string activity) =>
         !string.IsNullOrWhiteSpace(activity) &&
-        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase);
+        activity.Contains('/', StringComparison.Ordinal) &&
+        activity[..activity.IndexOf('/', StringComparison.Ordinal)]
+            .StartsWith("softcom.mobile.smart", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsLegacyLoginActivity(string activity) =>
         !string.IsNullOrWhiteSpace(activity) &&
-        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase) &&
+        IsLegacySmartPackageActivity(activity) &&
         activity.EndsWith("softcom.mobile.smart.views.activities.login.LoginActivity", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsLegacyCompanyActivity(string activity) =>
         !string.IsNullOrWhiteSpace(activity) &&
-        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase) &&
+        IsLegacySmartPackageActivity(activity) &&
         activity.EndsWith("softcom.mobile.smart.views.activities.empresa.EmpresaActivity", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsLegacyCompanyAddConfigActivity(string activity) =>
         !string.IsNullOrWhiteSpace(activity) &&
-        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase) &&
+        IsLegacySmartPackageActivity(activity) &&
         activity.EndsWith("softcom.mobile.smart.views.activities.EmpresaAddConfigActivity", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsSmartTefSetupActivity(string activity) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        IsLegacySmartPackageActivity(activity) &&
+        activity.EndsWith("softcom.mobile.smart.tef.ui.TefSetupActivity", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsSmartTefMainActivity(string activity) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        IsLegacySmartPackageActivity(activity) &&
+        activity.EndsWith("softcom.mobile.smart.tef.ui.TefActivity", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsLegacyCompanyAddActivity(string activity) =>
         !string.IsNullOrWhiteSpace(activity) &&
-        activity.Contains("softcom.mobile.smart2/", StringComparison.OrdinalIgnoreCase) &&
+        IsLegacySmartPackageActivity(activity) &&
         activity.EndsWith("softcom.mobile.smart.views.activities.device.EmpresaAddActivity", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsLegacy80LargeSelfServiceModule(string module) =>
         string.Equals(module, "smart_totem", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(module, "smart_autopagamento", StringComparison.OrdinalIgnoreCase);
+
+    private static bool ShouldPreserveLegacy80Keyboard(string? provisioningProfile) =>
+        IsMercadoPagoN950Profile(provisioningProfile);
+
+    private static bool IsMercadoPagoN950Profile(string? provisioningProfile) =>
+        string.Equals(
+            provisioningProfile?.Trim(),
+            "mercadopagon950",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsActivityBasedSmartTefPackage(string? packageName) =>
+        !string.IsNullOrWhiteSpace(packageName) &&
+        packageName.Trim().StartsWith("softcom.mobile.smart", StringComparison.OrdinalIgnoreCase);
 
     private static string GetLegacy80ModuleResourceId(string module) =>
         (module ?? string.Empty).Trim().ToLowerInvariant() switch
@@ -3862,24 +4610,48 @@ public sealed class SmartUiAutomationService
         string resourceId,
         CancellationToken cancellationToken)
     {
-        var result = await _adb.ShellAsync(
-            serial,
-            "dumpsys activity top",
-            cancellationToken,
-            12000);
-
-        if (!result.Success || string.IsNullOrWhiteSpace(result.StandardOutput))
+        ActivityViewBoundsResult? lastFailure = null;
+        for (var attempt = 0; attempt < 3; attempt++)
         {
-            return new ActivityViewBoundsResult(
-                false,
-                0,
-                0,
-                0,
-                0,
-                "O Android nao disponibilizou a hierarquia da Activity atual.");
+            if (attempt > 0)
+            {
+                await Task.Delay(180, cancellationToken);
+            }
+
+            var result = await _adb.ShellAsync(
+                serial,
+                "dumpsys activity top",
+                cancellationToken,
+                12000);
+
+            if (!result.Success || string.IsNullOrWhiteSpace(result.StandardOutput))
+            {
+                lastFailure = new ActivityViewBoundsResult(
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "O Android nao disponibilizou a hierarquia da Activity atual.");
+                continue;
+            }
+
+            var parsed = ParseActivityViewBounds(result.StandardOutput, resourceId);
+            if (parsed.Success)
+            {
+                return parsed;
+            }
+
+            lastFailure = parsed;
         }
 
-        return ParseActivityViewBounds(result.StandardOutput, resourceId);
+        return lastFailure ?? new ActivityViewBoundsResult(
+            false,
+            0,
+            0,
+            0,
+            0,
+            $"O resource-id {resourceId} nao foi localizado na Activity atual.");
     }
 
     private static ActivityViewBoundsResult ParseActivityViewBounds(string dump, string resourceId)
@@ -3895,21 +4667,17 @@ public sealed class SmartUiAutomationService
         var parents = new Stack<ActivityDumpView>();
         var inViewHierarchy = false;
         ActivityViewBoundsResult? lastMatch = null;
+        ActivityViewBoundsResult? directMatch = null;
         var viewPattern = new Regex(
             @"^(?<indent>\s*)(?<type>[A-Za-z0-9_.$]+)\{.*\s(?<left>-?\d+),(?<top>-?\d+)-(?<right>-?\d+),(?<bottom>-?\d+)(?:\s[^}]*)?\}\s*$",
             RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
         foreach (var rawLine in dump.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
         {
-            if (rawLine.Contains("View Hierarchy:", StringComparison.Ordinal))
+            if (rawLine.Contains("View Hierarchy:", StringComparison.OrdinalIgnoreCase))
             {
                 inViewHierarchy = true;
                 parents.Clear();
-                continue;
-            }
-
-            if (!inViewHierarchy)
-            {
                 continue;
             }
 
@@ -3919,18 +4687,39 @@ public sealed class SmartUiAutomationService
                 continue;
             }
 
-            var indent = match.Groups["indent"].Value.Length;
-            while (parents.Count > 0 && parents.Peek().Indent >= indent)
-            {
-                parents.Pop();
-            }
-
             if (!int.TryParse(match.Groups["left"].Value, out var left) ||
                 !int.TryParse(match.Groups["top"].Value, out var top) ||
                 !int.TryParse(match.Groups["right"].Value, out var right) ||
                 !int.TryParse(match.Groups["bottom"].Value, out var bottom))
             {
                 continue;
+            }
+
+            // Mantem uma alternativa baseada no proprio retangulo da View. Ela cobre
+            // fabricantes cujo dumpsys omite o cabecalho "View Hierarchy" ou corta
+            // parte dos pais, sem voltar silenciosamente para coordenadas de outro
+            // aparelho.
+            if (rawLine.Contains(resourceId, StringComparison.OrdinalIgnoreCase) &&
+                right > left && bottom > top)
+            {
+                directMatch = new ActivityViewBoundsResult(
+                    true,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    "Retangulo relativo retornado sem todos os pais da hierarquia.");
+            }
+
+            if (!inViewHierarchy)
+            {
+                continue;
+            }
+
+            var indent = match.Groups["indent"].Value.Length;
+            while (parents.Count > 0 && parents.Peek().Indent >= indent)
+            {
+                parents.Pop();
             }
 
             var parentLeft = parents.Count > 0 ? parents.Peek().AbsoluteLeft : 0;
@@ -3965,7 +4754,7 @@ public sealed class SmartUiAutomationService
             parents.Push(current);
         }
 
-        return lastMatch ?? new ActivityViewBoundsResult(
+        return lastMatch ?? directMatch ?? new ActivityViewBoundsResult(
             false,
             0,
             0,
@@ -3981,9 +4770,16 @@ public sealed class SmartUiAutomationService
         bounds.CenterX > 0 && bounds.CenterX < display.Width &&
         bounds.CenterY > 0 && bounds.CenterY < display.Height;
 
-    private async Task<UiSnapshot> ReadUiQuickAsync(string serial, CancellationToken cancellationToken)
+    private async Task<UiSnapshot> ReadUiQuickAsync(
+        string serial,
+        CancellationToken cancellationToken,
+        int dumpTimeoutMilliseconds = 2500)
     {
-        var result = await _adb.DumpUiHierarchyAsync(serial, cancellationToken, maxAttempts: 1, dumpTimeoutMilliseconds: 2500);
+        var result = await _adb.DumpUiHierarchyAsync(
+            serial,
+            cancellationToken,
+            maxAttempts: 1,
+            dumpTimeoutMilliseconds: dumpTimeoutMilliseconds);
         if (!result.Success || string.IsNullOrWhiteSpace(result.StandardOutput))
         {
             return new UiSnapshot(
@@ -4098,6 +4894,7 @@ public sealed class SmartUiAutomationService
 
     private async Task<string> ResolveTefPackageAsync(
         string serial,
+        string? configuredPackage,
         CancellationToken cancellationToken)
     {
         const string tefPackage = "softcom.mobile.smart2.redeflex";
@@ -4106,16 +4903,35 @@ public sealed class SmartUiAutomationService
             return tefPackage;
         }
 
+        // Algumas adquirentes, como a Cielo DX8000 validada, entregam o modulo
+        // Smart TEF dentro do APK principal (softcom.mobile.smart). Nesse caso o
+        // package detectado para aquele UDID e a fonte correta.
+        if (!string.IsNullOrWhiteSpace(configuredPackage) &&
+            configuredPackage.StartsWith("softcom.mobile.smart", StringComparison.OrdinalIgnoreCase) &&
+            await _adb.IsPackageInstalledAsync(serial, configuredPackage, cancellationToken))
+        {
+            return configuredPackage.Trim();
+        }
+
         var foreground = await _adb.GetForegroundPackageAsync(serial, cancellationToken);
         if (!string.IsNullOrWhiteSpace(foreground) &&
-            foreground.Contains("redeflex", StringComparison.OrdinalIgnoreCase) &&
+            foreground.StartsWith("softcom.mobile.smart", StringComparison.OrdinalIgnoreCase) &&
             await _adb.IsPackageInstalledAsync(serial, foreground, cancellationToken))
         {
             return foreground;
         }
 
+        var detection = await _adb.DetectSmartPackageAsync(serial, cancellationToken);
+        var fallback = detection.Candidates.FirstOrDefault(x =>
+            x.StartsWith("softcom.mobile.smart", StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(fallback) &&
+            await _adb.IsPackageInstalledAsync(serial, fallback, cancellationToken))
+        {
+            return fallback;
+        }
+
         throw new InvalidOperationException(
-            "O package do Smart TEF nao foi localizado. Esperado: softcom.mobile.smart2.redeflex.");
+            "Nenhum package Softcom Smart com suporte ao modulo TEF foi localizado neste Android.");
     }
 
     private async Task<FieldFillResult> FillFieldAsync(
@@ -4206,30 +5022,27 @@ public sealed class SmartUiAutomationService
             return configuredPackage.Trim();
         }
 
-        var foreground = await _adb.GetForegroundPackageAsync(serial, cancellationToken);
-        if (!string.IsNullOrWhiteSpace(foreground) &&
-            (foreground.Contains("softcom", StringComparison.OrdinalIgnoreCase) ||
-             foreground.Contains("smart", StringComparison.OrdinalIgnoreCase)) &&
-            await _adb.IsPackageInstalledAsync(serial, foreground, cancellationToken))
+        var detection = await _adb.DetectSmartPackageAsync(serial, cancellationToken);
+        if (!string.IsNullOrWhiteSpace(detection.PackageName) &&
+            !detection.PackageName.Contains("redeflex", StringComparison.OrdinalIgnoreCase))
         {
-            return foreground;
+            return detection.PackageName;
         }
 
-        // Package confirmado no Smart padrao atual. Evita confundir com a variante RedeFlex.
-        const string standardSmart = "softcom.mobile.smart2";
-        if (await _adb.IsPackageInstalledAsync(serial, standardSmart, cancellationToken))
-        {
-            return standardSmart;
-        }
-
-        var candidates = await _adb.FindLikelySmartPackagesAsync(serial, cancellationToken);
-        if (candidates.Count == 0)
+        // SubmitDeviceUrl configura o Smart padrao. A variante RedeFlex possui fluxo
+        // dedicado e nao pode ser escolhida como fallback apenas por estar em foreground.
+        var candidates = detection.Candidates
+            .Where(x => !x.Contains("redeflex", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(AdbService.SmartPackageScore)
+            .ThenBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (candidates.Length == 0)
         {
             throw new InvalidOperationException(
                 "Nenhum package Android contendo 'softcom' ou 'smart' foi localizado. Configure o package do Smart em Configuracoes.");
         }
 
-        if (candidates.Count == 1)
+        if (candidates.Length == 1)
         {
             return candidates[0];
         }
@@ -4546,6 +5359,7 @@ public sealed class SmartUiAutomationService
         ContainsLabel(nodes, "device ja esta em uso") ||
         ContainsLabel(nodes, "device esta em uso") ||
         ContainsLabel(nodes, "dispositivo em uso") ||
+        ContainsLabel(nodes, "encontra-se em uso") ||
         ContainsLabel(nodes, "erro ao vincular") ||
         ContainsLabel(nodes, "falha ao vincular") ||
         ContainsLabel(nodes, "vinculo recusado");
@@ -4628,17 +5442,23 @@ public sealed class SmartUiAutomationService
     {
         foreach (var value in nodes.SelectMany(x => new[] { x.Text, x.SearchText }))
         {
-            var match = System.Text.RegularExpressions.Regex.Match(
-                value ?? string.Empty,
-                @"Device\s*ID\s*:\s*([A-Za-z0-9._-]+)",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            if (match.Success)
+            var deviceId = ExtractSmartDeviceIdFromText(value);
+            if (!string.IsNullOrWhiteSpace(deviceId))
             {
-                return match.Groups[1].Value.Trim();
+                return deviceId;
             }
         }
 
         return string.Empty;
+    }
+
+    private static string ExtractSmartDeviceIdFromText(string? value)
+    {
+        var match = Regex.Match(
+            value ?? string.Empty,
+            @"Device\s*ID\s*:\s*([A-Za-z0-9._-]+)",
+            RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups[1].Value.Trim() : string.Empty;
     }
 
     private static string FirstNonEmpty(string current, string candidate) =>
@@ -4706,7 +5526,14 @@ public sealed class SmartUiAutomationService
         int CompanyX, int CompanyY,
         int TokenX, int TokenY,
         int ConfirmX, int ConfirmY,
-        int ConcludeX, int ConcludeY);
+        int ConcludeX, int ConcludeY,
+        bool RequiresManualScroll,
+        int ScrollStartX, int ScrollStartY,
+        int ScrollEndX, int ScrollEndY,
+        int ScrollDurationMilliseconds,
+        bool UseCoordinateConclusion,
+        bool RequiresActivityGuard = false,
+        bool UseUiFieldBounds = false);
 
     private sealed record DisplaySizeResult(bool Success, int Width, int Height, string Message);
 

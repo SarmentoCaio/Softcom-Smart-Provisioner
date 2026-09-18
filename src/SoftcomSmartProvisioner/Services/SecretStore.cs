@@ -12,6 +12,7 @@ public sealed class SecretStore
     public const string VpnPassword = "VPN_PASSWORD";
     public const string ApiClientId = "API_CLIENT_ID";
     public const string ApiClientSecret = "API_CLIENT_SECRET";
+    public const string SmartTefToken = "SMART_TEF_TOKEN";
 
     private readonly string _filePath;
     private Dictionary<string, string> _encrypted = new(StringComparer.OrdinalIgnoreCase);

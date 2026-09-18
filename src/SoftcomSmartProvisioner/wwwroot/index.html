@@ -22,9 +22,6 @@
         <button class="nav-item active" data-page="provision">
           <span class="nav-icon">◇</span><span>Provisionar</span>
         </button>
-        <button class="nav-item" data-page="android">
-          <span class="nav-icon">▣</span><span>Android</span>
-        </button>
         <button class="nav-item" data-page="logs">
           <span class="nav-icon">≡</span><span>Logs</span>
         </button>
@@ -50,37 +47,32 @@
         </div>
         <div class="top-actions">
           <button class="ghost compact hidden" id="update-available-button">Atualização disponível</button>
-          <span class="phase-badge" id="phase-badge">Fase 1</span>
           <button class="icon-button" id="theme-toggle" title="Alternar tema">☼</button>
         </div>
       </header>
 
       <section class="page active" id="page-provision">
-        <div class="grid two">
-          <article class="panel">
+        <div class="grid two setup-grid" id="setup-grid">
+          <article class="panel setup-panel">
             <div class="panel-heading">
-              <div>
+              <div class="setup-heading-copy">
                 <span class="eyebrow">1. AMBIENTE E CLIENTE</span>
                 <h2>Softcomshop</h2>
+                <span class="setup-company-summary hidden" id="setup-company-summary"></span>
               </div>
-              <span class="mini-status" id="db-credential-status">Credenciais</span>
+              <div class="heading-actions">
+                <span class="mini-status" id="db-credential-status">Credenciais</span>
+                <button type="button" class="ghost compact hidden" id="expand-setup">Alterar</button>
+              </div>
             </div>
 
-            <div class="access-mode-card">
+            <div class="access-mode-card access-mode-inline">
               <span class="field-caption">Modo de acesso</span>
-              <div class="segmented access-mode three" id="access-mode-switch">
+              <div class="segmented access-mode" id="access-mode-switch">
                 <button class="active" data-access="online">Online</button>
-                <button data-access="docker">Docker isolado</button>
-                <button data-access="database">VPN local</button>
+                <button data-access="docker">Docker</button>
               </div>
-              <small id="access-mode-helper">Online usa o Softcomshop. Docker isola a VPN em um container e publica apenas o MySQL localmente. VPN local mantém o fluxo antigo.</small>
-            </div>
-
-            <div id="database-access-options" class="hidden">
-              <div class="segmented" id="environment-switch">
-                <button class="active" data-env="aws1">AWS 1</button>
-                <button data-env="aws2">AWS 2</button>
-              </div>
+              <small id="access-mode-helper">Usa a sessão Web do Softcomshop.</small>
             </div>
 
             <label class="field">
@@ -91,21 +83,21 @@
                   <div class="database-suggestions hidden" id="database-suggestions" role="listbox"></div>
                 </div>
                 <button class="secondary" id="use-database">Usar</button>
-                <button class="secondary" id="load-databases">Buscar bancos</button>
+                <button class="secondary hidden" id="load-databases">Buscar bancos</button>
               </div>
               <small id="client-helper">Informe o nome do cliente. O Provisioner usa a sessão WEB do Softcomshop e não acessa VPN/MySQL.</small>
             </label>
 
             <div class="inline-actions">
               <button class="ghost hidden" id="connect-docker">Iniciar Docker</button>
-              <button class="ghost" id="connect-vpn">Conectar VPN</button>
+              <button class="ghost hidden" id="connect-vpn">Conectar VPN</button>
               <button class="ghost" id="open-client-site" disabled>Abrir Softcomshop</button>
             </div>
 
             <div class="callout hidden" id="database-error"></div>
           </article>
 
-          <article class="panel">
+          <article class="panel setup-panel">
             <div class="panel-heading">
               <div>
                 <span class="eyebrow">2. EMPRESA</span>
@@ -130,7 +122,7 @@
           </article>
         </div>
 
-        <div class="grid two">
+        <div class="grid two main-workspace">
           <article class="panel">
             <div class="panel-heading">
               <div>
@@ -278,46 +270,63 @@
               <div class="tef-heading">
                 <div>
                   <strong>Configuração Smart TEF</strong>
-                  <span>O Smart TEF usa o aplicativo RedeFlex e não utiliza URL de oauth_clients neste fluxo.</span>
+                  <span>O Smart TEF usa o APK disponível para a adquirente e não utiliza URL de oauth_clients neste fluxo.</span>
                 </div>
-                <span class="mini-status ok">RedeFlex</span>
+                <span class="mini-status ok">Package por dispositivo</span>
               </div>
 
-              <label class="field">
-                <span>Nome do dispositivo</span>
-                <input id="tef-device-name" value="SMART 1" autocomplete="off">
-              </label>
-
-              <div class="tef-grid">
+              <div class="tef-fields">
+                <label class="field tef-field-wide">
+                  <span>Nome do dispositivo</span>
+                  <input id="tef-device-name" value="SMART 1" placeholder="Ex.: SMART 1" autocomplete="off">
+                </label>
                 <label class="field">
                   <span>CNPJ</span>
-                  <input id="tef-cnpj" value="16161060606116" inputmode="numeric" autocomplete="off">
+                  <input id="tef-cnpj" placeholder="Somente números" inputmode="numeric" autocomplete="off">
                 </label>
                 <label class="field">
                   <span>Empresa ID</span>
-                  <input id="tef-empresa-id" value="106160" inputmode="numeric" autocomplete="off">
+                  <input id="tef-empresa-id" placeholder="ID da empresa" autocomplete="off">
                 </label>
-              </div>
-
-              <label class="field">
-                <span>Token</span>
-                <input id="tef-token" value="c531b36997b208f001889804450dde7e" autocomplete="off">
-              </label>
-
-              <div class="callout tef-note">
-                Esses valores ficam preenchidos por padrão e podem ser alterados antes da preparação.
+                <label class="field tef-field-wide">
+                  <span>Token</span>
+                  <input id="tef-token" type="password" placeholder="Token do Smart TEF" autocomplete="new-password">
+                </label>
+                <div class="callout tef-note tef-field-wide">
+                  Informe os dados fornecidos para o dispositivo antes da preparação. O token salvo fica protegido para o usuário atual do Windows.
+                </div>
+                <div class="tef-save-row tef-field-wide">
+                  <label class="checkbox-line tef-save-check">
+                    <input type="checkbox" id="save-tef-configuration">
+                    Manter estes dados para os próximos dispositivos
+                  </label>
+                  <button type="button" class="secondary compact" id="save-tef-settings">Salvar configuração</button>
+                </div>
               </div>
             </div>
           </article>
 
           <article class="panel">
-            <div class="panel-heading">
+            <div class="panel-heading android-panel-heading">
               <div>
                 <span class="eyebrow">4. ANDROID</span>
                 <h2>Dispositivo ADB</h2>
               </div>
-              <button class="ghost compact" id="refresh-android">Atualizar</button>
+              <div class="android-header-actions">
+                <div class="android-selection-actions hidden" id="android-multi-actions">
+                  <button type="button" class="ghost compact" id="select-all-android">Selecionar todos</button>
+                  <button type="button" class="ghost compact" id="clear-android-selection">Limpar seleção</button>
+                  <strong id="android-selected-count">Selecionados: 0 dispositivos</strong>
+                </div>
+                <button class="ghost compact" id="refresh-android">Atualizar</button>
+              </div>
             </div>
+
+            <label class="multi-device-toggle">
+              <input type="checkbox" id="multi-device-check">
+              <span class="check-box"></span>
+              <span><strong>Provisionar vários dispositivos</strong><small>Ative para selecionar vários ADBs e relacionar um cadastro diferente a cada maquineta.</small></span>
+            </label>
 
             <div id="android-picker" class="android-picker">
               <div class="empty-state">Buscando dispositivos ADB...</div>
@@ -363,27 +372,20 @@
           </label>
 
           <div class="final-actions">
-            <button class="secondary big" id="generate-url" disabled>Gerar URL</button>
             <button class="secondary big" id="validate-link" disabled>Validar</button>
-            <button class="primary big" id="prepare-smart" disabled>Preparar Smart</button>
+            <button class="primary big" id="prepare-smart" disabled>Provisionar selecionados</button>
           </div>
 
-          <div class="phase-note">
-            <strong>Fase atual:</strong> Softcomshop Online, SelfHost para Comanda/Autopagamento e acesso ao banco por Docker isolado ou VPN local.
+          <div class="provisioning-jobs hidden" id="provisioning-jobs">
+            <div class="provisioning-jobs-heading">
+              <strong>Andamento por dispositivo</strong>
+              <button type="button" class="danger-soft compact" id="cancel-all-provisioning">Cancelar todos</button>
+            </div>
+            <div id="provisioning-job-list"></div>
+            <div class="provisioning-summary" id="provisioning-summary"></div>
           </div>
+
         </article>
-      </section>
-
-      <section class="page" id="page-android">
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">ADB / SCRCPY</span>
-            <h2>Dispositivos Android</h2>
-            <p>Lista os emuladores e aparelhos conectados e lê o Android ID usado no vínculo.</p>
-          </div>
-          <button class="secondary" id="refresh-android-page">Atualizar lista</button>
-        </div>
-        <div class="android-grid" id="android-grid"></div>
       </section>
 
       <section class="page" id="page-logs">
@@ -404,50 +406,6 @@
       </section>
 
       <section class="page" id="page-settings">
-        <div class="grid two">
-          <article class="panel">
-            <div class="panel-heading">
-              <div>
-                <span class="eyebrow">ACESSO INTERNO</span>
-                <h2>Credenciais</h2>
-              </div>
-            </div>
-            <p class="muted">O acesso padrão do Recuperador já está disponível nesta versão. Se necessário, você pode substituir as credenciais somente neste computador.</p>
-            <div class="status-list">
-              <div><span>Banco AWS</span><strong id="setting-db-status">—</strong></div>
-              <div><span>VPN</span><strong id="setting-vpn-status">—</strong></div>
-              <div><span>API Softcomshop</span><strong id="setting-api-status">—</strong></div>
-            </div>
-            <div class="credentials-form">
-              <label class="field">
-                <span>Usuário do banco (opcional)</span>
-                <input id="database-username" autocomplete="off" placeholder="Deixe vazio para usar o acesso padrão">
-              </label>
-              <label class="field">
-                <span>Senha do banco (opcional)</span>
-                <input id="database-password" type="password" autocomplete="new-password" placeholder="Deixe vazio para usar o acesso padrão">
-              </label>
-              <div class="inline-actions">
-                <button class="primary" id="save-database-credentials">Salvar acesso local</button>
-                <button class="ghost" id="import-secrets">Importar do Recuperador</button>
-              </div>
-            </div>
-            <small class="helper">As substituições locais são protegidas pelo usuário atual do Windows e não são exibidas novamente.</small>
-          </article>
-
-          <article class="panel">
-            <div class="panel-heading">
-              <div>
-                <span class="eyebrow">VPN</span>
-                <h2>Perfil OpenVPN</h2>
-              </div>
-            </div>
-            <div class="path-box" id="vpn-profile">Nenhum perfil localizado</div>
-            <button class="secondary" id="choose-vpn">Selecionar .ovpn</button>
-            <small class="helper">O programa também tenta reutilizar automaticamente o perfil já configurado pelo Recuperador.</small>
-          </article>
-        </div>
-
         <article class="panel saved-clients-panel">
           <div class="panel-heading">
             <div>
@@ -455,7 +413,7 @@
               <h2>Clientes salvos</h2>
             </div>
           </div>
-          <p class="muted">Clientes autenticados ficam salvos localmente para aparecer na pesquisa da tela Provisionar. Remover aqui apaga somente o atalho salvo no Provisioner; nenhum cadastro do Softcomshop e excluido.</p>
+          <p class="muted">Clientes autenticados ficam salvos localmente para aparecer na pesquisa da tela Provisionar. Remover aqui apaga somente o atalho salvo no Provisioner; nenhum cadastro do Softcomshop é excluído.</p>
           <div class="saved-client-list" id="saved-online-clients">
             <div class="saved-client-empty">Nenhum cliente Online salvo.</div>
           </div>
@@ -484,15 +442,20 @@
               <span class="checkbox-line"><input type="checkbox" id="update-auto-install" checked> Instalar automaticamente quando houver nova versão</span>
             </label>
           </div>
-          <label class="field">
-            <span>Manifesto do canal Estável</span>
-            <input id="update-stable-url" autocomplete="off" placeholder="https://.../stable/latest.json">
-          </label>
-          <label class="field">
-            <span>Manifesto do canal Teste</span>
-            <input id="update-beta-url" autocomplete="off" placeholder="https://.../beta/latest.json">
-          </label>
-          <div class="update-result" id="update-result">Informe a URL do manifesto para ativar as atualizações.</div>
+          <details class="advanced-section compact-advanced">
+            <summary>Configuração dos manifestos</summary>
+            <div class="advanced-section-content">
+              <label class="field">
+                <span>Manifesto do canal Estável</span>
+                <input id="update-stable-url" autocomplete="off" placeholder="https://.../stable/latest.json">
+              </label>
+              <label class="field">
+                <span>Manifesto do canal Teste</span>
+                <input id="update-beta-url" autocomplete="off" placeholder="https://.../beta/latest.json">
+              </label>
+            </div>
+          </details>
+          <div class="update-result" id="update-result">O canal estável já vem configurado pelo aplicativo.</div>
           <div class="inline-actions">
             <button class="primary" id="save-update-settings">Salvar configuração</button>
             <button class="secondary" id="check-update">Verificar agora</button>
@@ -500,8 +463,43 @@
           </div>
         </article>
 
-        <div class="grid two">
-          <article class="panel">
+        <details class="advanced-settings">
+          <summary>
+            <span><strong>Opções avançadas</strong><small>Acesso direto ao banco, VPN, package e diagnóstico local</small></span>
+          </summary>
+          <div class="advanced-settings-content">
+            <div class="grid two">
+              <article class="panel">
+                <div class="panel-heading">
+                  <div><span class="eyebrow">ACESSO INTERNO</span><h2>Credenciais</h2></div>
+                </div>
+                <p class="muted">Use somente no modo Docker isolado. O acesso padrão pode ser substituído apenas neste computador.</p>
+                <div class="status-list">
+                  <div><span>Banco AWS</span><strong id="setting-db-status">—</strong></div>
+                  <div><span>VPN</span><strong id="setting-vpn-status">—</strong></div>
+                  <div><span>API Softcomshop</span><strong id="setting-api-status">—</strong></div>
+                </div>
+                <div class="credentials-form">
+                  <label class="field"><span>Usuário do banco</span><input id="database-username" autocomplete="off" placeholder="Deixe vazio para usar o acesso padrão"></label>
+                  <label class="field"><span>Senha do banco</span><input id="database-password" type="password" autocomplete="new-password" placeholder="Deixe vazio para usar o acesso padrão"></label>
+                  <div class="inline-actions">
+                    <button class="primary" id="save-database-credentials">Salvar acesso local</button>
+                    <button class="ghost" id="import-secrets">Importar do Recuperador</button>
+                  </div>
+                </div>
+                <small class="helper">As substituições são protegidas pelo usuário atual do Windows e não são exibidas novamente.</small>
+              </article>
+
+              <article class="panel">
+                <div class="panel-heading"><div><span class="eyebrow">VPN</span><h2>Perfil OpenVPN</h2></div></div>
+                <div class="path-box" id="vpn-profile">Nenhum perfil localizado</div>
+                <button class="secondary" id="choose-vpn">Selecionar .ovpn</button>
+                <small class="helper">O programa também tenta reutilizar o perfil já configurado pelo Recuperador.</small>
+              </article>
+            </div>
+
+            <div class="grid two">
+              <article class="panel">
             <div class="panel-heading">
               <div>
                 <span class="eyebrow">ANDROID</span>
@@ -517,9 +515,9 @@
             </label>
             <button class="ghost" id="detect-package">Detectar no Android selecionado</button>
             <div class="package-results hidden" id="package-results"></div>
-          </article>
+              </article>
 
-          <article class="panel">
+              <article class="panel">
             <div class="panel-heading">
               <div>
                 <span class="eyebrow">COMPONENTES</span>
@@ -532,10 +530,38 @@
               <div><span>OpenVPN</span><strong id="setting-openvpn-status">—</strong></div>
               <div><span>WebView2</span><strong class="ok">OK</strong></div>
             </div>
-          </article>
-        </div>
+              </article>
+            </div>
+          </div>
+        </details>
       </section>
     </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="provision-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="provision-confirm-title">
+    <div class="modal-card provision-confirm-card">
+      <div class="modal-heading">
+        <div>
+          <span class="eyebrow">PROVISIONAMENTO</span>
+          <h3 id="provision-confirm-title">Confirmar operação</h3>
+        </div>
+        <button type="button" class="icon-button" id="provision-confirm-close" aria-label="Fechar">×</button>
+      </div>
+      <p class="provision-confirm-description" id="provision-confirm-description"></p>
+      <div class="provision-confirm-summary">
+        <div><span>Módulo</span><strong id="provision-confirm-module">—</strong></div>
+        <div><span>Dispositivos</span><strong id="provision-confirm-devices">—</strong></div>
+        <div><span>Acesso</span><strong id="provision-confirm-access">—</strong></div>
+        <div><span>Dados locais</span><strong id="provision-confirm-data">—</strong></div>
+      </div>
+      <div class="provision-confirm-warning">
+        Vínculos anteriores serão verificados antes do envio. O resultado será acompanhado individualmente em cada dispositivo.
+      </div>
+      <div class="inline-actions modal-actions">
+        <button type="button" class="secondary" id="provision-confirm-cancel">Cancelar</button>
+        <button type="button" class="primary" id="provision-confirm-submit">Iniciar provisionamento</button>
+      </div>
+    </div>
   </div>
 
 
@@ -553,7 +579,7 @@
         <input id="selfhost-create-name" autocomplete="off" placeholder="Ex.: SELFHOST_SMART_01">
       </label>
       <div class="selfhost-create-doc-block">
-        <div class="selfhost-create-doc-title">NFC-e <span class="optional-tag">preferencial</span></div>
+        <div class="selfhost-create-doc-title">NFC-e <span class="optional-tag" id="selfhost-create-primary-tag">preferencial</span></div>
         <div class="selfhost-create-fiscal-row">
           <label class="field">
             <span>Série</span>
@@ -565,7 +591,7 @@
           </label>
         </div>
       </div>
-      <div class="selfhost-create-doc-block">
+      <div class="selfhost-create-doc-block" id="selfhost-create-nfe-block">
         <div class="selfhost-create-doc-title">NF-e <span class="optional-tag">fallback</span></div>
         <div class="selfhost-create-fiscal-row">
           <label class="field">
@@ -579,7 +605,7 @@
         </div>
       </div>
       <div class="inline-error-message hidden" id="selfhost-create-error" role="alert"></div>
-      <small class="modal-helper">A NFC-e é usada quando informada. Deixe-a vazia para usar a NF-e como fallback; série e numeração são enviadas no próprio cadastro do dispositivo.</small>
+      <small class="modal-helper" id="selfhost-create-helper">A NFC-e é usada quando informada. Deixe-a vazia para usar a NF-e como fallback; série e numeração são enviadas no próprio cadastro do dispositivo.</small>
       <div class="inline-actions modal-actions">
         <button type="button" class="secondary" id="selfhost-create-cancel">Cancelar</button>
         <button type="button" class="primary" id="selfhost-create-confirm">Criar</button>

@@ -12,6 +12,11 @@
     oauthClient: null,
     androidDevices: [],
     androidSerial: "",
+    androidSerials: [],
+    androidSelectionInitialized: false,
+    multiDevice: false,
+    androidTargets: {},
+    provisioningJobs: {},
     generatedUrl: "",
     module: "smart_pdv",
     useSelfHost: false,
@@ -25,12 +30,15 @@
     updateAvailable: false,
     updateRequired: false,
     latestVersion: "",
+    hasSavedTefToken: false,
+    tefSettingsInitialized: false,
     busy: new Set()
   };
 
   const $ = (id) => document.getElementById(id);
   const send = (action, payload = {}) => window.chrome?.webview?.postMessage({ action, payload });
   const databasePrefix = "softcoms_softcomshop_";
+  let pendingProvisionConfirmation = null;
 
   function toast(message, type = "info") {
     const host = $("toast-host");
@@ -58,6 +66,42 @@
     el.classList.add("hidden");
   }
 
+  function selectedProvisionDevicesLabel() {
+    const selected = new Set(state.androidSerials || []);
+    const names = state.androidDevices
+      .filter(device => selected.has(device.serial))
+      .map(device => device.friendlyName || device.model || device.serial)
+      .filter(Boolean);
+    if (!names.length) return "Nenhum selecionado";
+    if (names.length <= 2) return `${names.length} · ${names.join(" + ")}`;
+    return `${names.length} · ${names.slice(0, 2).join(" + ")} +${names.length - 2}`;
+  }
+
+  function openProvisionConfirmation(options) {
+    const modal = $("provision-confirm-modal");
+    if (!modal) return;
+    pendingProvisionConfirmation = options.onConfirm;
+    $("provision-confirm-title").textContent = options.title || "Confirmar provisionamento";
+    $("provision-confirm-description").textContent = options.description || "Confira os dados antes de iniciar.";
+    $("provision-confirm-module").textContent = options.moduleLabel || "Smart";
+    $("provision-confirm-devices").textContent = selectedProvisionDevicesLabel();
+    $("provision-confirm-access").textContent = options.accessLabel || "—";
+    $("provision-confirm-data").textContent = options.clearData ? "Serão limpos" : "Serão preservados";
+    modal.classList.remove("hidden");
+    setTimeout(() => $("provision-confirm-submit")?.focus(), 0);
+  }
+
+  function closeProvisionConfirmation() {
+    $("provision-confirm-modal")?.classList.add("hidden");
+    pendingProvisionConfirmation = null;
+  }
+
+  function acceptProvisionConfirmation() {
+    const action = pendingProvisionConfirmation;
+    closeProvisionConfirmation();
+    if (typeof action === "function") action();
+  }
+
   function setBusy(key, active) {
     if (active) state.busy.add(key); else state.busy.delete(key);
     const map = {
@@ -77,7 +121,7 @@
       el.disabled = active;
       el.classList.toggle("busy", active);
       if (key === "validation") el.textContent = active ? "Validando..." : "Validar";
-      if (key === "provision") el.textContent = active ? "Preparando..." : "Preparar Smart";
+      if (key === "provision") el.textContent = active ? "Provisionando..." : "Provisionar selecionados";
       if (key === "createDevice") el.textContent = active ? "Criando..." : "Criar dispositivo";
       if (key === "online") el.textContent = active ? "Conectando..." : (state.accessMode === "online" ? "Conectar" : "Usar");
       if (key === "update") el.textContent = active ? "Verificando..." : "Verificar agora";
@@ -113,9 +157,8 @@
         $(`page-${page}`).classList.add("active");
         const titles = {
           provision: ["Preparar dispositivo Smart", "Use o modo Online sem VPN ou o acesso direto ao banco para provisionar o Smart."],
-          android: ["Dispositivos Android", "ADB, Android ID e scrcpy em uma única tela."],
           logs: ["Logs", "Acompanhe VPN, banco, ADB e preparação sem janelas de console."],
-          settings: ["Configurações", "Acessos internos, VPN e parâmetros locais do Smart."]
+          settings: ["Configurações", "Clientes salvos, atualizações e opções avançadas."]
         };
         $("page-title").textContent = titles[page][0];
         $("page-subtitle").textContent = titles[page][1];
@@ -138,9 +181,8 @@
     renderLogs();
 
     $("app-version").textContent = `v${b.app.version}`;
-    $("phase-badge").textContent = b.app.phase;
     state.environment = b.settings.lastEnvironment || "aws1";
-    state.accessMode = ["online", "docker", "database"].includes(b.settings.accessMode) ? b.settings.accessMode : "online";
+    state.accessMode = b.settings.accessMode === "docker" || b.settings.accessMode === "database" ? "docker" : "online";
     if (state.accessMode === "online") {
       state.databases = rememberedOnlineClients();
       const lastOnline = b.settings.lastOnlineClient || b.settings.lastDatabase || "";
@@ -148,11 +190,22 @@
         state.database = normalizeDatabaseName(lastOnline);
         $("database-input").value = displayDatabaseName(lastOnline);
       }
-    } else if (state.environment === "aws2") {
-      state.database = normalizeDatabaseName("jormungandr");
-      $("database-input").value = "jormungandr";
+    } else {
+      state.database = "";
+      $("database-input").value = "";
     }
     $("smart-package").value = b.settings.smartPackageName || "";
+    state.hasSavedTefToken = !!b.smartTef?.hasSavedToken;
+    if (!state.tefSettingsInitialized) {
+      $("tef-device-name").value = b.settings.smartTefDeviceName || "SMART 1";
+      $("tef-cnpj").value = b.settings.smartTefCnpj || "";
+      $("tef-empresa-id").value = b.settings.smartTefEmpresaId || "";
+      $("save-tef-configuration").checked = b.settings.saveSmartTefConfiguration === true;
+      state.tefSettingsInitialized = true;
+    }
+    $("tef-token").placeholder = state.hasSavedTefToken
+      ? "Token salvo com proteção local"
+      : "Token do Smart TEF";
     if ($("update-channel")) $("update-channel").value = b.settings.updateChannel === "beta" ? "beta" : "stable";
     if ($("update-auto-check")) $("update-auto-check").checked = b.settings.autoCheckUpdates !== false;
     if ($("update-auto-install")) $("update-auto-install").checked = b.settings.autoInstallUpdates !== false;
@@ -174,11 +227,6 @@
         $("selfhost-status").textContent = "SelfHost não localizado.";
       }
     }
-
-    document.querySelectorAll("#environment-switch button").forEach(btn => {
-      btn.classList.toggle("active", btn.dataset.env === state.environment);
-    });
-
     const cap = b.capabilities;
     const dbOk = !!cap.databaseCredentials;
     $("db-credential-status").textContent = dbOk ? "Credenciais OK" : "Sem credenciais";
@@ -202,7 +250,7 @@
     const essentials = cap.adbAvailable && cap.scrcpyAvailable;
     $("global-status-dot").className = `status-dot ${essentials ? "ok" : "error"}`;
     $("global-status").textContent = essentials ? "Componentes locais OK" : "Verificar instalação";
-    $("global-substatus").textContent = state.accessMode === "online" ? "Modo Online" : (state.accessMode === "docker" ? "Banco via Docker isolado" : (dbOk ? "Banco via VPN local" : "Importe as credenciais"));
+    $("global-substatus").textContent = state.accessMode === "online" ? "Modo Online" : "Banco via Docker isolado";
     renderAccessMode();
     renderSavedOnlineClients();
   }
@@ -210,37 +258,27 @@
   function renderAccessMode() {
     const online = state.accessMode === "online";
     const docker = state.accessMode === "docker";
-    const database = state.accessMode === "database";
     document.querySelectorAll("#access-mode-switch button").forEach(btn => {
       btn.classList.toggle("active", btn.dataset.access === state.accessMode);
     });
-    $("database-access-options").classList.toggle("hidden", online);
-    $("load-databases").classList.toggle("hidden", online);
-    $("connect-vpn").classList.toggle("hidden", !database);
-    $("connect-docker").classList.toggle("hidden", !docker);
-    $("use-database").textContent = online ? "Conectar" : "Usar";
+    $("load-databases")?.classList.add("hidden");
+    $("connect-vpn")?.classList.add("hidden");
+    $("connect-docker")?.classList.add("hidden");
+    $("use-database").textContent = online ? "Conectar" : "Localizar";
     $("db-credential-status").textContent = online
       ? (state.onlineConnected ? "Online conectado" : "Online")
-      : docker
-        ? (state.bootstrap?.capabilities?.dockerAvailable ? "Docker disponível" : "Docker ausente")
-        : (state.bootstrap?.capabilities?.databaseCredentials ? "Credenciais OK" : "Sem credenciais");
-    $("db-credential-status").className = `mini-status ${online ? (state.onlineConnected ? "ok" : "") : (docker ? (state.bootstrap?.capabilities?.dockerAvailable ? "ok" : "warn") : (state.bootstrap?.capabilities?.databaseCredentials ? "ok" : "warn"))}`;
+      : (state.bootstrap?.capabilities?.dockerAvailable ? "Docker disponível" : "Docker ausente");
+    $("db-credential-status").className = `mini-status ${online ? (state.onlineConnected ? "ok" : "") : (state.bootstrap?.capabilities?.dockerAvailable ? "ok" : "warn")}`;
     $("client-helper").textContent = online
       ? "Informe o cliente. O acesso ocorre pela sessão WEB do Softcomshop."
-      : docker
-        ? "O banco é acessado por 127.0.0.1:13306; a VPN fica somente dentro do Docker."
-        : "Acesso direto ao banco usando a VPN instalada no Windows.";
+      : "Digite o cliente; o Provisioner procura automaticamente nos dois ambientes AWS pelo Docker.";
     $("access-mode-helper").textContent = online
-      ? "Sem VPN e sem banco: usa os endpoints do Softcomshop."
-      : docker
-        ? "Recomendado para banco direto: o Windows e o Android permanecem fora da VPN."
-        : "Modo legado: conecta o OpenVPN diretamente no Windows quando necessário.";
+      ? "Usa a sessão Web do Softcomshop."
+      : "Busca o cliente nas duas AWS automaticamente.";
     $("open-client-site").disabled = !state.database;
     $("global-substatus").textContent = online
       ? (state.onlineConnected ? "Softcomshop Online conectado" : "Modo Online")
-      : docker
-        ? (state.bootstrap?.capabilities?.dockerAvailable ? "Banco via Docker isolado" : "Docker Desktop não localizado")
-        : (state.bootstrap?.capabilities?.databaseCredentials ? "Banco via VPN local" : "Banco direto requer credenciais");
+      : (state.bootstrap?.capabilities?.dockerAvailable ? "Banco via Docker isolado" : "Docker Desktop não localizado");
     renderCompanyPreview();
     renderModuleMode();
     updateActions();
@@ -317,7 +355,29 @@
     renderOauthClients();
     renderOauthPreview();
     renderFiscalSeries();
+    setSetupCompact(false);
     updateActions();
+  }
+
+  function setSetupCompact(compact) {
+    const grid = $("setup-grid");
+    if (!grid) return;
+    grid.classList.toggle("compact", !!compact);
+    $("expand-setup")?.classList.toggle("hidden", !compact);
+    const companySummary = $("setup-company-summary");
+    companySummary?.classList.toggle("hidden", !compact);
+    if (companySummary) {
+      companySummary.textContent = compact && state.company
+        ? `Empresa: ${state.company.name}`
+        : "";
+    }
+    const headings = grid.querySelectorAll("h2");
+    if (headings[0]) headings[0].textContent = compact && state.database
+      ? `Softcomshop · ${displayDatabaseName(state.database)}`
+      : "Softcomshop";
+    if (headings[1]) headings[1].textContent = compact && state.company
+      ? state.company.name
+      : "Empresa do dispositivo";
   }
 
   function useTypedDatabase() {
@@ -329,7 +389,7 @@
     $("database-error").classList.add("hidden");
     if (database) {
       if (state.accessMode === "online") send("connectOnline", { database: state.database, accessMode: state.accessMode });
-      else loadCompanies();
+      else send("resolveDockerClient", { database: state.database, accessMode: "docker" });
     }
   }
 
@@ -513,8 +573,10 @@
     if (select) select.value = String(index);
     const input = $("oauth-input");
     if (input) input.value = state.oauthClient.name || "";
+    if (state.androidSerials[0]) state.androidTargets[state.androidSerials[0]] = state.oauthClient.clientId;
     hideOauthSuggestions();
     renderOauthPreview();
+    renderAndroid();
     loadFiscalSeries();
   }
 
@@ -593,11 +655,21 @@
     const modal = $("selfhost-create-modal");
     const input = $("selfhost-create-name");
     if (!modal || !input) return;
+    const modernSelfHost = state.bootstrap?.selfHost?.generation === "SelfHost 4.1+";
     input.value = "";
     $("selfhost-create-series").value = "";
     $("selfhost-create-number").value = "1";
     $("selfhost-create-nfe-series").value = "";
     $("selfhost-create-nfe-number").value = "1";
+    $("selfhost-create-nfe-block")?.classList.toggle("hidden", !modernSelfHost);
+    if ($("selfhost-create-primary-tag")) {
+      $("selfhost-create-primary-tag").textContent = modernSelfHost ? "preferencial" : "SelfHost 4.0";
+    }
+    if ($("selfhost-create-helper")) {
+      $("selfhost-create-helper").textContent = modernSelfHost
+        ? "A NFC-e é usada quando informada. Deixe-a vazia para usar a NF-e como fallback; somente a série escolhida é enviada ao SelfHost."
+        : "No SelfHost 4.0, o cadastro administrativo utiliza uma única série NFC-e e sua próxima numeração.";
+    }
     clearInlineError("selfhost-create-error");
     modal.classList.remove("hidden");
     setTimeout(() => input.focus(), 0);
@@ -609,16 +681,16 @@
 
   function createSelfHostDevice() {
     clearInlineError("selfhost-create-error");
+    const modernSelfHost = state.bootstrap?.selfHost?.generation === "SelfHost 4.1+";
     const name = $("selfhost-create-name")?.value.trim() || "";
     const seriesText = $("selfhost-create-series")?.value.trim() || "";
     const numberText = $("selfhost-create-number")?.value.trim() || "";
-    const nfeSeriesText = $("selfhost-create-nfe-series")?.value.trim() || "";
-    const nfeNumberText = $("selfhost-create-nfe-number")?.value.trim() || "";
+    const nfeSeriesText = modernSelfHost ? ($("selfhost-create-nfe-series")?.value.trim() || "") : "";
+    const nfeNumberText = modernSelfHost ? ($("selfhost-create-nfe-number")?.value.trim() || "") : "";
     const series = Number(seriesText);
     const initialNumber = Number(numberText);
     const nfeSeries = Number(nfeSeriesText);
     const nfeInitialNumber = Number(nfeNumberText);
-    const modernSelfHost = state.bootstrap?.selfHost?.generation === "SelfHost 4.1+";
 
     if (!state.database || !state.company || !name) {
       showInlineError("selfhost-create-error", "Selecione cliente e empresa e informe o nome do dispositivo.");
@@ -654,15 +726,6 @@
       showInlineError("selfhost-create-error", "Informe uma série NFC-e válida.");
       return;
     }
-    if (!modernSelfHost && nfeSeriesText && (!/^\d+$/.test(nfeSeriesText) || !Number.isInteger(nfeSeries) || nfeSeries < 0)) {
-      showInlineError("selfhost-create-error", "Informe uma série NF-e válida ou deixe a NF-e em branco.");
-      return;
-    }
-    if (!modernSelfHost && nfeSeriesText && (!/^\d+$/.test(nfeNumberText) || !Number.isInteger(nfeInitialNumber) || nfeInitialNumber < 1)) {
-      showInlineError("selfhost-create-error", "Informe uma numeração inicial NF-e válida.");
-      return;
-    }
-
     send("createOauthClient", {
       accessMode: state.accessMode,
       environment: state.environment,
@@ -803,72 +866,131 @@
 
   function renderAndroid() {
     const picker = $("android-picker");
-    const grid = $("android-grid");
     const online = state.androidDevices.filter(x => x.isOnline);
+    $("standard-device-config")?.classList.toggle("hidden", isTefMode() || state.multiDevice);
+    picker.classList.toggle("single", !state.multiDevice);
+    $("android-multi-actions")?.classList.toggle("hidden", !state.multiDevice);
+    if ($("prepare-smart")) $("prepare-smart").textContent = state.multiDevice ? "Provisionar selecionados" : "Provisionar";
 
     if (!online.length) {
       picker.innerHTML = `<div class="empty-state">Nenhum Android online no ADB.</div>`;
-      grid.innerHTML = `<div class="empty-state">Conecte um emulador ou aparelho e clique em Atualizar.</div>`;
       state.androidSerial = "";
+      state.androidSerials = [];
+      state.androidSelectionInitialized = false;
       updateActions();
       return;
     }
 
-    if (!online.some(x => x.serial === state.androidSerial)) {
-      state.androidSerial = online[0].serial;
+    const onlineSerials = new Set(online.map(x => x.serial));
+    state.androidSerials = state.androidSerials.filter(x => onlineSerials.has(x));
+    if (!state.multiDevice && state.androidSerials.length > 1) state.androidSerials = [state.androidSerials[0]];
+    if (!state.androidSelectionInitialized) {
+      state.androidSerials = [online[0].serial];
+      state.androidSelectionInitialized = true;
     }
+    state.androidSerial = state.androidSerials[0] || "";
 
+    assignProvisioningTargets();
     picker.innerHTML = online.map(d => `
-      <div class="android-option ${d.serial === state.androidSerial ? "selected" : ""}" data-serial="${escapeAttr(d.serial)}">
+      <div class="android-option ${state.androidSerials.includes(d.serial) ? "selected" : ""}" data-serial="${escapeAttr(d.serial)}">
         <div class="android-radio"></div>
         <div>
-          <strong>${escapeHtml(d.model || d.serial)}</strong>
-          <span>${escapeHtml(d.transport)} · Android ${escapeHtml(d.androidVersion || "?")} · Smart ${escapeHtml(d.smartVersion || "não detectado")} · ${escapeHtml(d.serial)}</span>
+          <strong>${escapeHtml(d.friendlyName || "Dispositivo não identificado")}</strong>
+          <span>${escapeHtml(d.serial)} · Modelo Android: ${escapeHtml(d.model || "?")} · Android ${escapeHtml(d.androidVersion || "?")} (SDK ${escapeHtml(d.androidSdk || "?")})</span>
+          <span>Smart ${escapeHtml(d.smartVersion || "não detectado")} · Package: ${escapeHtml(d.smartPackage || "não detectado")} · ${escapeHtml(d.resolution || "resolução não lida")}</span>
+          ${state.multiDevice && state.androidSerials.includes(d.serial) && !isTefMode() && state.oauthClients.length ? `<label class="android-target-label">Cadastro para este Android
+            <select class="android-target" data-target-serial="${escapeAttr(d.serial)}">
+              <option value="">Selecione...</option>
+              ${state.oauthClients.map(x => `<option value="${escapeAttr(x.clientId)}" ${state.androidTargets[d.serial] === x.clientId ? "selected" : ""}>${escapeHtml(x.name)}</option>`).join("")}
+            </select></label>` : ""}
         </div>
         <div class="device-meta">
-          <b>ONLINE</b>
+          <b>${d.isAmbiguousIdentity ? "VALIDAR" : "CONECTADO"}</b>
           <span>${d.confirmedSmartDeviceId
             ? `Smart ID ${escapeHtml(d.confirmedSmartDeviceId)}`
-            : `ADB ID ${escapeHtml(d.androidId || "não lido")} (não autoritativo)`}</span>
+            : escapeHtml(d.identificationStatus || "Não identificado")}</span>
         </div>
       </div>
     `).join("");
 
     picker.querySelectorAll(".android-option").forEach(el => {
       el.addEventListener("click", () => {
-        state.androidSerial = el.dataset.serial;
+        const serial = el.dataset.serial;
+        state.androidSerials = state.multiDevice
+          ? (state.androidSerials.includes(serial)
+              ? state.androidSerials.filter(x => x !== serial)
+              : [...state.androidSerials, serial])
+          : [serial];
+        state.androidSerial = state.androidSerials[0] || "";
         renderAndroid();
         evaluate();
       });
     });
-
-    grid.innerHTML = online.map(d => `
-      <article class="device-card">
-        <div class="device-card-top">
-          <div><h3>${escapeHtml(d.model || d.serial)}</h3><p>${escapeHtml(d.serial)}</p></div>
-          <span class="device-chip">● ONLINE</span>
-        </div>
-        <div class="device-details">
-          <div><span>Conexão</span><strong>${escapeHtml(d.transport)}</strong></div>
-          <div><span>Android</span><strong>${escapeHtml(d.androidVersion || "?")}</strong></div>
-          <div><span>Smart</span><strong>${escapeHtml(d.smartVersion || "Não detectado")}</strong></div>
-          <div><span>Fluxo</span><strong>${escapeHtml(d.smartFlow || "—")}</strong></div>
-          <div><span>Bateria</span><strong>${d.battery ?? "—"}${d.battery != null ? "%" : ""}</strong></div>
-        </div>
-        <div class="device-details">
-          <div style="grid-column:1/-1"><span>${d.confirmedSmartDeviceId ? "Device ID real do Smart" : "Android ID do shell ADB"}</span><strong>${escapeHtml(d.confirmedSmartDeviceId || d.androidId || "Não identificado")}${d.confirmedSmartDeviceId ? "" : " (não autoritativo em Android 8+)"}</strong></div>
-        </div>
-        <div class="device-card-actions">
-          <button class="secondary compact device-scrcpy" data-serial="${escapeAttr(d.serial)}">Abrir scrcpy</button>
-        </div>
-      </article>
-    `).join("");
-
-    grid.querySelectorAll(".device-scrcpy").forEach(btn => {
-      btn.addEventListener("click", () => send("openScrcpy", { serial: btn.dataset.serial }));
+    picker.querySelectorAll(".android-target").forEach(select => {
+      select.addEventListener("click", e => e.stopPropagation());
+      select.addEventListener("change", e => {
+        e.stopPropagation();
+        state.androidTargets[select.dataset.targetSerial] = select.value;
+        updateActions();
+      });
     });
 
+    if ($("android-selected-count")) {
+      const count = state.androidSerials.length;
+      $("android-selected-count").textContent = `Selecionados: ${count} dispositivo${count === 1 ? "" : "s"}`;
+    }
+
     updateActions();
+  }
+
+  function assignProvisioningTargets() {
+    const validIds = new Set(state.oauthClients.map(x => x.clientId));
+    Object.keys(state.androidTargets).forEach(serial => {
+      if (!validIds.has(state.androidTargets[serial])) delete state.androidTargets[serial];
+    });
+    if (!state.multiDevice) {
+      const serial = state.androidSerials[0];
+      if (serial && state.oauthClient) state.androidTargets[serial] = state.oauthClient.clientId;
+      return;
+    }
+    // No modo multidispositivo nunca herda nem escolhe automaticamente o cadastro
+    // global. Cada relacao ADB -> cadastro deve ser informada explicitamente na lista.
+  }
+
+  function provisioningTargetsPayload() {
+    return Object.fromEntries(state.androidSerials.map(serial => {
+      const clientId = state.androidTargets[serial];
+      return [serial, state.oauthClients.find(x => x.clientId === clientId) || null];
+    }));
+  }
+
+  function provisioningTargetsValid() {
+    if (isTefMode()) return true;
+    if (!state.multiDevice) return state.androidSerials.length === 1 && !!state.oauthClient;
+    assignProvisioningTargets();
+    if (state.androidSerials.length < 2) return false;
+    const targets = state.androidSerials.map(x => state.androidTargets[x]).filter(Boolean);
+    return targets.length === state.androidSerials.length && new Set(targets).size === targets.length;
+  }
+
+  function renderProvisioningJobs() {
+    const host = $("provisioning-jobs");
+    const list = $("provisioning-job-list");
+    if (!host || !list) return;
+    const jobs = Object.values(state.provisioningJobs);
+    host.classList.toggle("hidden", !jobs.length);
+    const statusNames = ["Aguardando", "Em execução", "Concluído", "Falhou", "Cancelado"];
+    const classNames = ["pending", "running", "success", "failed", "canceled"];
+    list.innerHTML = jobs.map(job => {
+      const logs = (job.logs || []).slice(-5).map(x => `${x.stage}: ${x.message}`).join("\n");
+      return `<div class="provisioning-job ${classNames[job.status] || "pending"}">
+        <div><strong>${escapeHtml(job.friendlyName || job.serial)}</strong><span>${escapeHtml(job.serial)} · ${escapeHtml(job.smartPackageName || "package não detectado")}${job.targetDeviceName ? ` · ${escapeHtml(job.targetDeviceName)}` : ""}</span></div>
+        <div><strong>${statusNames[job.status] || job.status}</strong><button type="button" class="ghost compact cancel-job" data-serial="${escapeAttr(job.serial)}" ${job.status !== 0 && job.status !== 1 ? "disabled" : ""}>Cancelar</button></div>
+        <small>Etapa: ${escapeHtml(job.stage || "Aguardando")} · ${Math.round((job.elapsedMilliseconds || 0) / 1000)}s${job.error ? ` · ${escapeHtml(job.error)}` : ""}</small>
+        <div class="job-log">${escapeHtml(logs)}</div>
+      </div>`;
+    }).join("");
+    list.querySelectorAll(".cancel-job").forEach(button => button.addEventListener("click", () => send("cancelProvisioningJob", { serial: button.dataset.serial })));
   }
 
   function renderValidation(payload) {
@@ -919,24 +1041,27 @@
   }
 
   function getTefPayload() {
+    const token = $("tef-token").value.trim();
     return {
       tefDeviceName: $("tef-device-name").value.trim(),
       tefCnpj: $("tef-cnpj").value.trim(),
       tefEmpresaId: $("tef-empresa-id").value.trim(),
-      tefToken: $("tef-token").value.trim()
+      tefToken: token,
+      useSavedTefToken: !token && state.hasSavedTefToken,
+      saveTefConfiguration: $("save-tef-configuration").checked
     };
   }
 
   function tefFieldsValid() {
     const x = getTefPayload();
-    return !!(x.tefDeviceName && x.tefCnpj && x.tefEmpresaId && x.tefToken);
+    return !!(x.tefDeviceName && x.tefCnpj && x.tefEmpresaId && (x.tefToken || x.useSavedTefToken));
   }
 
   function renderModuleMode() {
     const tef = isTefMode();
     const selfHostRequired = moduleRequiresSelfHost();
     const selfHost = isSelfHostMode();
-    $("standard-device-config").classList.toggle("hidden", tef);
+    $("standard-device-config").classList.toggle("hidden", tef || state.multiDevice);
     $("link-source-config")?.classList.toggle("hidden", tef);
     const selfHostCheck = $("use-selfhost-check");
     if (selfHostCheck) {
@@ -963,10 +1088,13 @@
       const base = getSelfHostBaseUrl();
       const sh = state.bootstrap?.selfHost || {};
       const version = sh.installed ? `SelfHost ${sh.version || "?"} · ${sh.generation || ""}` : "SelfHost não localizado";
-      $("selfhost-status").textContent = base ? `${version} · ${base}` : `${version} · IP local automático`;
+      const legacy = sh.generation === "SelfHost 4.0";
+      const mapping = legacy
+        ? "Config2.json · um dispositivo filho diferente por Android"
+        : "um dispositivo filho diferente por Android";
+      $("selfhost-status").textContent = base ? `${version} · ${mapping} · ${base}` : `${version} · ${mapping} · IP local automático`;
     }
     $("tef-config").classList.toggle("hidden", !tef);
-    $("generate-url").classList.toggle("hidden", tef);
     $("validate-link").classList.toggle("hidden", tef);
     if (tef) {
       $("url-box").classList.add("hidden");
@@ -992,21 +1120,23 @@
 
   function updateActions() {
     const androidOk = !!state.androidSerial;
+    const selectedAndroid = state.androidDevices.find(x => x.serial === state.androidSerial);
     const oauthOk = !!state.oauthClient;
     const companyOk = !!state.company;
     const dbOk = !!state.database;
     const tef = isTefMode();
+    const multiSelectionOk = !state.multiDevice || state.androidSerials.length >= 2;
+    const targetSelectionOk = state.multiDevice ? provisioningTargetsValid() : oauthOk;
 
     $("open-scrcpy").disabled = !androidOk;
-    // O botao avulso Limpar Smart usa o package padrao salvo. No Smart TEF a limpeza
-    // deve ser feita pela opcao da preparacao, que seleciona o package RedeFlex correto.
-    $("clear-smart").disabled = tef || !androidOk || !state.bootstrap?.settings?.smartPackageName;
+    // O botao avulso Limpar Smart usa o package detectado. No Smart TEF a limpeza
+    // deve ser feita pela preparacao, que resolve a variante correta por dispositivo.
+    $("clear-smart").disabled = tef || !androidOk || !selectedAndroid?.smartPackage;
     const existingMode = state.deviceMode === "existing";
-    $("generate-url").disabled = tef || !existingMode || !(oauthOk && companyOk && dbOk);
     $("validate-link").disabled = tef || !existingMode || !(oauthOk && androidOk && companyOk && dbOk);
     $("prepare-smart").disabled = tef
-      ? !(androidOk && tefFieldsValid())
-      : !existingMode || !(oauthOk && androidOk && companyOk && dbOk);
+      ? !(androidOk && multiSelectionOk && tefFieldsValid())
+      : !existingMode || !(targetSelectionOk && androidOk && multiSelectionOk && companyOk && dbOk);
     $("open-client-site").disabled = !dbOk;
     if ($("create-device")) {
       $("create-device").disabled = !(companyOk && dbOk && $("new-device-name").value.trim());
@@ -1046,7 +1176,7 @@
     document.querySelectorAll("#access-mode-switch button").forEach(btn => {
       btn.addEventListener("click", () => {
         const requested = btn.dataset.access;
-        const next = ["online", "docker", "database"].includes(requested) ? requested : "online";
+        const next = ["online", "docker"].includes(requested) ? requested : "online";
         if (next === state.accessMode) return;
         state.accessMode = next;
         state.onlineConnected = false;
@@ -1057,29 +1187,11 @@
           state.database = last ? normalizeDatabaseName(last) : "";
           $("database-input").value = last ? displayDatabaseName(last) : "";
         } else {
-          state.database = state.environment === "aws2" ? normalizeDatabaseName("jormungandr") : "";
-          $("database-input").value = state.environment === "aws2" ? "jormungandr" : "";
+          state.environment = "aws1";
+          state.database = "";
+          $("database-input").value = "";
         }
         renderAccessMode();
-      });
-    });
-
-    document.querySelectorAll("#environment-switch button").forEach(btn => {
-      btn.addEventListener("click", () => {
-        state.environment = btn.dataset.env;
-        document.querySelectorAll("#environment-switch button").forEach(x => x.classList.toggle("active", x === btn));
-        state.database = state.environment === "aws2" ? normalizeDatabaseName("jormungandr") : "";
-        state.company = null;
-        state.oauthClient = null;
-        state.databases = [];
-        state.companies = [];
-        state.oauthClients = [];
-        $("database-input").value = state.environment === "aws2" ? "jormungandr" : "";
-        renderDatabases();
-        renderCompanies();
-        renderCompanyPreview();
-        renderOauthClients();
-        renderOauthPreview();
       });
     });
 
@@ -1146,7 +1258,26 @@
       renderOauthClients();
       renderOauthPreview();
       renderFiscalSeries();
-      if (state.company) loadOauth();
+      if (state.company) {
+        setSetupCompact(true);
+        loadOauth();
+      }
+    });
+
+    $("expand-setup")?.addEventListener("click", () => setSetupCompact(false));
+
+    $("multi-device-check")?.addEventListener("change", e => {
+      state.multiDevice = !!e.target.checked;
+      state.androidTargets = {};
+      if (!state.multiDevice && state.androidSerials.length > 1) {
+        state.androidSerials = [state.androidSerials[0]];
+      }
+      if (!state.multiDevice && state.oauthClient && state.androidSerials[0]) {
+        state.androidTargets[state.androidSerials[0]] = state.oauthClient.clientId;
+      }
+      renderModuleMode();
+      renderAndroid();
+      evaluate();
     });
 
     $("oauth-input")?.addEventListener("focus", () => renderOauthSuggestions(true));
@@ -1199,7 +1330,9 @@
       state.fiscalSeries = [];
       clearInlineError("series-error");
       if ($("oauth-input")) $("oauth-input").value = state.oauthClient?.name || "";
+      if (state.oauthClient && state.androidSerials[0]) state.androidTargets[state.androidSerials[0]] = state.oauthClient.clientId;
       renderOauthPreview();
+      renderAndroid();
       loadFiscalSeries();
     });
 
@@ -1244,6 +1377,19 @@
     $("selfhost-create-modal")?.addEventListener("mousedown", e => {
       if (e.target === $("selfhost-create-modal")) closeSelfHostCreateModal();
     });
+    $("provision-confirm-close")?.addEventListener("click", closeProvisionConfirmation);
+    $("provision-confirm-cancel")?.addEventListener("click", closeProvisionConfirmation);
+    $("provision-confirm-submit")?.addEventListener("click", acceptProvisionConfirmation);
+    $("provision-confirm-modal")?.addEventListener("mousedown", e => {
+      if (e.target === $("provision-confirm-modal")) closeProvisionConfirmation();
+    });
+    $("provision-confirm-modal")?.addEventListener("keydown", e => {
+      if (e.key === "Escape") closeProvisionConfirmation();
+      if (e.key === "Enter" && e.target?.id !== "provision-confirm-cancel") {
+        e.preventDefault();
+        acceptProvisionConfirmation();
+      }
+    });
 
     $("toggle-series").addEventListener("click", () => {
       state.seriesExpanded = !state.seriesExpanded;
@@ -1284,6 +1430,7 @@
       if (remainsSelfHost) {
         renderModuleMode();
         renderOauthClients();
+        renderAndroid();
         renderOauthPreview();
         renderFiscalSeries();
         return;
@@ -1318,9 +1465,27 @@
         }
       });
     });
+    $("save-tef-settings")?.addEventListener("click", () => {
+      const tef = getTefPayload();
+      if (!tef.tefDeviceName || !tef.tefCnpj || !tef.tefEmpresaId || (!tef.tefToken && !tef.useSavedTefToken)) {
+        toast("Preencha Nome do dispositivo, CNPJ, Empresa ID e Token antes de salvar.", "error");
+        return;
+      }
+      send("saveSmartTefSettings", tef);
+    });
 
     $("refresh-android").addEventListener("click", () => send("refreshAndroid"));
-    $("refresh-android-page").addEventListener("click", () => send("refreshAndroid"));
+    $("select-all-android")?.addEventListener("click", () => {
+      state.androidSerials = state.androidDevices.filter(x => x.isOnline).map(x => x.serial);
+      state.androidSerial = state.androidSerials[0] || "";
+      renderAndroid();
+    });
+    $("clear-android-selection")?.addEventListener("click", () => {
+      state.androidSerials = [];
+      state.androidSerial = "";
+      renderAndroid();
+    });
+    $("cancel-all-provisioning")?.addEventListener("click", () => send("cancelAllProvisioning"));
     $("open-scrcpy").addEventListener("click", () => send("openScrcpy", { serial: state.androidSerial }));
     $("clear-smart").addEventListener("click", () => {
       if (confirm("Limpar os dados locais do Smart neste Android?")) {
@@ -1331,18 +1496,6 @@
     $("connect-vpn").addEventListener("click", () => send("connectVpn", { environment: state.environment }));
     $("connect-docker").addEventListener("click", () => send("connectDocker", { environment: state.environment }));
     $("open-client-site").addEventListener("click", () => send("openClientSite", { database: state.database }));
-
-    $("generate-url").addEventListener("click", () => {
-      send("generateUrl", {
-        accessMode: state.accessMode,
-        database: state.database,
-        company: state.company,
-        oauthClient: state.oauthClient,
-        module: state.module,
-        useSelfHost: isSelfHostMode(),
-        selfHostBaseUrl: getSelfHostBaseUrl()
-      });
-    });
 
     $("validate-link").addEventListener("click", () => {
       if (!state.database || !state.company || !state.oauthClient || !state.androidSerial) {
@@ -1371,30 +1524,46 @@
       const clearData = $("clear-before-link").checked;
 
       if (isTefMode()) {
-        if (!state.androidSerial || !tefFieldsValid()) {
-          toast("Selecione um Android e confira os dados do Smart TEF.", "error");
+        if (!state.androidSerial || (state.multiDevice && state.androidSerials.length < 2) || !tefFieldsValid()) {
+          toast(state.multiDevice
+            ? "Selecione ao menos dois Androids e confira os dados do Smart TEF."
+            : "Selecione um Android e confira os dados do Smart TEF.", "error");
           return;
         }
 
         const tef = getTefPayload();
-        const warning = `Smart TEF será configurado no Android selecionado com o nome ${tef.tefDeviceName}. A VPN será desligada antes da configuração${clearData ? " e os dados locais do Smart TEF serão limpos" : "; o aplicativo será fechado e aberto novamente sem limpar os dados"}. Deseja continuar?`;
-        if (!confirm(warning)) return;
-
-        renderValidation({ status: "ready", title: "Configurando Smart TEF", detail: "Percorrendo o fluxo inicial do RedeFlex e preenchendo os dados manuais." });
-        setBusy("provision", true);
-        send("prepareSmart", {
-          accessMode: state.accessMode,
-          environment: state.environment,
-          serial: state.androidSerial,
-          module: state.module,
+        openProvisionConfirmation({
+          title: "Configurar Smart TEF",
+          description: `O Smart TEF será configurado como ${tef.tefDeviceName}. A VPN será desligada antes do preenchimento das chaves.`,
+          moduleLabel: "Smart TEF",
+          accessLabel: "Configuração direta no Android",
           clearData,
-          ...tef
+          onConfirm: () => {
+            renderValidation({ status: "ready", title: "Configurando Smart TEF", detail: "Percorrendo o fluxo inicial do package detectado e preenchendo os dados manuais." });
+            setBusy("provision", true);
+            send("prepareSmart", {
+              accessMode: state.accessMode,
+              environment: state.environment,
+              serials: state.androidSerials,
+              module: state.module,
+              clearData,
+              ...tef
+            });
+          }
         });
         return;
       }
 
-      if (!state.database || !state.company || !state.oauthClient || !state.androidSerial) {
+      if (!state.database || !state.company || (!state.multiDevice && !state.oauthClient) || !state.androidSerials.length) {
         toast(`Selecione cliente, empresa, dispositivo ${isSelfHostMode() ? "SelfHost" : "Softcomshop"} e Android.`, "error");
+        return;
+      }
+      if (state.multiDevice && state.androidSerials.length < 2) {
+        toast("No modo multidispositivo, selecione ao menos dois Androids.", "error");
+        return;
+      }
+      if (!provisioningTargetsValid()) {
+        toast("Selecione um cadastro diferente para cada Android escolhido.", "error");
         return;
       }
 
@@ -1405,25 +1574,32 @@
           ? "usando a sessão WEB do Softcomshop"
           : state.accessMode === "docker"
             ? "usando o banco pelo Docker isolado, sem VPN no Windows"
-            : "usando o acesso direto ao banco e VPN local quando necessário";
-      const warning = clearData
-        ? `Modulo selecionado: ${moduleLabel}. O Provisioner verificará e removerá vínculos anteriores ${modeInfo} e limpará os dados locais do Smart antes do novo vínculo. Deseja continuar?`
-        : `Modulo selecionado: ${moduleLabel}. O Provisioner verificará e removerá vínculos anteriores ${modeInfo}, fechará e abrirá novamente o Smart sem limpar os dados e então continuará o vínculo. Deseja continuar?`;
-      if (!confirm(warning)) return;
-
-      renderValidation({ status: "ready", title: "Iniciando preparacao", detail: "Validando o cenario e abrindo o Smart no Android selecionado." });
-      setBusy("provision", true);
-      send("prepareSmart", {
-        accessMode: state.accessMode,
-        environment: state.environment,
-        database: state.database,
-        company: state.company,
-        oauthClient: state.oauthClient,
-        serial: state.androidSerial,
-        module: state.module,
-        useSelfHost: isSelfHostMode(),
-        selfHostBaseUrl: getSelfHostBaseUrl(),
-        clearData
+            : "usando o banco pelo Docker isolado";
+      openProvisionConfirmation({
+        title: state.multiDevice ? "Confirmar provisionamento em lote" : "Confirmar provisionamento",
+        description: clearData
+          ? `O Provisioner verificará e removerá vínculos anteriores ${modeInfo} antes de criar o novo vínculo.`
+          : `O Provisioner verificará e removerá vínculos anteriores ${modeInfo}. O Smart será reiniciado sem apagar sua configuração local.`,
+        moduleLabel,
+        accessLabel: isSelfHostMode() ? "SelfHost" : state.accessMode === "online" ? "Softcomshop Web" : "Docker local",
+        clearData,
+        onConfirm: () => {
+          renderValidation({ status: "ready", title: "Iniciando preparação", detail: "Validando o cenário e abrindo o Smart nos Androids selecionados." });
+          setBusy("provision", true);
+          send("prepareSmart", {
+            accessMode: state.accessMode,
+            environment: state.environment,
+            database: state.database,
+            company: state.company,
+            oauthClient: state.oauthClient,
+            oauthClientsBySerial: provisioningTargetsPayload(),
+            serials: state.androidSerials,
+            module: state.module,
+            useSelfHost: isSelfHostMode(),
+            selfHostBaseUrl: getSelfHostBaseUrl(),
+            clearData
+          });
+        }
       });
     });
 
@@ -1554,8 +1730,18 @@
           $("company-select").value = String(state.companies[0].id);
           state.company = state.companies[0];
           renderCompanyPreview();
+          setSetupCompact(true);
           loadOauth();
+        } else {
+          setSetupCompact(false);
         }
+        break;
+      case "databaseResolved":
+        state.environment = payload.environment || "aws1";
+        state.database = normalizeDatabaseName(payload.database || state.database);
+        $("database-input").value = displayDatabaseName(state.database);
+        toast(`${displayDatabaseName(state.database)} localizado em ${String(state.environment).toUpperCase()}.`, "success");
+        loadCompanies();
         break;
       case "oauthClients": {
         const currentClientId = state.oauthClient?.clientId || "";
@@ -1565,6 +1751,7 @@
           state.oauthClient = idx >= 0 ? state.oauthClients[idx] : null;
         }
         renderOauthClients();
+        renderAndroid();
         if (state.oauthClient) {
           // A lista atualizada ao final do provisionamento deve refletir o novo
           // device_id sem iniciar outra avaliacao que sobrescreva o resultado final.
@@ -1582,6 +1769,7 @@
         const nameIdx = idx >= 0 ? idx : state.oauthClients.findIndex(x => String(x.name || "").toLowerCase() === createdName);
         state.oauthClient = nameIdx >= 0 ? state.oauthClients[nameIdx] : null;
         renderOauthClients();
+        renderAndroid();
         state.deviceMode = "existing";
         const existingRadio = document.querySelector('input[name="device-mode"][value="existing"]');
         if (existingRadio) existingRadio.checked = true;
@@ -1651,12 +1839,20 @@
       case "provisionProgress":
         renderValidation({
           status: "ready",
-          title: "Preparando Smart",
+          title: payload.friendlyName ? `Preparando ${payload.friendlyName}` : "Preparando Smart",
           detail: payload.message || "Executando etapa do provisionamento..."
         });
         break;
+      case "smartTefSettingsSaved":
+        state.hasSavedTefToken = !!payload.hasSavedToken;
+        $("tef-token").value = "";
+        $("tef-token").placeholder = state.hasSavedTefToken
+          ? "Token salvo com proteção local"
+          : "Token do Smart TEF";
+        $("save-tef-configuration").checked = true;
+        updateActions();
+        break;
       case "smartPreparationFinished": {
-        setBusy("provision", false);
         const tef = payload.module === "smart_tef";
         renderValidation({
           status: payload.success ? "success" : "danger",
@@ -1683,6 +1879,26 @@
         }
         break;
       }
+      case "provisioningStarted":
+        state.provisioningJobs = {};
+        renderProvisioningJobs();
+        renderValidation({ status: "ready", title: `Provisionando ${payload.count} dispositivo(s)`, detail: `Até ${payload.maxParallelism} jobs simultâneos, isolados por UDID.` });
+        break;
+      case "provisionJob":
+        state.provisioningJobs[payload.serial] = payload;
+        renderProvisioningJobs();
+        break;
+      case "provisioningFinished":
+        setBusy("provision", false);
+        if ($("provisioning-summary")) {
+          $("provisioning-summary").textContent = `Provisionamento concluído · Sucesso: ${payload.success} · Falha: ${payload.failed} · Cancelado: ${payload.canceled}`;
+        }
+        renderValidation({
+          status: payload.failed ? "warning" : "success",
+          title: "Provisionamento concluído",
+          detail: `Sucesso: ${payload.success} · Falha: ${payload.failed} · Cancelado: ${payload.canceled}`
+        });
+        break;
       case "vpnConnected":
         toast(payload.message, "success");
         send("loadDatabases", { environment: state.environment, accessMode: state.accessMode });

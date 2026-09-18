@@ -153,12 +153,11 @@ public sealed class SelfHostDeviceService : IDisposable
         initialNumber = (initialNumber ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("Informe o nome do dispositivo SelfHost.", nameof(name));
-        if (DetectInstallation().Generation == "SelfHost 4.1+")
-        {
-            name = NormalizeDeviceName(name);
-            if (name.Equals("SELFHOST_", StringComparison.OrdinalIgnoreCase))
-                throw new ArgumentException("Informe o nome do dispositivo após o prefixo SELFHOST_.", nameof(name));
-        }
+        // O Gerenciador oficial 4.0 e 4.1+ cadastra filhos como SELFHOST_<nome>
+        // e usa o mesmo prefixo para decidir quais dispositivos exibir.
+        name = NormalizeDeviceName(name);
+        if (name.Equals("SELFHOST_", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Informe o nome do dispositivo após o prefixo SELFHOST_.", nameof(name));
         if (!int.TryParse(serie, out var serieValue) || serieValue < 0)
             throw new ArgumentException("Informe uma série NFC-e ou NF-e válida.", nameof(serie));
         if (!int.TryParse(initialNumber, out var numberValue) || numberValue < 1)
@@ -230,7 +229,7 @@ public sealed class SelfHostDeviceService : IDisposable
         }
     }
 
-    internal static string NormalizeDeviceName(string? name)
+    public static string NormalizeDeviceName(string? name)
     {
         var value = (name ?? string.Empty).Trim();
         while (value.StartsWith("SELFHOST_", StringComparison.OrdinalIgnoreCase))
@@ -238,9 +237,21 @@ public sealed class SelfHostDeviceService : IDisposable
         return "SELFHOST_" + value;
     }
 
-    public async Task<IReadOnlyList<OAuthClientInfo>> ListDevicesAsync(CancellationToken ct = default)
+    public Task<IReadOnlyList<OAuthClientInfo>> ListDevicesAsync(CancellationToken ct = default) =>
+        ListDevicesCoreAsync(onlySelfHostChildren: true, ct);
+
+    /// <summary>
+    /// Lista todos os dispositivos que a credencial raiz consegue administrar.
+    /// A interface continua exibindo somente SELFHOST_, mas a procura de um
+    /// device_id antigo nao pode ignorar dispositivos comuns da mesma empresa.
+    /// </summary>
+    public Task<IReadOnlyList<OAuthClientInfo>> ListAllDevicesAsync(CancellationToken ct = default) =>
+        ListDevicesCoreAsync(onlySelfHostChildren: false, ct);
+
+    private async Task<IReadOnlyList<OAuthClientInfo>> ListDevicesCoreAsync(
+        bool onlySelfHostChildren,
+        CancellationToken ct)
     {
-        var modernSelfHost = DetectInstallation().Generation == "SelfHost 4.1+";
         var cfg = LoadInstalledConfig();
         var token = await GetTokenAsync(cfg, ct);
         var all = new Dictionary<string, OAuthClientInfo>(StringComparer.Ordinal);
@@ -259,7 +270,8 @@ public sealed class SelfHostDeviceService : IDisposable
             using var doc = JsonDocument.Parse(body);
             var rawItems = ExtractRawDeviceObjects(doc.RootElement).ToArray();
             var items = ExtractDeviceObjects(rawItems)
-                .Where(x => !modernSelfHost || x.Name.StartsWith("SELFHOST_", StringComparison.OrdinalIgnoreCase))
+                .Where(x => !onlySelfHostChildren ||
+                            x.Name.StartsWith("SELFHOST_", StringComparison.OrdinalIgnoreCase))
                 .ToArray();
             foreach (var x in items)
             {
@@ -273,7 +285,9 @@ public sealed class SelfHostDeviceService : IDisposable
                 throw new InvalidOperationException("A paginação de dispositivos do SelfHost excedeu o limite de segurança.");
         }
 
-        _log?.Invoke($"{all.Count} dispositivo(s) SelfHost localizado(s) pela API do Softcomshop.");
+        _log?.Invoke(onlySelfHostChildren
+            ? $"{all.Count} dispositivo(s) SelfHost localizado(s) pela API do Softcomshop."
+            : $"{all.Count} dispositivo(s) total localizado(s) para procurar vinculos anteriores.");
         return all.Values.OrderBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
     }
 
