@@ -46,6 +46,26 @@ public sealed class ProvisioningPayloadTests
         Assert.False(result.TryGetProperty("oauthClient", out _));
     }
 
+    [Theory]
+    [InlineData("smart_autopagamento")]
+    [InlineData("smart_totem")]
+    public void PerDevicePayloadPreservesRequestedSelfServiceModule(string module)
+    {
+        using var source = JsonDocument.Parse($$"""
+        {
+          "module": "{{module}}",
+          "oauthClientsBySerial": {
+            "KM54257740097": { "clientId": "CLIENT-K2", "name": "SELFHOST_K2" }
+          }
+        }
+        """);
+
+        var result = WithSerial(source.RootElement, "KM54257740097", true);
+
+        Assert.Equal(module, result.GetProperty("module").GetString());
+        Assert.Equal("CLIENT-K2", result.GetProperty("oauthClient").GetProperty("clientId").GetString());
+    }
+
     private static JsonElement WithSerial(JsonElement payload, string serial, bool requireMappedClient)
     {
         var method = typeof(MainForm).GetMethod(

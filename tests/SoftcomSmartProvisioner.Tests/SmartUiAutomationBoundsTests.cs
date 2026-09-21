@@ -92,6 +92,156 @@ public sealed class SmartUiAutomationBoundsTests
         Assert.Equal(1037, Read<int>(layout, "CompanyY"));
         Assert.Equal(1201, Read<int>(layout, "TokenY"));
         Assert.Equal(1432, Read<int>(layout, "ConfirmY"));
+        Assert.Equal(1066, Read<int>(layout, "ConcludeY"));
+    }
+
+    [Fact]
+    public void ComposeRootContainingAllLabelsDoesNotRedirectCnpjToToken()
+    {
+        var nodeType = typeof(SmartUiAutomationService).GetNestedType(
+            "UiNode",
+            BindingFlags.NonPublic)
+            ?? throw new MissingMemberException(typeof(SmartUiAutomationService).FullName, "UiNode");
+
+        object Node(
+            string text,
+            string className,
+            string searchText,
+            int top,
+            int bottom) => Activator.CreateInstance(
+                nodeType,
+                text,
+                string.Empty,
+                string.Empty,
+                className,
+                "softcom.mobile.smart2",
+                searchText,
+                false,
+                true,
+                64,
+                top,
+                656,
+                bottom)
+            ?? throw new InvalidOperationException("Nao foi possivel criar o no de teste.");
+
+        var values = new[]
+        {
+            Node(string.Empty, "android.widget.FrameLayout", "CNPJ Empresa ID Token", 0, 1504),
+            Node("CNPJ", "android.widget.TextView", "CNPJ", 780, 828),
+            Node(string.Empty, "android.widget.EditText", string.Empty, 825, 921),
+            Node("Empresa ID", "android.widget.TextView", "Empresa ID", 944, 992),
+            Node(string.Empty, "android.widget.EditText", string.Empty, 989, 1085),
+            Node("Token", "android.widget.TextView", "Token", 1108, 1156),
+            Node(string.Empty, "android.widget.EditText", string.Empty, 1153, 1249)
+        };
+        var typedNodes = Array.CreateInstance(nodeType, values.Length);
+        for (var index = 0; index < values.Length; index++)
+        {
+            typedNodes.SetValue(values[index], index);
+        }
+
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "FindEditableBelowLabels",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(
+                typeof(SmartUiAutomationService).FullName,
+                "FindEditableBelowLabels");
+
+        var cnpj = method.Invoke(null, new object[] { typedNodes, new[] { "cnpj" } })
+            ?? throw new InvalidOperationException("O campo CNPJ nao foi localizado.");
+        var company = method.Invoke(null, new object[] { typedNodes, new[] { "empresa id" } })
+            ?? throw new InvalidOperationException("O campo Empresa ID nao foi localizado.");
+        var token = method.Invoke(null, new object[] { typedNodes, new[] { "token" } })
+            ?? throw new InvalidOperationException("O campo Token nao foi localizado.");
+
+        Assert.Equal(873, Read<int>(cnpj, "CenterY"));
+        Assert.Equal(1037, Read<int>(company, "CenterY"));
+        Assert.Equal(1201, Read<int>(token, "CenterY"));
+    }
+
+    [Fact]
+    public void StoneSuccessDialogLocatesClickableConcludeButton()
+    {
+        var nodeType = typeof(SmartUiAutomationService).GetNestedType(
+            "UiNode",
+            BindingFlags.NonPublic)
+            ?? throw new MissingMemberException(typeof(SmartUiAutomationService).FullName, "UiNode");
+
+        object Node(
+            string text,
+            string className,
+            string searchText,
+            bool clickable,
+            int left,
+            int top,
+            int right,
+            int bottom) => Activator.CreateInstance(
+                nodeType,
+                text,
+                string.Empty,
+                string.Empty,
+                className,
+                "softcom.mobile.smart2",
+                searchText,
+                clickable,
+                true,
+                left,
+                top,
+                right,
+                bottom)
+            ?? throw new InvalidOperationException("Nao foi possivel criar o no de teste.");
+
+        var values = new[]
+        {
+            Node(string.Empty, "android.view.View", "Chaves verificadas com sucesso! Concluir", false, 40, 390, 680, 1162),
+            Node("Chaves verificadas com sucesso!", "android.widget.TextView", "Chaves verificadas com sucesso!", false, 88, 726, 632, 808),
+            Node(string.Empty, "android.view.View", "Concluir", true, 88, 1018, 632, 1114),
+            Node("Concluir", "android.widget.TextView", "Concluir", false, 306, 1046, 414, 1086)
+        };
+        var typedNodes = Array.CreateInstance(nodeType, values.Length);
+        for (var index = 0; index < values.Length; index++)
+        {
+            typedNodes.SetValue(values[index], index);
+        }
+
+        var find = typeof(SmartUiAutomationService).GetMethod(
+            "FindByLabels",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "FindByLabels");
+        var success = typeof(SmartUiAutomationService).GetMethod(
+            "IsSmartTefKeySuccess",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "IsSmartTefKeySuccess");
+
+        var conclude = find.Invoke(null, new object[] { typedNodes, new[] { "concluir" } })
+            ?? throw new InvalidOperationException("O botao Concluir nao foi localizado.");
+
+        Assert.True((bool)(success.Invoke(null, new object[] { typedNodes }) ?? false));
+        Assert.Equal(360, Read<int>(conclude, "CenterX"));
+        Assert.Equal(1066, Read<int>(conclude, "CenterY"));
+    }
+
+    [Theory]
+    [InlineData(1080, 1920, 832, 1020)]
+    [InlineData(540, 960, 416, 510)]
+    public void K2SynchronizationOkPointScalesWithoutUiAutomator(
+        int width,
+        int height,
+        int expectedX,
+        int expectedY)
+    {
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "GetLegacy80LargeSynchronizationOkPoint",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(
+                typeof(SmartUiAutomationService).FullName,
+                "GetLegacy80LargeSynchronizationOkPoint");
+
+        var point = ((int X, int Y))(method.Invoke(null, new object[] { width, height })
+            ?? throw new InvalidOperationException("O ponto do OK do K2 nao foi calculado."));
+
+        Assert.Equal(expectedX, point.X);
+        Assert.Equal(expectedY, point.Y);
     }
 
     private static object Parse(string dump, string resourceId)

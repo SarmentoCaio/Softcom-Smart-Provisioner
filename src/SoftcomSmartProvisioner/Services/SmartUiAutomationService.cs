@@ -2026,6 +2026,28 @@ public sealed class SmartUiAutomationService
         CancellationToken cancellationToken)
     {
         progress?.Invoke("legacy80-sync", "Aguardando a sincronizacao inicial do Smart 8.0...");
+
+        if (IsLegacy80LargeSelfServiceModule(module))
+        {
+            // No K2/Android 7, ate uma leitura do UIAutomator durante o dialogo de
+            // sincronizacao pode fazer o Smart recuar. O AutoPagamento ja seguia pelo
+            // caminho seguro quando essa leitura ficava indisponivel; Totem, por
+            // conseguir responder ao dump, ainda sofria a regressao. Para os dois
+            // modulos de tela grande, nao lemos a arvore: o cadastro remoto confirma
+            // o vinculo e somente depois DismissConfirmedSynchronizationAsync toca OK.
+            await Task.Delay(1800, cancellationToken);
+            progress?.Invoke(
+                "legacy80-sync-pending",
+                "K2 em sincronizacao. Aguardando a confirmacao remota antes de acionar o OK uma unica vez, sem UIAutomator...");
+            return new SmartAutomationResult(
+                true,
+                packageName,
+                "legacy80-sync-pending",
+                "A sincronizacao do K2 foi enviada; o vinculo sera confirmado remotamente antes do unico clique em OK.",
+                string.Empty,
+                smartDeviceId);
+        }
+
         UiSnapshot finalSnapshot = new(false, Array.Empty<UiNode>(), string.Empty);
 
         var consecutiveUnavailableSnapshots = 0;
@@ -2071,31 +2093,24 @@ public sealed class SmartUiAutomationService
         if (finalSnapshot.Success && IsSynchronizationSuccess(finalSnapshot.Nodes))
         {
             progress?.Invoke("legacy80-sync-success", "Dados sincronizados com sucesso. Finalizando a confirmacao...");
-            var ok = FindSynchronizationOkNode(finalSnapshot.Nodes);
-            if (ok is not null)
+            if (IsLegacy80LargeSelfServiceModule(module))
             {
-                progress?.Invoke("legacy80-sync-ok", $"Acionando OK da sincronizacao em {ok.CenterX},{ok.CenterY}...");
-                await _adb.TapAsync(serial, ok.CenterX, ok.CenterY, cancellationToken);
-                await Task.Delay(700, cancellationToken);
+                // No K2, o chamador valida primeiro o device_id no SelfHost/Softcomshop
+                // e entao fecha o dialogo por uma unica coordenada calibrada. Clicar aqui
+                // e novamente apos a validacao atingia a tela de modulo que ficava por
+                // baixo do dialogo, aparentando que o Smart havia voltado sozinho.
+                progress?.Invoke(
+                    "legacy80-sync-ok-pending",
+                    "Sincronizacao concluida no K2. Aguardando a confirmacao remota para acionar o OK uma unica vez...");
             }
-            else if (IsLegacy80LargeSelfServiceModule(module))
+            else
             {
-                // No Smart 8.0 de Totem/AutoPagamento o dialogo de sucesso pode exibir
-                // a mensagem no UIAutomator sem expor o botao OK como um no clicavel.
-                // O ponto abaixo foi mapeado no dispositivo 1080x1920 e e escalado
-                // proporcionalmente para a resolucao Android atual.
-                var activity = await GetLegacySmartActivityAsync(serial, cancellationToken);
-                if (IsLegacyCompanyAddActivity(activity))
+                var ok = FindSynchronizationOkNode(finalSnapshot.Nodes);
+                if (ok is not null)
                 {
-                    var display = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
-                    if (display.Success)
-                    {
-                        var okX = Math.Clamp((int)Math.Round(display.Width * (830d / 1080d)), 1, display.Width - 1);
-                        var okY = Math.Clamp((int)Math.Round(display.Height * (1025d / 1920d)), 1, display.Height - 1);
-                        progress?.Invoke("legacy80-sync-ok-fallback", $"OK nao foi exposto pela interface. Acionando o ponto mapeado {okX},{okY}...");
-                        await _adb.TapAsync(serial, okX, okY, cancellationToken);
-                        await Task.Delay(700, cancellationToken);
-                    }
+                    progress?.Invoke("legacy80-sync-ok", $"Acionando OK da sincronizacao em {ok.CenterX},{ok.CenterY}...");
+                    await _adb.TapAsync(serial, ok.CenterX, ok.CenterY, cancellationToken);
+                    await Task.Delay(700, cancellationToken);
                 }
             }
 
@@ -2154,6 +2169,7 @@ public sealed class SmartUiAutomationService
     public async Task<bool> DismissConfirmedSynchronizationAsync(
         string serial,
         string packageName,
+        string? module = null,
         Action<string, string>? progress = null,
         CancellationToken cancellationToken = default)
     {
@@ -2166,6 +2182,74 @@ public sealed class SmartUiAutomationService
         if (!display.Success)
         {
             return false;
+        }
+
+        // No K2 (Android 7), consultar o UIAutomator enquanto o dialogo final esta
+        // visivel pode fazer o Smart recuar para a selecao de modulo antes do toque.
+        // Como este metodo so e chamado depois da confirmacao autoritativa do vinculo,
+        // Totem/AutoPagamento podem fechar o unico OK pelo ponto calibrado, sem ler a
+        // arvore de acessibilidade instavel.
+        if (IsLegacy80LargeSelfServiceModule(module))
+        {
+            var foregroundActivity = await GetForegroundActivityAsync(serial, cancellationToken);
+            if (string.IsNullOrWhiteSpace(foregroundActivity) ||
+                !foregroundActivity.Contains(packageName, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (IsLegacyLoginActivity(foregroundActivity))
+            {
+                progress?.Invoke(
+                    "legacy80-sync-finished",
+                    "O Smart ja encerrou a confirmacao de sincronizacao e retornou para a tela de Login.");
+                return true;
+            }
+
+            var dialogReady = false;
+            for (var attempt = 0; attempt < 30; attempt++)
+            {
+                var windows = await _adb.ShellAsync(
+                    serial,
+                    "dumpsys window windows",
+                    cancellationToken,
+                    8000);
+                if (windows.Success &&
+                    HasAdditionalWindowForActivity(windows.CombinedOutput, foregroundActivity))
+                {
+                    dialogReady = true;
+                    break;
+                }
+
+                await Task.Delay(500, cancellationToken);
+            }
+
+            if (!dialogReady)
+            {
+                progress?.Invoke(
+                    "legacy80-sync-ok-wait",
+                    "O vinculo foi confirmado, mas o dialogo final do K2 ainda nao abriu. Nenhum toque foi enviado fora de hora.");
+                return false;
+            }
+
+            var (okX, okY) = GetLegacy80LargeSynchronizationOkPoint(display.Width, display.Height);
+            progress?.Invoke(
+                "legacy80-sync-ok-large",
+                $"Dialogo final do K2 confirmado. Acionando o OK em {okX},{okY}, sem UIAutomator...");
+            var tap = await _adb.TapAsync(serial, okX, okY, cancellationToken);
+            if (!tap.Success)
+            {
+                return false;
+            }
+
+            await Task.Delay(900, cancellationToken);
+            var afterTap = await _adb.ShellAsync(
+                serial,
+                "dumpsys window windows",
+                cancellationToken,
+                8000);
+            return afterTap.Success &&
+                   !HasAdditionalWindowForActivity(afterTap.CombinedOutput, foregroundActivity);
         }
 
         // dialog_button pertence ao custom_dialog.xml do Smart 8.0.1. button1 cobre
@@ -2295,6 +2379,27 @@ public sealed class SmartUiAutomationService
         !string.IsNullOrWhiteSpace(activityDump) &&
         (activityDump.Contains("app:id/dialog_button", StringComparison.OrdinalIgnoreCase) ||
          activityDump.Contains("android:id/button1", StringComparison.OrdinalIgnoreCase));
+
+    private static (int X, int Y) GetLegacy80LargeSynchronizationOkPoint(int width, int height) =>
+        (
+            Math.Clamp((int)Math.Round(width * (832d / 1080d)), 1, Math.Max(1, width - 1)),
+            Math.Clamp((int)Math.Round(height * (1020d / 1920d)), 1, Math.Max(1, height - 1))
+        );
+
+    private static bool HasAdditionalWindowForActivity(string? windowDump, string? activity)
+    {
+        if (string.IsNullOrWhiteSpace(windowDump) || string.IsNullOrWhiteSpace(activity))
+        {
+            return false;
+        }
+
+        var count = windowDump
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Count(line =>
+                line.Contains("Window #", StringComparison.OrdinalIgnoreCase) &&
+                line.Contains(activity, StringComparison.OrdinalIgnoreCase));
+        return count >= 2;
+    }
 
     private async Task<SmartAutomationResult> SubmitDeviceUrlSmart81Async(
         string serial,
@@ -3691,7 +3796,48 @@ public sealed class SmartUiAutomationService
                 }
 
                 progress?.Invoke("tef-conclude", $"Aguardando validacao das chaves e Concluir... tentativa {attempt}/7.");
-                var tap = await _adb.TapAsync(serial, layout.ConcludeX, layout.ConcludeY, cancellationToken);
+                var concludeX = layout.ConcludeX;
+                var concludeY = layout.ConcludeY;
+                var check = await ReadUiQuickAsync(serial, cancellationToken);
+                if (check.Success)
+                {
+                    if (IsSmartTefLoginScreen(check.Nodes))
+                    {
+                        return new TefDirectResult(true, "tef-concluded", string.Empty, BuildSummary(check.Nodes));
+                    }
+
+                    if (IsSmartTefValidationFailure(check.Nodes))
+                    {
+                        return new TefDirectResult(
+                            false,
+                            "tef-validation",
+                            "O Smart TEF retornou falha durante a validacao das chaves.",
+                            BuildSummary(check.Nodes));
+                    }
+
+                    var conclude = FindByLabels(check.Nodes, new[] { "concluir" });
+                    if (conclude is not null)
+                    {
+                        concludeX = conclude.CenterX;
+                        concludeY = conclude.CenterY;
+                        progress?.Invoke(
+                            "tef-conclude",
+                            "Chaves verificadas com sucesso. Acionando o botao Concluir localizado na tela...");
+                    }
+                    else if (IsSmartTefKeySuccess(check.Nodes))
+                    {
+                        progress?.Invoke(
+                            "tef-conclude",
+                            "Chaves verificadas com sucesso. Acionando Concluir pelo ponto calibrado do dispositivo...");
+                    }
+                    else
+                    {
+                        await Task.Delay(900, cancellationToken);
+                        continue;
+                    }
+                }
+
+                var tap = await _adb.TapAsync(serial, concludeX, concludeY, cancellationToken);
                 if (!tap.Success)
                 {
                     return new TefDirectResult(false, "tef-conclude", "Nao foi possivel tocar no botao Concluir do Smart TEF.", tap.CombinedOutput.Trim());
@@ -3726,23 +3872,9 @@ public sealed class SmartUiAutomationService
                         string.Empty);
                 }
 
-                // Faz no maximo duas leituras auxiliares para nao repetir o problema
-                // de ficar minutos preso no UIAutomator do L400.
-                if (attempt is 3 or 7)
-                {
-                    var check = await ReadUiQuickAsync(serial, cancellationToken);
-                    if (check.Success)
-                    {
-                        if (IsSmartTefLoginScreen(check.Nodes))
-                        {
-                            return new TefDirectResult(true, "tef-concluded", string.Empty, BuildSummary(check.Nodes));
-                        }
-                        if (IsSmartTefValidationFailure(check.Nodes))
-                        {
-                            return new TefDirectResult(false, "tef-validation", "O Smart TEF retornou falha durante a validacao das chaves.", BuildSummary(check.Nodes));
-                        }
-                    }
-                }
+                // Se o clique ocorreu no botao real, uma nova iteracao confirma a
+                // Activity final. Nao declaramos sucesso apenas porque o comando ADB
+                // terminou sem erro.
             }
 
             return layout.RequiresActivityGuard
@@ -4015,7 +4147,7 @@ public sealed class SmartUiAutomationService
                 360, 1037,
                 360, 1201,
                 360, 1432,
-                360, 1128,
+                360, 1066,
                 true,
                 360, 1280, 360, 800, 450,
                 true,
@@ -4517,7 +4649,7 @@ public sealed class SmartUiAutomationService
         IsLegacySmartPackageActivity(activity) &&
         activity.EndsWith("softcom.mobile.smart.views.activities.device.EmpresaAddActivity", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsLegacy80LargeSelfServiceModule(string module) =>
+    private static bool IsLegacy80LargeSelfServiceModule(string? module) =>
         string.Equals(module, "smart_totem", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(module, "smart_autopagamento", StringComparison.OrdinalIgnoreCase);
 
@@ -5222,7 +5354,12 @@ public sealed class SmartUiAutomationService
             .Where(x => !x.ClassName.Contains("EditText", StringComparison.OrdinalIgnoreCase))
             .FirstOrDefault(x =>
             {
-                var value = Normalize(x.SearchText);
+                // SearchText inclui todos os descendentes. Em telas Compose isso faz o
+                // container raiz conter simultaneamente "CNPJ", "Empresa ID" e "Token".
+                // Se o container for tratado como label, a busca geometrica escolhe o
+                // ultimo EditText (Token) para todos os campos. Aqui a correspondencia
+                // precisa considerar somente o texto/descricao do proprio no.
+                var value = Normalize($"{x.Text} {x.ContentDescription}");
                 return normalizedLabels.Any(item => value.Contains(item, StringComparison.OrdinalIgnoreCase));
             });
 

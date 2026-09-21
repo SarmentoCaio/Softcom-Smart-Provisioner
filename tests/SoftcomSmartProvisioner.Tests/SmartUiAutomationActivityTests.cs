@@ -108,6 +108,27 @@ public sealed class SmartUiAutomationActivityTests
     }
 
     [Theory]
+    [InlineData("smart_autopagamento", true)]
+    [InlineData("SMART_AUTOPAGAMENTO", true)]
+    [InlineData("smart_totem", true)]
+    [InlineData("smart_comanda", false)]
+    [InlineData("smart_pdv", false)]
+    [InlineData(null, false)]
+    public void OnlyTotemAndAutoPagamentoUseLegacy80LargeSelfServiceProfile(
+        string? module,
+        bool expected)
+    {
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "IsLegacy80LargeSelfServiceModule",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(
+                typeof(SmartUiAutomationService).FullName,
+                "IsLegacy80LargeSelfServiceModule");
+
+        Assert.Equal(expected, (bool)(method.Invoke(null, new object?[] { module }) ?? false));
+    }
+
+    [Theory]
     [InlineData("android.widget.Button{... app:id/dialog_button}", true)]
     [InlineData("android.widget.Button{... android:id/button1}", true)]
     [InlineData("android.widget.Button{... app:id/btn_confirmar}", false)]
@@ -122,5 +143,28 @@ public sealed class SmartUiAutomationActivityTests
                 "ContainsSynchronizationDialogResource");
 
         Assert.Equal(expected, (bool)(method.Invoke(null, new object?[] { activityDump }) ?? false));
+    }
+
+    [Fact]
+    public void K2FinalDialogRequiresAnAdditionalWindowForCurrentActivity()
+    {
+        const string activity =
+            "softcom.mobile.smart2/softcom.mobile.smart.views.activities.device.EmpresaAddActivity";
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "HasAdditionalWindowForActivity",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(
+                typeof(SmartUiAutomationService).FullName,
+                "HasAdditionalWindowForActivity");
+
+        var withoutDialog = $"Window #6 Window{{abc u0 {activity}}}";
+        var withDialog = $$"""
+            Window #6 Window{abc u0 {{activity}}}
+            Window #5 Window{def u0 {{activity}}}
+            Window #4 Window{ghi u0 softcom.mobile.smart2/softcom.mobile.smart.views.activities.EmpresaAddConfigActivity}
+            """;
+
+        Assert.False((bool)(method.Invoke(null, new object?[] { withoutDialog, activity }) ?? true));
+        Assert.True((bool)(method.Invoke(null, new object?[] { withDialog, activity }) ?? false));
     }
 }

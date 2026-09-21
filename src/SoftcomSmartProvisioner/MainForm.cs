@@ -1710,6 +1710,15 @@ public sealed class MainForm : Form
                 PostEvent("provisionProgress", new { stage, message });
             }
 
+            var automationProfile = string.Equals(module, "smart_tef", StringComparison.OrdinalIgnoreCase)
+                ? "Smart TEF"
+                : IsLegacy80LargeSelfServiceModule(module)
+                    ? "Smart 8.0 tela grande (Totem/AutoPagamento)"
+                    : "fluxo padrao/mobile";
+            Progress(
+                "profile",
+                $"Modulo recebido: {module}. Perfil solicitado: {automationProfile}. Android: {android.FriendlyName} ({android.Model}), SDK {android.AndroidSdk}.");
+
             // Smart TEF possui fluxo proprio e nao usa URL/oauth_clients nesta etapa.
             // O XML confirmado do app RedeFlex expoe Nome do dispositivo, CNPJ, Empresa ID e Token.
             if (string.Equals(module, "smart_tef", StringComparison.OrdinalIgnoreCase))
@@ -1935,6 +1944,7 @@ public sealed class MainForm : Form
                     smartUiFinalized = await _smartAutomationService.DismissConfirmedSynchronizationAsync(
                         serial,
                         selfHostAutomation.PackageName,
+                        module,
                         Progress,
                         _shutdown.Token);
                 }
@@ -2296,6 +2306,7 @@ public sealed class MainForm : Form
                         smartUiFinalized = await _smartAutomationService.DismissConfirmedSynchronizationAsync(
                             serial,
                             onlineAutomation.PackageName,
+                            module,
                             Progress,
                             _shutdown.Token);
                     }
@@ -2341,6 +2352,7 @@ public sealed class MainForm : Form
                         smartUiFinalized = await _smartAutomationService.DismissConfirmedSynchronizationAsync(
                             serial,
                             onlineAutomation.PackageName,
+                            module,
                             Progress,
                             _shutdown.Token);
                     }
@@ -2875,6 +2887,10 @@ public sealed class MainForm : Form
 
     private static bool IsSelfHostModule(string? module) =>
         string.Equals(module, "smart_comanda", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(module, "smart_autopagamento", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsLegacy80LargeSelfServiceModule(string? module) =>
+        string.Equals(module, "smart_totem", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(module, "smart_autopagamento", StringComparison.OrdinalIgnoreCase);
 
     private static string BuildSelfHostDeviceUrl(string softcomshopUrl, string? requestedBaseUrl)

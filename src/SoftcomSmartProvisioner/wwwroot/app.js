@@ -1028,12 +1028,12 @@
     return state.module === "smart_tef";
   }
 
-  function moduleRequiresSelfHost() {
-    return state.module === "smart_comanda" || state.module === "smart_autopagamento";
+  function moduleRequiresSelfHost(module = state.module) {
+    return module === "smart_comanda" || module === "smart_autopagamento";
   }
 
-  function isSelfHostMode() {
-    return !isTefMode() && (moduleRequiresSelfHost() || state.useSelfHost);
+  function isSelfHostMode(module = state.module) {
+    return module !== "smart_tef" && (moduleRequiresSelfHost(module) || state.useSelfHost);
   }
 
   function getSelfHostBaseUrl() {
@@ -1520,10 +1520,15 @@
       });
     });
     $("prepare-smart").addEventListener("click", () => {
-      state.module = $("module-select").value || "smart_pdv";
+      // O modal de confirmacao e assincrono. Congelamos o modulo escolhido antes
+      // de abri-lo para que uma renderizacao/alteracao posterior do estado global
+      // nao envie outro modulo ao backend (ex.: AutoPagamento chegando como Comanda).
+      const requestedModule = $("module-select").value || "smart_pdv";
+      state.module = requestedModule;
+      const requestedUseSelfHost = isSelfHostMode(requestedModule);
       const clearData = $("clear-before-link").checked;
 
-      if (isTefMode()) {
+      if (requestedModule === "smart_tef") {
         if (!state.androidSerial || (state.multiDevice && state.androidSerials.length < 2) || !tefFieldsValid()) {
           toast(state.multiDevice
             ? "Selecione ao menos dois Androids e confira os dados do Smart TEF."
@@ -1545,7 +1550,7 @@
               accessMode: state.accessMode,
               environment: state.environment,
               serials: state.androidSerials,
-              module: state.module,
+              module: requestedModule,
               clearData,
               ...tef
             });
@@ -1568,7 +1573,7 @@
       }
 
       const moduleLabel = $("module-select").selectedOptions[0]?.textContent || "Smart";
-      const modeInfo = isSelfHostMode()
+      const modeInfo = requestedUseSelfHost
         ? "usando o /device/add do SelfHost"
         : state.accessMode === "online"
           ? "usando a sessão WEB do Softcomshop"
@@ -1581,7 +1586,7 @@
           ? `O Provisioner verificará e removerá vínculos anteriores ${modeInfo} antes de criar o novo vínculo.`
           : `O Provisioner verificará e removerá vínculos anteriores ${modeInfo}. O Smart será reiniciado sem apagar sua configuração local.`,
         moduleLabel,
-        accessLabel: isSelfHostMode() ? "SelfHost" : state.accessMode === "online" ? "Softcomshop Web" : "Docker local",
+        accessLabel: requestedUseSelfHost ? "SelfHost" : state.accessMode === "online" ? "Softcomshop Web" : "Docker local",
         clearData,
         onConfirm: () => {
           renderValidation({ status: "ready", title: "Iniciando preparação", detail: "Validando o cenário e abrindo o Smart nos Androids selecionados." });
@@ -1594,8 +1599,8 @@
             oauthClient: state.oauthClient,
             oauthClientsBySerial: provisioningTargetsPayload(),
             serials: state.androidSerials,
-            module: state.module,
-            useSelfHost: isSelfHostMode(),
+            module: requestedModule,
+            useSelfHost: requestedUseSelfHost,
             selfHostBaseUrl: getSelfHostBaseUrl(),
             clearData
           });
