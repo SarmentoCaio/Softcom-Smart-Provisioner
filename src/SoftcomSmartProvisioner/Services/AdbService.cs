@@ -552,17 +552,21 @@ public sealed class AdbService
         // Smart em vez de apenas recolher o teclado. Quando o dump expoe o estado da
         // janela, ele e a fonte de verdade; mInputShown fica apenas como compatibilidade
         // para ROMs antigas que nao publicam nenhum dos indicadores visuais.
-        var publishesWindowState =
-            output.Contains("mIsInputViewShown=", StringComparison.OrdinalIgnoreCase) ||
+        // Algumas ROMs Android 7 do K2 mantem mIsInputViewShown=true mesmo com a janela
+        // do IME fechada. Quando mWindowVisible/mDecorViewVisible existem, eles tem
+        // prioridade e impedem que um BACK seja enviado para a Activity do Smart.
+        var publishesRenderedWindowState =
             output.Contains("mWindowVisible=", StringComparison.OrdinalIgnoreCase) ||
             output.Contains("mDecorViewVisible=", StringComparison.OrdinalIgnoreCase);
 
-        if (publishesWindowState)
+        if (publishesRenderedWindowState)
         {
-            return output.Contains("mIsInputViewShown=true", StringComparison.OrdinalIgnoreCase) ||
-                   output.Contains("mWindowVisible=true", StringComparison.OrdinalIgnoreCase) ||
+            return output.Contains("mWindowVisible=true", StringComparison.OrdinalIgnoreCase) ||
                    output.Contains("mDecorViewVisible=true", StringComparison.OrdinalIgnoreCase);
         }
+
+        if (output.Contains("mIsInputViewShown=", StringComparison.OrdinalIgnoreCase))
+            return output.Contains("mIsInputViewShown=true", StringComparison.OrdinalIgnoreCase);
 
         return output.Contains("mInputShown=true", StringComparison.OrdinalIgnoreCase) ||
                output.Contains("inputShown=true", StringComparison.OrdinalIgnoreCase);

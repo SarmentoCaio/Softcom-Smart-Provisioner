@@ -57,8 +57,89 @@ public static class ProcessRunner
             TryKill(process);
             return new ProcessResult(-1, await stdoutTask, "Tempo limite excedido.");
         }
+        catch (OperationCanceledException)
+        {
+            TryKill(process);
+            throw;
+        }
 
         return new ProcessResult(process.ExitCode, await stdoutTask, await stderrTask);
+    }
+
+    public static async Task<ProcessResult> RunTextStreamingAsync(
+        string fileName,
+        IEnumerable<string> arguments,
+        string workingDirectory,
+        CancellationToken cancellationToken,
+        int timeoutMilliseconds,
+        Action<string>? onOutputLine)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                WorkingDirectory = workingDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
+            }
+        };
+
+        foreach (var argument in arguments)
+            process.StartInfo.ArgumentList.Add(argument);
+
+        process.Start();
+        var stdout = new StringBuilder();
+        var stderr = new StringBuilder();
+        var stdoutTask = ReadLinesAsync(process.StandardOutput, stdout, onOutputLine, cancellationToken);
+        var stderrTask = ReadLinesAsync(process.StandardError, stderr, onOutputLine, cancellationToken);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(timeoutMilliseconds);
+
+        try
+        {
+            await process.WaitForExitAsync(timeoutCts.Token);
+            await Task.WhenAll(stdoutTask, stderrTask);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            TryKill(process);
+            await DrainAfterKillAsync(stdoutTask, stderrTask);
+            return new ProcessResult(-1, stdout.ToString(), "Tempo limite excedido.");
+        }
+        catch (OperationCanceledException)
+        {
+            TryKill(process);
+            await DrainAfterKillAsync(stdoutTask, stderrTask);
+            throw;
+        }
+
+        return new ProcessResult(process.ExitCode, stdout.ToString(), stderr.ToString());
+    }
+
+    private static async Task ReadLinesAsync(
+        StreamReader reader,
+        StringBuilder destination,
+        Action<string>? onOutputLine,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            var line = await reader.ReadLineAsync(cancellationToken);
+            if (line is null) break;
+            destination.AppendLine(line);
+            if (line.Length == 0 || onOutputLine is null) continue;
+            try { onOutputLine(line); } catch { }
+        }
+    }
+
+    private static async Task DrainAfterKillAsync(params Task[] tasks)
+    {
+        try { await Task.WhenAll(tasks); } catch { }
     }
 
     public static async Task<BinaryProcessResult> RunBinaryAsync(
@@ -116,7 +197,10 @@ public static class ProcessRunner
             FileName = fileName,
             WorkingDirectory = workingDirectory,
             UseShellExecute = false,
-            CreateNoWindow = false
+            // scrcpy é distribuído como executável de console, mas sua interface útil
+            // é a janela SDL de espelhamento. Não abra um console auxiliar ao iniciá-lo.
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden
         };
 
         foreach (var argument in arguments)

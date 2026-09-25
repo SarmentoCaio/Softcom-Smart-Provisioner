@@ -67,6 +67,7 @@ public sealed class AdbServiceTests
 
     [Theory]
     [InlineData("mShowRequested=true mInputShown=true mWindowVisible=false mIsInputViewShown=false", false)]
+    [InlineData("mShowRequested=false mInputShown=false mWindowVisible=false mIsInputViewShown=true", false)]
     [InlineData("mShowRequested=true mInputShown=true mWindowVisible=true mIsInputViewShown=true", true)]
     [InlineData("mInputShown=true", true)]
     [InlineData("mShowRequested=false mInputShown=false mWindowVisible=false", false)]

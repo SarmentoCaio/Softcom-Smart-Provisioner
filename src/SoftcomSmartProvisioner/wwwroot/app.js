@@ -21,12 +21,30 @@
     module: "smart_pdv",
     useSelfHost: false,
     selfHostBaseUrl: "",
+    selfHostBackend: "softcomshop",
+    selfHostBackendTouched: false,
+    selfHostConfigExpanded: false,
+    selfHostConfiguration: null,
+    selfHostConfigurationLoaded: false,
+    selfHostReadRequested: false,
+    selfHostRootDevices: [],
+    selfHostRootClientId: "",
+    selfHostRootRequestKey: "",
+    selfHostPreview: null,
     deviceMode: "existing",
     fiscalSeries: [],
     seriesExpanded: false,
     databaseSuggestionIndex: -1,
     oauthSuggestionIndex: -1,
     logs: [],
+    testAutomation: null,
+    testAutomationLoaded: false,
+    testAutomationRunning: false,
+    testAutomationProgress: [],
+    testDeviceSerial: "",
+    testDeviceTag: "",
+    testSuiteId: "",
+    testSelectionFromProvision: false,
     updateAvailable: false,
     updateRequired: false,
     latestVersion: "",
@@ -113,8 +131,12 @@
       provision: $("prepare-smart"),
       createDevice: $("create-device"),
       online: $("use-database"),
+      selfHostConfiguration: $("selfhost-read-config"),
+      selfHostRootCreate: $("selfhost-root-create-confirm"),
       update: $("check-update"),
-      updateInstall: $("install-update")
+      updateInstall: $("install-update"),
+      testAutomationCatalog: $("refresh-test-automation"),
+      testAutomationRun: $("run-test-automation")
     };
     const el = map[key];
     if (el) {
@@ -124,8 +146,12 @@
       if (key === "provision") el.textContent = active ? "Provisionando..." : "Provisionar selecionados";
       if (key === "createDevice") el.textContent = active ? "Criando..." : "Criar dispositivo";
       if (key === "online") el.textContent = active ? "Conectando..." : (state.accessMode === "online" ? "Conectar" : "Usar");
+      if (key === "selfHostConfiguration") el.textContent = active ? "Aguarde..." : "Ler configuração";
+      if (key === "selfHostRootCreate") el.textContent = active ? "Criando..." : "Criar";
       if (key === "update") el.textContent = active ? "Verificando..." : "Verificar agora";
       if (key === "updateInstall") el.textContent = active ? "Atualizando..." : "Atualizar agora";
+      if (key === "testAutomationCatalog") el.textContent = active ? "Atualizando..." : "Atualizar catálogo";
+      if (key === "testAutomationRun") el.textContent = active ? "Executando..." : "Executar testes";
     }
 
     if (key === "createDevice") {
@@ -145,6 +171,13 @@
         button.classList.toggle("busy", active);
       });
     }
+    if (key === "selfHostConfiguration" || key === "selfHostRootDevices" || key === "selfHostRootCreate") {
+      renderSelfHostConfiguration();
+    }
+    if (key === "testAutomationRun") {
+      state.testAutomationRunning = active;
+      updateTestRunActions();
+    }
   }
 
   function configureNavigation() {
@@ -157,11 +190,13 @@
         $(`page-${page}`).classList.add("active");
         const titles = {
           provision: ["Preparar dispositivo Smart", "Use o modo Online sem VPN ou o acesso direto ao banco para provisionar o Smart."],
+          tests: ["Testes do Smart", "Execute as suítes automatizadas no dispositivo conectado, sem sair do Provisioner."],
           logs: ["Logs", "Acompanhe VPN, banco, ADB e preparação sem janelas de console."],
           settings: ["Configurações", "Clientes salvos, atualizações e opções avançadas."]
         };
         $("page-title").textContent = titles[page][0];
         $("page-subtitle").textContent = titles[page][1];
+        if (page === "tests" && !state.testAutomationLoaded) send("loadTestAutomation", { refreshDevices: true });
       });
     });
   }
@@ -227,6 +262,8 @@
         $("selfhost-status").textContent = "SelfHost não localizado.";
       }
     }
+    if ($("selfhost-port")) $("selfhost-port").value = String(b.selfHost?.port || 7711);
+    renderSelfHostConfiguration();
     const cap = b.capabilities;
     const dbOk = !!cap.databaseCredentials;
     $("db-credential-status").textContent = dbOk ? "Credenciais OK" : "Sem credenciais";
@@ -255,6 +292,32 @@
     renderSavedOnlineClients();
   }
 
+  function renderBackendMode() {
+    const desktop = state.selfHostBackend === "softshop";
+    document.querySelectorAll("#backend-mode-switch button").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.backend === state.selfHostBackend);
+    });
+    $("softcomshop-client-config")?.classList.toggle("hidden", desktop);
+    $("selfhost-softshop-config")?.classList.toggle("hidden", !desktop);
+    $("company-setup-panel")?.classList.toggle("hidden", desktop);
+    $("setup-grid")?.classList.toggle("desktop-backend", desktop);
+    if ($("setup-backend-title")) {
+      $("setup-backend-title").textContent = desktop ? "Softshop Desktop" : "Softcomshop Web";
+    }
+    if ($("backend-mode-helper")) {
+      $("backend-mode-helper").textContent = desktop
+        ? "Configure a conexão SQL Server usada pelo SelfHost."
+        : "Informe o cliente do Softcomshop Web."
+    }
+    if (desktop) {
+      const ready = isSelfHostDesktopDatabaseReady();
+      $("db-credential-status").textContent = ready ? "SQL configurado" : "Configurar SQL";
+      $("db-credential-status").className = `mini-status ${ready ? "ok" : "warn"}`;
+      $("open-client-site").disabled = true;
+      $("global-substatus").textContent = "Softshop Desktop via SelfHost";
+    }
+  }
+
   function renderAccessMode() {
     const online = state.accessMode === "online";
     const docker = state.accessMode === "docker";
@@ -279,6 +342,7 @@
     $("global-substatus").textContent = online
       ? (state.onlineConnected ? "Softcomshop Online conectado" : "Modo Online")
       : (state.bootstrap?.capabilities?.dockerAvailable ? "Banco via Docker isolado" : "Docker Desktop não localizado");
+    renderBackendMode();
     renderCompanyPreview();
     renderModuleMode();
     updateActions();
@@ -350,6 +414,10 @@
     state.companies = [];
     state.oauthClients = [];
     state.fiscalSeries = [];
+    state.selfHostRootDevices = [];
+    state.selfHostRootClientId = "";
+    state.selfHostRootRequestKey = "";
+    state.selfHostPreview = null;
     renderCompanies();
     renderCompanyPreview();
     renderOauthClients();
@@ -372,9 +440,9 @@
         : "";
     }
     const headings = grid.querySelectorAll("h2");
-    if (headings[0]) headings[0].textContent = compact && state.database
-      ? `Softcomshop · ${displayDatabaseName(state.database)}`
-      : "Softcomshop";
+    if (headings[0]) headings[0].textContent = state.selfHostBackend === "softshop"
+      ? "Softshop Desktop"
+      : (compact && state.database ? `Softcomshop · ${displayDatabaseName(state.database)}` : "Softcomshop Web");
     if (headings[1]) headings[1].textContent = compact && state.company
       ? state.company.name
       : "Empresa do dispositivo";
@@ -741,6 +809,210 @@
     });
   }
 
+  function selfHostShopPayload() {
+    return {
+      database: state.database,
+      companyId: state.company?.id || null
+    };
+  }
+
+  function selfHostConfigurationPayload() {
+    const configureTableDatabase = state.module === "smart_comanda" && state.selfHostBackend === "softcomshop";
+    return {
+      ...selfHostShopPayload(),
+      backend: state.selfHostBackend,
+      rootClientId: state.selfHostRootClientId,
+      port: $("selfhost-port")?.value.trim() || "7711",
+      smartEnabled: $("selfhost-smart-enabled")?.checked !== false,
+      sqlServer: state.selfHostBackend === "softshop" ? $("selfhost-sql-server")?.value.trim() || "" : "",
+      sqlPort: state.selfHostBackend === "softshop" ? $("selfhost-sql-port")?.value.trim() || "" : "",
+      sqlUser: state.selfHostBackend === "softshop" ? $("selfhost-sql-user")?.value.trim() || "" : "",
+      sqlPassword: state.selfHostBackend === "softshop" ? $("selfhost-sql-password")?.value || "" : "",
+      sqlDatabase: state.selfHostBackend === "softshop" ? $("selfhost-sql-database")?.value.trim() || "" : "",
+      configureTableDatabase,
+      mysqlServer: configureTableDatabase ? $("selfhost-mysql-server")?.value.trim() || "" : "",
+      mysqlPort: configureTableDatabase ? $("selfhost-mysql-port")?.value.trim() || "" : "",
+      mysqlUser: configureTableDatabase ? $("selfhost-mysql-user")?.value.trim() || "" : "",
+      mysqlPassword: configureTableDatabase ? $("selfhost-mysql-password")?.value || "" : "",
+      mysqlDatabase: configureTableDatabase ? $("selfhost-mysql-database")?.value.trim() || "" : ""
+    };
+  }
+
+  function isSelfHostTableDatabaseReady() {
+    if (state.module !== "smart_comanda" || state.selfHostBackend !== "softcomshop") return true;
+    const hasRequiredText = ["selfhost-mysql-server", "selfhost-mysql-port", "selfhost-mysql-user", "selfhost-mysql-database"]
+      .every(id => !!$(id)?.value.trim());
+    const port = Number($("selfhost-mysql-port")?.value.trim());
+    const validPort = Number.isInteger(port) && port >= 1 && port <= 65535;
+    const hasPassword = !!$("selfhost-mysql-password")?.value || state.selfHostConfiguration?.hasMysqlPassword === true;
+    return hasRequiredText && validPort && hasPassword;
+  }
+
+  function isSelfHostDesktopDatabaseReady() {
+    if (state.selfHostBackend !== "softshop") return true;
+    const hasRequiredText = ["selfhost-sql-server", "selfhost-sql-user", "selfhost-sql-database"]
+      .every(id => !!$(id)?.value.trim());
+    const portText = $("selfhost-sql-port")?.value.trim() || "";
+    const port = Number(portText);
+    const validPort = !portText || (Number.isInteger(port) && port >= 1 && port <= 65535);
+    const hasPassword = !!$("selfhost-sql-password")?.value || state.selfHostConfiguration?.hasDatabasePassword === true;
+    return hasRequiredText && validPort && hasPassword;
+  }
+
+  function isStoredSelfHostConfigurationComplete(config = state.selfHostConfiguration) {
+    if (config?.isComplete !== true) return false;
+    const storedDesktop = String(config?.tipoBancoDados || "").toLowerCase().includes("desktop");
+    if ((state.selfHostBackend === "softshop") !== storedDesktop) return false;
+    return state.module !== "smart_comanda" || storedDesktop || config?.isTableDatabaseComplete === true;
+  }
+
+  function ensureSelfHostSetup(forceRoots = false) {
+    if (!isSelfHostMode()) return;
+    const installed = state.bootstrap?.selfHost?.installed === true;
+    if (installed && !state.selfHostConfigurationLoaded && !state.selfHostReadRequested) {
+      state.selfHostReadRequested = true;
+      send("readSelfHostConfiguration");
+    }
+    if (!state.selfHostConfigExpanded || state.selfHostBackend !== "softcomshop" || !state.database || !state.company) {
+      state.selfHostRootDevices = [];
+      state.selfHostRootClientId = "";
+      state.selfHostRootRequestKey = "";
+      renderSelfHostConfiguration();
+      return;
+    }
+    const key = `${state.database}|${state.company.id}`;
+    if (forceRoots || state.selfHostRootRequestKey !== key) {
+      state.selfHostRootRequestKey = key;
+      send("loadSelfHostRootDevices", selfHostShopPayload());
+    }
+    renderSelfHostConfiguration();
+  }
+
+  function renderSelfHostConfiguration() {
+    const sh = state.bootstrap?.selfHost || {};
+    const config = state.selfHostConfiguration;
+    const status = $("selfhost-status");
+    if (status) {
+      if (!sh.installed) {
+        status.textContent = "SelfHost não localizado.";
+        status.className = "selfhost-status bad";
+      } else if (!state.selfHostConfigurationLoaded) {
+        status.textContent = `SelfHost ${sh.version || "?"} · ${sh.generation || ""} · configuração não carregada`;
+        status.className = "selfhost-status";
+      } else {
+        const complete = isStoredSelfHostConfigurationComplete(config);
+        const label = complete ? "Configurado" : (config?.hasClientId || config?.hasClientSecret ? "Configuração incompleta" : "Não configurado");
+        status.textContent = `SelfHost ${sh.version || "?"} · ${sh.generation || ""} · ${label}`;
+        status.className = `selfhost-status ${complete ? "ok" : "warn"}`;
+      }
+    }
+
+    $("selfhost-config-content")?.classList.toggle("hidden", !state.selfHostConfigExpanded);
+    const toggleConfig = $("selfhost-toggle-config");
+    if (toggleConfig) {
+      toggleConfig.textContent = state.selfHostConfigExpanded ? "Recolher" : "Configurar";
+      toggleConfig.setAttribute("aria-expanded", state.selfHostConfigExpanded ? "true" : "false");
+      toggleConfig.disabled = !sh.installed || state.busy.has("selfHostConfiguration");
+    }
+
+    const configuring = state.selfHostConfigExpanded;
+
+    const select = $("selfhost-root-select");
+    if (select) {
+      const canChoose = !!(sh.installed && state.selfHostBackend === "softcomshop" && state.database && state.company);
+      select.disabled = !canChoose;
+      select.innerHTML = `<option value="">${canChoose ? "Selecione o dispositivo raiz" : "Selecione cliente e empresa"}</option>` +
+        state.selfHostRootDevices.map(x => `<option value="${escapeAttr(x.clientId)}">${escapeHtml(x.name)}${x.isLinked ? " · vinculado" : ""}</option>`).join("");
+      if (state.selfHostRootClientId && state.selfHostRootDevices.some(x => x.clientId === state.selfHostRootClientId)) {
+        select.value = state.selfHostRootClientId;
+      }
+    }
+    if ($("selfhost-root-new")) $("selfhost-root-new").disabled = !(sh.installed && state.selfHostBackend === "softcomshop" && state.database && state.company);
+
+    $("selfhost-softcomshop-config")?.classList.toggle("hidden", state.selfHostBackend !== "softcomshop");
+    $("selfhost-softshop-config")?.classList.toggle("hidden", state.selfHostBackend !== "softshop");
+    const desktopComplete = isSelfHostDesktopDatabaseReady();
+    const sqlStatus = $("selfhost-sql-status");
+    if (sqlStatus) {
+      sqlStatus.textContent = desktopComplete ? "Pronto" : "Pendente";
+      sqlStatus.className = `mini-status ${desktopComplete ? "ok" : "warn"}`;
+    }
+
+    const configuringTableDatabase = configuring && state.module === "smart_comanda" && state.selfHostBackend === "softcomshop";
+    $("selfhost-mysql-config")?.classList.toggle("hidden", !configuringTableDatabase);
+    const mysqlComplete = isSelfHostTableDatabaseReady();
+    const mysqlStatus = $("selfhost-mysql-status");
+    if (mysqlStatus) {
+      mysqlStatus.textContent = mysqlComplete ? "Pronto" : "Pendente";
+      mysqlStatus.className = `mini-status ${mysqlComplete ? "ok" : "warn"}`;
+    }
+
+    const summary = $("selfhost-config-summary");
+    if (summary) {
+      if (!state.selfHostConfigurationLoaded || !config) {
+        summary.classList.add("hidden");
+        summary.innerHTML = "";
+      } else {
+        summary.classList.remove("hidden");
+        summary.innerHTML = `
+          <div><span>Retaguarda</span><strong>${escapeHtml(config.tipoBancoDados || "Não configurada")}</strong></div>
+          ${state.selfHostBackend === "softshop"
+            ? `<div><span>Servidor SQL</span><strong>${escapeHtml(config.servidor || "—")}</strong></div>
+               <div><span>Banco Softshop</span><strong>${escapeHtml(config.bancoDados || "—")}</strong></div>
+               <div><span>Credenciais SQL</span><strong>${config.hasDatabasePassword ? "Presentes" : "Incompletas"}</strong></div>`
+            : `<div><span>Empresa</span><strong>${escapeHtml(config.softcomShopEmpresa || "—")}</strong></div>
+               <div><span>Dispositivo raiz</span><strong>${escapeHtml(config.softcomShopDevice || "—")}</strong></div>
+               <div><span>Credenciais</span><strong>${config.hasClientId && config.hasClientSecret ? "Presentes" : "Incompletas"}</strong></div>`}
+          <div><span>Relay</span><strong>${config.relayConfigured ? "Preservado" : "Não configurado"}</strong></div>
+          ${state.module === "smart_comanda" ? `<div><span>Banco de mesas</span><strong>${config.isTableDatabaseComplete ? "Configurado" : "Incompleto"}</strong></div>` : ""}
+          <div><span>Armazenamento</span><strong>${sh.generation === "SelfHost 4.0" ? "Config.json / Config2.json" : "selfhost-config.db"}</strong></div>`;
+      }
+    }
+
+    const backendReady = state.selfHostBackend === "softshop"
+      ? desktopComplete
+      : !!(state.database && state.company && state.selfHostRootClientId);
+    const ready = !!(configuring && sh.installed && backendReady && mysqlComplete);
+    if ($("selfhost-preview-config")) $("selfhost-preview-config").disabled = !ready || state.busy.has("selfHostConfiguration");
+    if ($("selfhost-apply-config")) $("selfhost-apply-config").disabled = !ready || state.busy.has("selfHostConfiguration");
+  }
+
+  function renderSelfHostPreview(result) {
+    const summary = $("selfhost-config-summary");
+    if (!summary) return;
+    const changes = result?.changes || [];
+    summary.classList.remove("hidden");
+    summary.innerHTML = changes.length
+      ? `<div class="selfhost-preview-title">Alterações previstas</div>${changes.map(x => `<div><span>${escapeHtml(x.field)}</span><strong>${escapeHtml(String(x.from ?? "—"))} → ${escapeHtml(String(x.to ?? "—"))}</strong></div>`).join("")}<div><span>Reinício</span><strong>${result.restartRequired ? "Necessário" : "Não necessário"}</strong></div>`
+      : `<div><span>Preview</span><strong>Nenhuma alteração de configuração</strong></div>`;
+  }
+
+  function openSelfHostRootCreateModal() {
+    if (!state.database || !state.company) return;
+    clearInlineError("selfhost-root-create-error");
+    $("selfhost-root-create-name").value = "";
+    $("selfhost-root-create-modal")?.classList.remove("hidden");
+    setTimeout(() => $("selfhost-root-create-name")?.focus(), 0);
+  }
+
+  function closeSelfHostRootCreateModal() {
+    $("selfhost-root-create-modal")?.classList.add("hidden");
+  }
+
+  function createSelfHostRootDevice() {
+    const name = $("selfhost-root-create-name")?.value.trim() || "";
+    clearInlineError("selfhost-root-create-error");
+    if (!name) {
+      showInlineError("selfhost-root-create-error", "Informe o nome do dispositivo raiz.");
+      return;
+    }
+    if (/^SELFHOST_/i.test(name)) {
+      showInlineError("selfhost-root-create-error", "Não use SELFHOST_: esse prefixo pertence aos dispositivos filhos.");
+      return;
+    }
+    send("createSelfHostRootDevice", { ...selfHostShopPayload(), name });
+  }
+
   function loadFiscalSeries() {
     if (isTefMode() || !state.database || !state.company || !state.oauthClient) {
       state.fiscalSeries = [];
@@ -1033,7 +1305,7 @@
   }
 
   function isSelfHostMode(module = state.module) {
-    return module !== "smart_tef" && (moduleRequiresSelfHost(module) || state.useSelfHost);
+    return module !== "smart_tef" && (state.selfHostBackend === "softshop" || moduleRequiresSelfHost(module) || state.useSelfHost);
   }
 
   function getSelfHostBaseUrl() {
@@ -1059,9 +1331,11 @@
 
   function renderModuleMode() {
     const tef = isTefMode();
-    const selfHostRequired = moduleRequiresSelfHost();
+    const desktopBackend = state.selfHostBackend === "softshop";
+    const selfHostRequired = desktopBackend || moduleRequiresSelfHost();
     const selfHost = isSelfHostMode();
-    $("standard-device-config").classList.toggle("hidden", tef || state.multiDevice);
+    const selfHostReady = !selfHost || isStoredSelfHostConfigurationComplete();
+    $("standard-device-config").classList.toggle("hidden", tef || state.multiDevice || !selfHostReady);
     $("link-source-config")?.classList.toggle("hidden", tef);
     const selfHostCheck = $("use-selfhost-check");
     if (selfHostCheck) {
@@ -1070,7 +1344,7 @@
     }
     if ($("link-source-hint")) {
       $("link-source-hint").textContent = selfHostRequired
-        ? "Smart Comanda e Smart Autopagamento exigem vínculo pelo SelfHost."
+        ? (desktopBackend ? "O Softshop Desktop é configurado e acessado pelo SelfHost." : "Smart Comanda e Smart Autopagamento exigem vínculo pelo SelfHost.")
         : (selfHost
           ? "O dispositivo será vinculado pelo SelfHost. Depois, o módulo pode ser alterado no próprio Smart, inclusive para Comanda."
           : "O dispositivo será vinculado pelo Softcomshop. Se pretende alternar depois para Comanda, escolha SelfHost.");
@@ -1084,16 +1358,8 @@
     }
     const deviceLabel = $("device-source-label");
     if (deviceLabel) deviceLabel.textContent = selfHost ? "Dispositivo SelfHost" : "Dispositivo Softcomshop";
-    if (selfHost && $("selfhost-status")) {
-      const base = getSelfHostBaseUrl();
-      const sh = state.bootstrap?.selfHost || {};
-      const version = sh.installed ? `SelfHost ${sh.version || "?"} · ${sh.generation || ""}` : "SelfHost não localizado";
-      const legacy = sh.generation === "SelfHost 4.0";
-      const mapping = legacy
-        ? "Config2.json · um dispositivo filho diferente por Android"
-        : "um dispositivo filho diferente por Android";
-      $("selfhost-status").textContent = base ? `${version} · ${mapping} · ${base}` : `${version} · ${mapping} · IP local automático`;
-    }
+    if (selfHost) ensureSelfHostSetup();
+    else renderSelfHostConfiguration();
     $("tef-config").classList.toggle("hidden", !tef);
     $("validate-link").classList.toggle("hidden", tef);
     if (tef) {
@@ -1106,7 +1372,7 @@
       });
     } else {
       $("preparation-description").innerHTML = selfHost
-        ? `O <strong>${$("module-select").selectedOptions[0]?.textContent || "Smart"}</strong> será vinculado pelo SelfHost. Assim o mesmo dispositivo poderá trocar de módulo no próprio Smart, inclusive para Comanda, sem refazer o vínculo. O SelfHost deve estar previamente configurado e com o serviço ativo.`
+        ? `O <strong>${$("module-select").selectedOptions[0]?.textContent || "Smart"}</strong> será vinculado pelo SelfHost. Primeiro confirme o dispositivo raiz acima; depois cada Android usa um dispositivo filho SELFHOST_ próprio.`
         : (state.accessMode === "online"
           ? `Use <strong>Validar</strong> para conferir o cenário ou <strong>Preparar Smart</strong> para criar/reutilizar o vínculo pela sessão Web, abrir o APK e confirmar o dispositivo no Softcomshop — sem VPN/MySQL.`
           : `Use <strong>Validar</strong> para conferir o cenário ou <strong>Preparar Smart</strong> para executar de fato: abrir o APK, informar a URL pelo ADB e confirmar o vínculo no banco.`);
@@ -1141,6 +1407,7 @@
     if ($("create-device")) {
       $("create-device").disabled = !(companyOk && dbOk && $("new-device-name").value.trim());
     }
+    renderSelfHostConfiguration();
   }
 
   function evaluate() {
@@ -1155,6 +1422,26 @@
 
   function loadOauth() {
     if (!state.database || !state.company) return;
+    if (isSelfHostMode() && state.selfHostBackend === "softshop") {
+      state.oauthClients = [];
+      state.oauthClient = null;
+      renderOauthClients();
+      renderOauthPreview();
+      renderValidation({
+        status: "warning",
+        title: "Softshop Desktop configurável",
+        detail: "A criação e listagem dos dispositivos Desktop ainda precisa usar o repositório oficial SH_Dispositivos; o fluxo do Softcomshop não será chamado por engano."
+      });
+      return;
+    }
+    if (isSelfHostMode() && !isStoredSelfHostConfigurationComplete()) {
+      state.oauthClients = [];
+      state.oauthClient = null;
+      renderOauthClients();
+      renderOauthPreview();
+      ensureSelfHostSetup();
+      return;
+    }
     send("loadOauthClients", {
       accessMode: state.accessMode,
       environment: state.environment,
@@ -1172,7 +1459,206 @@
 
   function escapeAttr(value) { return escapeHtml(value); }
 
+  function renderTestPrerequisites() {
+    const host = $("test-prerequisites");
+    const catalog = state.testAutomation;
+    if (!host || !catalog) return;
+    const checks = [
+      ["Projeto", catalog.prerequisites?.projectAvailable],
+      [".env seguro", catalog.prerequisites?.environmentAvailable],
+      ["uv", catalog.prerequisites?.uvAvailable],
+      ["Appium", catalog.prerequisites?.appiumAvailable]
+    ];
+    host.innerHTML = checks.map(([label, ok]) =>
+      `<span class="test-check ${ok ? "ok" : "bad"}">${ok ? "✓" : "!"} ${escapeHtml(label)}</span>`
+    ).join("");
+  }
+
+  function selectedTestDevice() {
+    return (state.testAutomation?.devices || []).find(x => x.serial === state.testDeviceSerial) || null;
+  }
+
+  function selectedTestSuite() {
+    return (state.testAutomation?.suites || []).find(x => x.id === state.testSuiteId) || null;
+  }
+
+  function suiteIdForProvisionModule(module) {
+    const normalized = String(module || "").toLowerCase();
+    if (normalized === "smart_pdv") return "pdv/pdv.robot";
+    if (normalized === "smart_comanda") return "commands/commands.robot";
+    if (normalized === "smart_minimercado") return "minimarket/minimarket.robot";
+    return "";
+  }
+
+  function rememberProvisionedDeviceForTests(serial, module) {
+    if (!serial) return;
+    state.testDeviceSerial = serial;
+    const suiteId = suiteIdForProvisionModule(module);
+    state.testSuiteId = suiteId;
+    state.testSelectionFromProvision = true;
+
+    const refreshSelection = () => {
+      const device = selectedTestDevice();
+      state.testDeviceTag = device?.suggestedDeviceTag || "";
+      renderTestAutomationCatalog();
+    };
+    if (state.testAutomationLoaded && state.testAutomation) {
+      refreshSelection();
+    } else {
+      // O catálogo carregado após o provisionamento mantém o serial e o módulo
+      // escolhidos acima e apenas completa o perfil relacionado ao UDID.
+      send("loadTestAutomation");
+    }
+  }
+
+  function renderTestDeviceProfile() {
+    const device = selectedTestDevice();
+    const field = $("test-device-tag-field");
+    const select = $("test-device-tag");
+    const details = $("test-device-details");
+    const status = $("test-device-status");
+    if (!field || !select || !details || !status) return;
+
+    if (!device) {
+      state.testDeviceTag = "";
+      field.classList.add("hidden");
+      details.textContent = "Nenhum Android selecionado.";
+      status.textContent = "Aguardando";
+      status.className = "mini-status";
+      updateTestRunActions();
+      return;
+    }
+
+    const tags = device.deviceTags || [];
+    if (!tags.includes(state.testDeviceTag)) state.testDeviceTag = device.suggestedDeviceTag || "";
+    select.innerHTML = `<option value="">Selecione o perfil</option>${tags.map(tag =>
+      `<option value="${escapeAttr(tag)}"${tag === state.testDeviceTag ? " selected" : ""}>${escapeHtml(tag)}</option>`
+    ).join("")}`;
+    field.classList.toggle("hidden", tags.length === 1);
+    select.disabled = tags.length === 0;
+    details.innerHTML = `<strong>${escapeHtml(device.friendlyName || device.serial)}</strong>` +
+      `<span>${escapeHtml(device.serial)} · Android ${escapeHtml(device.androidVersion || "?")} · Smart ${escapeHtml(device.smartVersion || "não detectado")}</span>`;
+    status.textContent = !device.isOnline ? "Desconectado" : tags.length ? (state.testDeviceTag ? "Identificado" : "Escolher perfil") : "Sem perfil";
+    status.className = `mini-status ${device.isOnline && state.testDeviceTag ? "ok" : "warn"}`;
+    updateTestRunActions();
+  }
+
+  function renderTestCases() {
+    const suite = selectedTestSuite();
+    const select = $("test-case");
+    if (!select) return;
+    const current = select.value;
+    const cases = suite?.testCases || [];
+    select.innerHTML = `<option value="">Todos os casos da suíte</option>${cases.map(test =>
+      `<option value="${escapeAttr(test)}">${escapeHtml(test)}</option>`
+    ).join("")}`;
+    select.disabled = !suite;
+    if (cases.includes(current)) select.value = current;
+
+    const tagSelect = $("test-include-tag");
+    if (tagSelect) {
+      const currentTag = tagSelect.value;
+      const tags = suite?.tags || [];
+      tagSelect.innerHTML = `<option value="">Sem filtro — executar a seleção acima</option>${tags.map(tag =>
+        `<option value="${escapeAttr(tag)}">${escapeHtml(tag)}</option>`
+      ).join("")}`;
+      const hasSpecificTest = !!select.value;
+      tagSelect.disabled = !suite || tags.length === 0 || hasSpecificTest;
+      if (!hasSpecificTest && tags.includes(currentTag)) tagSelect.value = currentTag;
+    }
+    updateTestRunActions();
+  }
+
+  function renderTestAutomationCatalog() {
+    const catalog = state.testAutomation;
+    if (!catalog) return;
+    renderTestPrerequisites();
+
+    const devices = catalog.devices || [];
+    if (!devices.some(x => x.serial === state.testDeviceSerial)) {
+      const preferred = devices.find(x => x.isOnline && x.suggestedDeviceTag) || devices.find(x => x.isOnline);
+      state.testDeviceSerial = preferred?.serial || "";
+      state.testDeviceTag = preferred?.suggestedDeviceTag || "";
+    }
+    $("test-device").innerHTML = `<option value="">Selecione um dispositivo</option>${devices.map(device =>
+      `<option value="${escapeAttr(device.serial)}"${device.serial === state.testDeviceSerial ? " selected" : ""}>${escapeHtml(device.friendlyName || device.serial)} · ${escapeHtml(device.serial)}</option>`
+    ).join("")}`;
+
+    const suites = catalog.suites || [];
+    if (!suites.some(x => x.id === state.testSuiteId) && !state.testSelectionFromProvision) {
+      state.testSuiteId = suites[0]?.id || "";
+    }
+    $("test-suite").innerHTML = `<option value="">Selecione uma suíte</option>${suites.map(suite =>
+      `<option value="${escapeAttr(suite.id)}"${suite.id === state.testSuiteId ? " selected" : ""}>${escapeHtml(suite.name)} · ${suite.testCases?.length || 0} casos</option>`
+    ).join("")}`;
+    $("test-suite-count").textContent = `${suites.length} suíte${suites.length === 1 ? "" : "s"}`;
+    $("open-test-report").classList.toggle("hidden", !catalog.reportPath);
+
+    renderTestDeviceProfile();
+    renderTestCases();
+    const warnings = catalog.warnings || [];
+    if (warnings.length) {
+      $("test-run-message").textContent = warnings.join(" ");
+    }
+  }
+
+  function updateTestRunActions() {
+    const catalog = state.testAutomation;
+    const prerequisites = catalog?.prerequisites;
+    const ready = !!(catalog && prerequisites?.projectAvailable && prerequisites?.runnerAvailable &&
+      prerequisites?.environmentAvailable && prerequisites?.uvAvailable && state.testDeviceSerial &&
+      state.testDeviceTag && state.testSuiteId);
+    const run = $("run-test-automation");
+    if (run) run.disabled = state.testAutomationRunning || !ready;
+    $("cancel-test-automation")?.classList.toggle("hidden", !state.testAutomationRunning);
+  }
+
+  function renderTestRunState(kind, title, message, summary = "") {
+    const panel = document.querySelector(".test-run-panel");
+    if (panel) panel.className = `panel test-run-panel${kind ? ` ${kind}` : ""}`;
+    if ($("test-run-title")) $("test-run-title").textContent = title;
+    if ($("test-run-message")) $("test-run-message").textContent = message;
+    const output = $("test-run-summary");
+    if (output) {
+      output.textContent = summary || "";
+      output.classList.toggle("hidden", !summary);
+    }
+    updateTestRunActions();
+  }
+
+  function renderTestProgress() {
+    const output = $("test-run-summary");
+    if (!output) return;
+    const lines = state.testAutomationProgress.slice(-100).map(item => {
+      const time = item.timestamp ? new Date(item.timestamp).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+      const prefix = item.level === "ERROR" ? "✕" : item.level === "WARN" ? "!" : "→";
+      return `${time} ${prefix} ${item.message || ""}`.trim();
+    });
+    output.textContent = lines.join("\n");
+    output.classList.toggle("hidden", lines.length === 0);
+    output.scrollTop = output.scrollHeight;
+  }
+
   function configureEvents() {
+    document.querySelectorAll("#backend-mode-switch button").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const next = btn.dataset.backend === "softshop" ? "softshop" : "softcomshop";
+        if (next === state.selfHostBackend) return;
+        state.selfHostBackend = next;
+        state.selfHostBackendTouched = true;
+        if (next === "softshop") state.useSelfHost = true;
+        state.selfHostPreview = null;
+        state.selfHostRootDevices = [];
+        state.selfHostRootClientId = "";
+        state.selfHostRootRequestKey = "";
+        clearInlineError("selfhost-config-error");
+        hideDatabaseSuggestions();
+        setSetupCompact(false);
+        renderAccessMode();
+        ensureSelfHostSetup(true);
+      });
+    });
+
     document.querySelectorAll("#access-mode-switch button").forEach(btn => {
       btn.addEventListener("click", () => {
         const requested = btn.dataset.access;
@@ -1254,12 +1740,17 @@
       state.oauthClient = null;
       state.oauthClients = [];
       state.fiscalSeries = [];
+      state.selfHostRootDevices = [];
+      state.selfHostRootClientId = "";
+      state.selfHostRootRequestKey = "";
+      state.selfHostPreview = null;
       renderCompanyPreview();
       renderOauthClients();
       renderOauthPreview();
       renderFiscalSeries();
       if (state.company) {
         setSetupCompact(true);
+        ensureSelfHostSetup(true);
         loadOauth();
       }
     });
@@ -1377,6 +1868,77 @@
     $("selfhost-create-modal")?.addEventListener("mousedown", e => {
       if (e.target === $("selfhost-create-modal")) closeSelfHostCreateModal();
     });
+    $("selfhost-read-config")?.addEventListener("click", () => {
+      state.selfHostBackendTouched = false;
+      state.selfHostReadRequested = true;
+      send("readSelfHostConfiguration");
+    });
+    $("selfhost-toggle-config")?.addEventListener("click", () => {
+      state.selfHostConfigExpanded = !state.selfHostConfigExpanded;
+      if (state.selfHostConfigExpanded) {
+        state.selfHostPreview = null;
+        clearInlineError("selfhost-config-error");
+        ensureSelfHostSetup(true);
+      }
+      renderModuleMode();
+      renderSelfHostConfiguration();
+      if (!state.selfHostConfigExpanded && state.company && isStoredSelfHostConfigurationComplete()) loadOauth();
+    });
+    $("selfhost-root-select")?.addEventListener("change", e => {
+      state.selfHostRootClientId = e.target.value || "";
+      state.selfHostPreview = null;
+      clearInlineError("selfhost-config-error");
+      renderSelfHostConfiguration();
+    });
+    $("selfhost-root-new")?.addEventListener("click", openSelfHostRootCreateModal);
+    $("selfhost-root-create-close")?.addEventListener("click", closeSelfHostRootCreateModal);
+    $("selfhost-root-create-cancel")?.addEventListener("click", closeSelfHostRootCreateModal);
+    $("selfhost-root-create-confirm")?.addEventListener("click", createSelfHostRootDevice);
+    $("selfhost-root-create-name")?.addEventListener("input", () => clearInlineError("selfhost-root-create-error"));
+    $("selfhost-root-create-name")?.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); createSelfHostRootDevice(); }
+      if (e.key === "Escape") closeSelfHostRootCreateModal();
+    });
+    $("selfhost-root-create-modal")?.addEventListener("mousedown", e => {
+      if (e.target === $("selfhost-root-create-modal")) closeSelfHostRootCreateModal();
+    });
+    $("selfhost-preview-config")?.addEventListener("click", () => {
+      clearInlineError("selfhost-config-error");
+      send("previewSelfHostConfiguration", selfHostConfigurationPayload());
+    });
+    $("selfhost-apply-config")?.addEventListener("click", () => {
+      clearInlineError("selfhost-config-error");
+      if (state.selfHostBackend === "softshop") {
+        if (!isSelfHostDesktopDatabaseReady()) {
+          showInlineError("selfhost-config-error", "Preencha a conexão SQL Server do Softshop Desktop.");
+          return;
+        }
+        if (!confirm("Configurar o SelfHost para usar o Softshop Desktop? O serviço será parado, um ponto de restauração será criado e depois o SelfHost será reiniciado e validado.")) return;
+      } else {
+        const root = state.selfHostRootDevices.find(x => x.clientId === state.selfHostRootClientId);
+        if (!root) {
+          showInlineError("selfhost-config-error", "Selecione o dispositivo raiz do SelfHost.");
+          return;
+        }
+        const unlinkWarning = root.isLinked
+          ? " O dispositivo raiz está vinculado e será desvinculado do vínculo atual antes do novo cadastro."
+          : "";
+        if (!confirm(`Configurar o SelfHost com ${root.name}?${unlinkWarning} O serviço será parado, um ponto de restauração será criado e depois o SelfHost será reiniciado e validado.`)) return;
+      }
+      send("configureSelfHost", selfHostConfigurationPayload());
+    });
+    ["selfhost-port", "selfhost-smart-enabled"].forEach(id => {
+      $(id)?.addEventListener("input", () => { state.selfHostPreview = null; clearInlineError("selfhost-config-error"); renderSelfHostConfiguration(); });
+      $(id)?.addEventListener("change", () => { state.selfHostPreview = null; clearInlineError("selfhost-config-error"); renderSelfHostConfiguration(); });
+    });
+    ["selfhost-mysql-server", "selfhost-mysql-port", "selfhost-mysql-user", "selfhost-mysql-password", "selfhost-mysql-database"].forEach(id => {
+      $(id)?.addEventListener("input", () => { state.selfHostPreview = null; clearInlineError("selfhost-config-error"); renderSelfHostConfiguration(); });
+      $(id)?.addEventListener("change", () => { state.selfHostPreview = null; clearInlineError("selfhost-config-error"); renderSelfHostConfiguration(); });
+    });
+    ["selfhost-sql-server", "selfhost-sql-port", "selfhost-sql-user", "selfhost-sql-password", "selfhost-sql-database"].forEach(id => {
+      $(id)?.addEventListener("input", () => { state.selfHostPreview = null; clearInlineError("selfhost-config-error"); renderBackendMode(); renderSelfHostConfiguration(); });
+      $(id)?.addEventListener("change", () => { state.selfHostPreview = null; clearInlineError("selfhost-config-error"); renderBackendMode(); renderSelfHostConfiguration(); });
+    });
     $("provision-confirm-close")?.addEventListener("click", closeProvisionConfirmation);
     $("provision-confirm-cancel")?.addEventListener("click", closeProvisionConfirmation);
     $("provision-confirm-submit")?.addEventListener("click", acceptProvisionConfirmation);
@@ -1417,6 +1979,7 @@
       renderModuleMode();
       renderOauthClients();
       renderOauthPreview();
+      ensureSelfHostSetup(true);
       if (state.company) loadOauth();
     });
 
@@ -1448,9 +2011,6 @@
 
     $("selfhost-base-url")?.addEventListener("input", e => {
       state.selfHostBaseUrl = e.target.value.trim();
-      if (isSelfHostMode() && $("selfhost-status")) {
-        $("selfhost-status").textContent = state.selfHostBaseUrl ? `Selfhost: ${state.selfHostBaseUrl}` : "Selfhost: IP local será detectado automaticamente.";
-      }
     });
 
     ["tef-device-name", "tef-cnpj", "tef-empresa-id", "tef-token"].forEach(id => {
@@ -1654,6 +2214,43 @@
       }
       send("detectSmartPackages", { serial: state.androidSerial });
     });
+
+    $("refresh-test-automation")?.addEventListener("click", () => {
+      clearInlineError("test-automation-error");
+      send("loadTestAutomation", { refreshDevices: true });
+    });
+    $("test-device")?.addEventListener("change", e => {
+      state.testDeviceSerial = e.target.value;
+      state.testDeviceTag = selectedTestDevice()?.suggestedDeviceTag || "";
+      renderTestDeviceProfile();
+    });
+    $("test-device-tag")?.addEventListener("change", e => {
+      state.testDeviceTag = e.target.value;
+      renderTestDeviceProfile();
+    });
+    $("test-suite")?.addEventListener("change", e => {
+      state.testSuiteId = e.target.value;
+      state.testSelectionFromProvision = false;
+      renderTestCases();
+    });
+    $("test-case")?.addEventListener("change", () => renderTestCases());
+    $("run-test-automation")?.addEventListener("click", () => {
+      const suite = selectedTestSuite();
+      if (!state.testDeviceSerial || !state.testDeviceTag || !suite) {
+        showInlineError("test-automation-error", "Selecione o Android, o perfil e a suíte de testes.");
+        return;
+      }
+      clearInlineError("test-automation-error");
+      send("runTestAutomation", {
+        serial: state.testDeviceSerial,
+        deviceTag: state.testDeviceTag,
+        suiteId: suite.id,
+        testCase: $("test-case").value || null,
+        includeTag: $("test-include-tag").value.trim() || null
+      });
+    });
+    $("cancel-test-automation")?.addEventListener("click", () => send("cancelTestAutomation"));
+    $("open-test-report")?.addEventListener("click", () => send("openTestReport"));
   }
 
   window.chrome?.webview?.addEventListener("message", (event) => {
@@ -1666,6 +2263,47 @@
         break;
       case "busy":
         setBusy(payload.key, payload.active);
+        break;
+      case "testAutomationCatalog":
+        state.testAutomation = payload;
+        state.testAutomationLoaded = true;
+        clearInlineError("test-automation-error");
+        renderTestAutomationCatalog();
+        break;
+      case "testAutomationStarted":
+        state.testAutomationRunning = true;
+        state.testAutomationProgress = [];
+        clearInlineError("test-automation-error");
+        renderTestRunState("running", "Testes em execução", `Executando ${payload.testCase || "a suíte selecionada"} em ${payload.serial}.`);
+        break;
+      case "testAutomationProgress":
+        state.testAutomationProgress.push(payload);
+        if (state.testAutomationProgress.length > 200) state.testAutomationProgress.splice(0, state.testAutomationProgress.length - 200);
+        if ($("test-run-message")) $("test-run-message").textContent = payload.message || "Execução em andamento...";
+        renderTestProgress();
+        break;
+      case "testAutomationCanceling":
+        renderTestRunState("running", "Cancelando execução", payload.message || "Aguarde o encerramento dos processos...");
+        break;
+      case "testAutomationFinished": {
+        state.testAutomationRunning = false;
+        if (payload.reportPath && state.testAutomation) state.testAutomation.reportPath = payload.reportPath;
+        $("open-test-report")?.classList.toggle("hidden", !payload.reportPath);
+        const kind = payload.success ? "success" : "failed";
+        const title = payload.success ? "Testes concluídos" : (payload.canceled ? "Execução cancelada" : "Testes concluídos com falhas");
+        const seconds = Math.max(0, Math.round((payload.elapsedMilliseconds || 0) / 1000));
+        if (payload.summary) {
+          state.testAutomationProgress.push({ timestamp: new Date().toISOString(), level: payload.success ? "INFO" : "ERROR", message: payload.summary });
+        }
+        renderTestRunState(kind, title, `${payload.message || "Execução finalizada."} Tempo: ${seconds}s.`);
+        renderTestProgress();
+        toast(payload.message || title, payload.success ? "success" : (payload.canceled ? "info" : "error"));
+        break;
+      }
+      case "testAutomationError":
+        state.testAutomationRunning = false;
+        showInlineError("test-automation-error", payload.message || "Não foi possível executar os testes.");
+        renderTestRunState("failed", "Falha ao iniciar os testes", payload.message || "Revise os pré-requisitos e tente novamente.");
         break;
       case "databases":
         state.databases = payload.items || [];
@@ -1821,6 +2459,100 @@
       case "selfHostCreateError":
         showInlineError("selfhost-create-error", payload.message || "Não foi possível criar o dispositivo SelfHost.");
         break;
+      case "selfHostConfigurationRead": {
+        state.selfHostReadRequested = false;
+        state.selfHostConfigurationLoaded = true;
+        state.selfHostConfiguration = payload.configuration || null;
+        if (!state.selfHostBackendTouched) {
+          state.selfHostBackend = String(payload.configuration?.tipoBancoDados || "").toLowerCase().includes("desktop")
+            ? "softshop"
+            : "softcomshop";
+        }
+        state.selfHostPreview = null;
+        if (payload.configuration?.portaHttp) $("selfhost-port").value = String(payload.configuration.portaHttp);
+        if (payload.configuration) $("selfhost-smart-enabled").checked = payload.configuration.smartEnabled === true;
+        if (payload.configuration) {
+          $("selfhost-sql-server").value = payload.configuration.servidor || "";
+          $("selfhost-sql-port").value = payload.configuration.porta || "";
+          $("selfhost-sql-user").value = payload.configuration.usuario || "sa";
+          $("selfhost-sql-database").value = payload.configuration.bancoDados || "";
+          $("selfhost-sql-password").value = "";
+          $("selfhost-sql-password").placeholder = payload.configuration.hasDatabasePassword
+            ? "Senha já configurada (deixe vazio para preservar)"
+            : "Senha SQL Server";
+          $("selfhost-mysql-server").value = payload.configuration.mysqlServidor || "";
+          $("selfhost-mysql-port").value = payload.configuration.mysqlPorta || "";
+          $("selfhost-mysql-user").value = payload.configuration.mysqlUsuario || "";
+          $("selfhost-mysql-database").value = payload.configuration.mysqlDatabase || "";
+          $("selfhost-mysql-password").value = "";
+          $("selfhost-mysql-password").placeholder = payload.configuration.hasMysqlPassword
+            ? "Senha já configurada (deixe vazio para preservar)"
+            : "Senha MySQL";
+        }
+        clearInlineError("selfhost-config-error");
+        renderBackendMode();
+        renderModuleMode();
+        ensureSelfHostSetup();
+        if (isSelfHostMode() && state.company && isStoredSelfHostConfigurationComplete(payload.configuration)) loadOauth();
+        break;
+      }
+      case "selfHostRootDevices": {
+        state.selfHostRootDevices = payload.items || [];
+        if (!state.selfHostRootDevices.some(x => x.clientId === state.selfHostRootClientId)) {
+          const configuredName = String(state.selfHostConfiguration?.softcomShopDevice || "").trim().toLowerCase();
+          const current = configuredName
+            ? state.selfHostRootDevices.find(x => String(x.name || "").trim().toLowerCase() === configuredName)
+            : null;
+          state.selfHostRootClientId = current?.clientId || "";
+        }
+        clearInlineError("selfhost-config-error");
+        renderSelfHostConfiguration();
+        break;
+      }
+      case "selfHostRootDeviceCreated": {
+        state.selfHostRootDevices = payload.items || [];
+        state.selfHostRootClientId = payload.item?.clientId || "";
+        closeSelfHostRootCreateModal();
+        clearInlineError("selfhost-root-create-error");
+        renderSelfHostConfiguration();
+        toast(`Dispositivo raiz ${payload.item?.name || ""} criado e selecionado. Use Pré-visualizar antes de configurar.`, "success");
+        break;
+      }
+      case "selfHostConfigurationPreview":
+        state.selfHostPreview = payload;
+        clearInlineError("selfhost-config-error");
+        renderSelfHostPreview(payload);
+        toast("Preview concluído sem alterar o SelfHost.", "success");
+        break;
+      case "selfHostConfigurationProgress":
+        clearInlineError("selfhost-config-error");
+        if ($("selfhost-status")) $("selfhost-status").textContent = payload.message || "Configurando SelfHost...";
+        break;
+      case "selfHostConfigurationConfigured": {
+        const result = payload.result || {};
+        state.selfHostConfigurationLoaded = true;
+        state.selfHostReadRequested = false;
+        state.selfHostConfiguration = result.configuration || state.selfHostConfiguration;
+        state.selfHostConfigExpanded = false;
+        state.selfHostPreview = null;
+        clearInlineError("selfhost-config-error");
+        renderModuleMode();
+        toast("SelfHost configurado, reiniciado e validado com sucesso.", "success");
+        if (state.company) loadOauth();
+        break;
+      }
+      case "selfHostConfigurationError":
+        if (payload.stage === "createRoot") {
+          showInlineError("selfhost-root-create-error", payload.message || "Não foi possível criar o dispositivo raiz.");
+        } else {
+          showInlineError("selfhost-config-error", payload.message || "Não foi possível configurar o SelfHost.");
+        }
+        if (payload.stage === "read") {
+          state.selfHostReadRequested = false;
+          state.selfHostConfigurationLoaded = false;
+        }
+        renderSelfHostConfiguration();
+        break;
       case "androidDevices":
         state.androidDevices = payload.items || [];
         renderAndroid();
@@ -1870,6 +2602,7 @@
           $("url-box").classList.remove("hidden");
         }
         if (payload.success) {
+          rememberProvisionedDeviceForTests(payload.serial, payload.module);
           const successText = tef
             ? "Smart TEF configurado. Validação concluída e botão Concluir acionado."
             : (payload.accessMode === "online"
@@ -1903,6 +2636,10 @@
           title: "Provisionamento concluído",
           detail: `Sucesso: ${payload.success} · Falha: ${payload.failed} · Cancelado: ${payload.canceled}`
         });
+        {
+          const succeeded = (payload.items || []).filter(item => String(item.status).toLowerCase() === "succeeded" || item.status === 2);
+          if (succeeded.length > 0) rememberProvisionedDeviceForTests(succeeded[0].serial, state.module);
+        }
         break;
       case "vpnConnected":
         toast(payload.message, "success");

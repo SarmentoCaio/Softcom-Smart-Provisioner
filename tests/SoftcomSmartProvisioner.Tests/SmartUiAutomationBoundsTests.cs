@@ -244,6 +244,29 @@ public sealed class SmartUiAutomationBoundsTests
         Assert.Equal(expectedY, point.Y);
     }
 
+    [Theory]
+    [InlineData(1080, 1920, 540, 1089)]
+    [InlineData(540, 960, 270, 544)]
+    public void K2Smart81SynchronizationOkPointUsesComposeDialogLayout(
+        int width,
+        int height,
+        int expectedX,
+        int expectedY)
+    {
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "GetSmart81K2SynchronizationOkPoint",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(
+                typeof(SmartUiAutomationService).FullName,
+                "GetSmart81K2SynchronizationOkPoint");
+
+        var point = ((int X, int Y))(method.Invoke(null, new object[] { width, height })
+            ?? throw new InvalidOperationException("O ponto do OK Compose do K2 nao foi calculado."));
+
+        Assert.Equal(expectedX, point.X);
+        Assert.Equal(expectedY, point.Y);
+    }
+
     private static object Parse(string dump, string resourceId)
     {
         var method = typeof(SmartUiAutomationService).GetMethod(

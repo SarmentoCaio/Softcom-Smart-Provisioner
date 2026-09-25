@@ -36,11 +36,17 @@ public sealed class MainForm : Form
     private CoreWebView2Environment? _webEnvironment;
     private OnlineSoftcomshopService? _onlineSoftcomshopService;
     private readonly SelfHostDeviceService _selfHostDeviceService;
+    private readonly SelfHostBridgeService _selfHostBridgeService = new();
+    private readonly SelfHostBackupService _selfHostBackupService = new();
+    private readonly SelfHostServiceManager _selfHostServiceManager = new();
     private readonly DeviceCatalogService _deviceCatalogService;
+    private readonly TestAutomationService _testAutomationService = new();
     private readonly MultiDeviceProvisioningService _multiDeviceProvisioningService = new();
     private readonly AsyncLocal<ProvisioningExecutionContext?> _provisioningContext = new();
     private readonly SemaphoreSlim _sharedInfrastructureGate = new(1, 1);
     private readonly object _settingsMutationGate = new();
+    private readonly object _testAutomationGate = new();
+    private CancellationTokenSource? _testAutomationRun;
     private DeviceCatalogSnapshot _deviceCatalog = new(null, Array.Empty<DeviceCatalogEntry>(), Array.Empty<string>(),
         new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase));
 
@@ -216,6 +222,26 @@ public sealed class MainForm : Form
                     await CreateOauthClientAsync(request.Payload);
                     break;
 
+                case "readSelfHostConfiguration":
+                    await ReadSelfHostConfigurationAsync();
+                    break;
+
+                case "loadSelfHostRootDevices":
+                    await LoadSelfHostRootDevicesAsync(request.Payload);
+                    break;
+
+                case "createSelfHostRootDevice":
+                    await CreateSelfHostRootDeviceAsync(request.Payload);
+                    break;
+
+                case "previewSelfHostConfiguration":
+                    await PreviewSelfHostConfigurationAsync(request.Payload);
+                    break;
+
+                case "configureSelfHost":
+                    await ConfigureSelfHostAsync(request.Payload);
+                    break;
+
                 case "loadFiscalSeries":
                     await LoadFiscalSeriesAsync(request.Payload);
                     break;
@@ -303,6 +329,22 @@ public sealed class MainForm : Form
 
                 case "installUpdate":
                     await InstallUpdateAsync();
+                    break;
+
+                case "loadTestAutomation":
+                    await LoadTestAutomationAsync(request.Payload);
+                    break;
+
+                case "runTestAutomation":
+                    await RunTestAutomationAsync(request.Payload);
+                    break;
+
+                case "cancelTestAutomation":
+                    CancelTestAutomation();
+                    break;
+
+                case "openTestReport":
+                    OpenTestReport();
                     break;
 
                 case "clearLogs":
@@ -758,6 +800,280 @@ public sealed class MainForm : Form
             PostBusy("createDevice", false);
         }
     }
+
+    private async Task ReadSelfHostConfigurationAsync()
+    {
+        PostBusy("selfHostConfiguration", true);
+        try
+        {
+            var installation = RequireSelfHostInstallation();
+            var result = await _selfHostBridgeService.ReadAsync(installation.InstallPath, _shutdown.Token);
+            WriteLog(
+                "SELFHOST",
+                $"Configuração oficial lida do {installation.Generation} {installation.Version}; estado: {(result.Configuration?.IsComplete == true ? "configurado" : "incompleto")}.");
+            PostEvent("selfHostConfigurationRead", result);
+        }
+        catch (Exception ex)
+        {
+            WriteLog("SELFHOST", "Falha ao ler configuração: " + SensitiveDataSanitizer.Clean(ex.Message), "ERROR");
+            PostEvent("selfHostConfigurationError", new { stage = "read", message = SensitiveDataSanitizer.Clean(ex.Message) });
+        }
+        finally
+        {
+            PostBusy("selfHostConfiguration", false);
+        }
+    }
+
+    private async Task LoadSelfHostRootDevicesAsync(JsonElement payload)
+    {
+        PostBusy("selfHostRootDevices", true);
+        try
+        {
+            _ = RequireSelfHostInstallation();
+            var context = ReadSelfHostShopContext(payload);
+            var items = await LoadEligibleRootDevicesAsync(context.Database, context.CompanyId);
+            WriteLog("SELFHOST", $"{items.Count} dispositivo(s) raiz elegível(is) localizado(s) para {context.CompanyId}. Dispositivos SELFHOST_ foram excluídos.");
+            PostEvent("selfHostRootDevices", new { items });
+        }
+        catch (Exception ex)
+        {
+            WriteLog("SELFHOST", "Falha ao listar dispositivos raiz: " + SensitiveDataSanitizer.Clean(ex.Message), "ERROR");
+            PostEvent("selfHostConfigurationError", new { stage = "rootDevices", message = SensitiveDataSanitizer.Clean(ex.Message) });
+        }
+        finally
+        {
+            PostBusy("selfHostRootDevices", false);
+        }
+    }
+
+    private async Task CreateSelfHostRootDeviceAsync(JsonElement payload)
+    {
+        PostBusy("selfHostRootCreate", true);
+        try
+        {
+            _ = RequireSelfHostInstallation();
+            var context = ReadSelfHostShopContext(payload);
+            var name = ReadString(payload, "name")?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(name))
+                throw new InvalidOperationException("Informe o nome do dispositivo raiz.");
+            if (name.StartsWith("SELFHOST_", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("O prefixo SELFHOST_ é reservado aos dispositivos filhos administrados pelo SelfHost.");
+
+            var created = await ExecuteOnlineAsync(
+                context.Database,
+                "criar dispositivo raiz do SelfHost",
+                service => service.CreateOAuthClientAsync(context.Database, context.CompanyId, name, _shutdown.Token));
+            var items = await LoadEligibleRootDevicesAsync(context.Database, context.CompanyId);
+            var selected = items.FirstOrDefault(x => x.ClientId == created.ClientId)
+                ?? items.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (selected is null)
+                throw new InvalidOperationException("O Softcomshop aceitou o cadastro, mas o dispositivo raiz não apareceu na atualização da lista.");
+
+            WriteLog("SELFHOST", $"Dispositivo raiz {selected.Name} criado pelo fluxo oficial /softauth/device/salvar; ainda não vinculado ao SelfHost.");
+            PostEvent("selfHostRootDeviceCreated", new { item = selected, items });
+        }
+        catch (Exception ex)
+        {
+            WriteLog("SELFHOST", "Falha ao criar dispositivo raiz: " + SensitiveDataSanitizer.Clean(ex.Message), "ERROR");
+            PostEvent("selfHostConfigurationError", new { stage = "createRoot", message = SensitiveDataSanitizer.Clean(ex.Message) });
+        }
+        finally
+        {
+            PostBusy("selfHostRootCreate", false);
+        }
+    }
+
+    private async Task PreviewSelfHostConfigurationAsync(JsonElement payload)
+    {
+        PostBusy("selfHostConfiguration", true);
+        try
+        {
+            var installation = RequireSelfHostInstallation();
+            var desired = await BuildSelfHostDesiredConfigurationAsync(payload);
+            var result = await _selfHostBridgeService.PreviewAsync(installation.InstallPath, desired, _shutdown.Token);
+            WriteLog("SELFHOST", $"Preview calculado sem gravação: {result.Changes?.Count ?? 0} alteração(ões), restart {(result.RestartRequired ? "necessário" : "dispensado")}.");
+            PostEvent("selfHostConfigurationPreview", result);
+        }
+        catch (Exception ex)
+        {
+            WriteLog("SELFHOST", "Falha no preview: " + SensitiveDataSanitizer.Clean(ex.Message), "ERROR");
+            PostEvent("selfHostConfigurationError", new { stage = "preview", message = SensitiveDataSanitizer.Clean(ex.Message) });
+        }
+        finally
+        {
+            PostBusy("selfHostConfiguration", false);
+        }
+    }
+
+    private async Task ConfigureSelfHostAsync(JsonElement payload)
+    {
+        PostBusy("selfHostConfiguration", true);
+        SelfHostDeviceService.SelfHostInstallationInfo? installation = null;
+        SelfHostBridgeResult? before = null;
+        SelfHostBridgeResult? configured = null;
+        var serviceStopped = false;
+        var desiredPort = 7711;
+        string? backupPath = null;
+        try
+        {
+            installation = RequireSelfHostInstallation();
+            _selfHostBackupService.EnsureConfigurationToolsClosed();
+            var desired = await BuildSelfHostDesiredConfigurationAsync(payload);
+            desiredPort = desired.PortaHttp;
+            before = await _selfHostBridgeService.ReadAsync(installation.InstallPath, _shutdown.Token);
+            SelfHostServiceManager.EnsurePortAvailable(desiredPort, before.Configuration?.PortaHttp);
+
+            PostEvent("selfHostConfigurationProgress", new { stage = "stopping", message = "Parando o SelfHost para criar um backup consistente..." });
+            await _selfHostServiceManager.StopAsync(installation.InstallPath, cancellationToken: _shutdown.Token);
+            serviceStopped = true;
+            backupPath = _selfHostBackupService.CreateStoppedBackup(installation.InstallPath, installation.Generation);
+            WriteLog("SELFHOST", $"Ponto de restauração preparado antes da configuração em {backupPath}.");
+
+            desired = await BuildSelfHostDesiredConfigurationAsync(payload, unlinkRootDevice: true);
+            PostEvent("selfHostConfigurationProgress", new { stage = "configuring", message = "Vinculando o dispositivo raiz e gravando pela API oficial..." });
+            configured = await _selfHostBridgeService.ConfigureAsync(installation.InstallPath, desired, _shutdown.Token);
+
+            PostEvent("selfHostConfigurationProgress", new { stage = "restarting", message = "Reiniciando o SelfHost e aguardando a porta local..." });
+            await _selfHostServiceManager.StartAsync(installation.InstallPath, desiredPort, cancellationToken: _shutdown.Token);
+            serviceStopped = false;
+
+            PostEvent("selfHostConfigurationProgress", new { stage = "validating", message = "Validando healthchecks, autenticação e empresa..." });
+            var validation = await _selfHostBridgeService.ValidateAsync(
+                installation.InstallPath,
+                $"http://127.0.0.1:{desiredPort}",
+                _shutdown.Token);
+            configured = configured with { Validation = validation.Validation };
+
+            WriteLog("SELFHOST", $"SelfHost {installation.Version} configurado e validado pela API local; backup: {backupPath}.");
+            PostEvent("selfHostConfigurationConfigured", new { result = configured, backupPath });
+        }
+        catch (Exception ex)
+        {
+            var message = SensitiveDataSanitizer.Clean(ex.Message);
+            WriteLog("SELFHOST", "Falha ao configurar: " + message, "ERROR");
+            PostEvent("selfHostConfigurationError", new { stage = configured is null ? "configure" : "validate", message, backupPath });
+        }
+        finally
+        {
+            if (serviceStopped && installation is not null)
+            {
+                try
+                {
+                    var recoveryPort = configured is null ? before?.Configuration?.PortaHttp ?? 7711 : desiredPort;
+                    await _selfHostServiceManager.StartAsync(installation.InstallPath, recoveryPort, cancellationToken: _shutdown.Token);
+                }
+                catch (Exception restartError)
+                {
+                    var restartMessage = SensitiveDataSanitizer.Clean(restartError.Message);
+                    WriteLog("SELFHOST", "Falha ao restaurar o serviço após erro: " + restartMessage, "ERROR");
+                    PostEvent("selfHostConfigurationError", new { stage = "restart", message = restartMessage, backupPath });
+                }
+            }
+            PostBusy("selfHostConfiguration", false);
+        }
+    }
+
+    private async Task<SelfHostDesiredConfiguration> BuildSelfHostDesiredConfigurationAsync(
+        JsonElement payload,
+        bool unlinkRootDevice = false)
+    {
+        var backend = ReadString(payload, "backend")?.Trim().ToLowerInvariant() ?? "softcomshop";
+        if (backend is not ("softcomshop" or "softshop"))
+            throw new InvalidOperationException("Escolha Softcomshop Web ou Softshop Desktop.");
+        var portText = ReadString(payload, "port")?.Trim() ?? "7711";
+        if (!int.TryParse(portText, out var port) || port is < 1 or > 65535)
+            throw new InvalidOperationException("A porta HTTP deve ser um inteiro entre 1 e 65535.");
+
+        string? deviceUrl = null;
+        if (backend == "softcomshop")
+        {
+            var context = ReadSelfHostShopContext(payload);
+            var clientId = ReadString(payload, "rootClientId")?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(clientId))
+                throw new InvalidOperationException("Selecione o dispositivo raiz do SelfHost.");
+            var items = await LoadEligibleRootDevicesAsync(context.Database, context.CompanyId);
+            var root = items.FirstOrDefault(x => x.ClientId.Equals(clientId, StringComparison.Ordinal))
+                ?? throw new InvalidOperationException("O dispositivo raiz selecionado não pertence mais à empresa escolhida.");
+
+            if (unlinkRootDevice && root.IsLinked)
+            {
+                PostEvent("selfHostConfigurationProgress", new
+                {
+                    stage = "unlinkingRoot",
+                    message = $"Desvinculando {root.Name} do SelfHost anterior..."
+                });
+                var unlinked = await ExecuteOnlineAsync(
+                    context.Database,
+                    "desvincular dispositivo raiz do SelfHost",
+                    service => service.UnlinkOAuthClientAsync(
+                        context.Database,
+                        context.CompanyId,
+                        root.ClientId,
+                        _shutdown.Token));
+                if (!unlinked)
+                    throw new InvalidOperationException($"O Softcomshop não confirmou a desvinculação do dispositivo raiz {root.Name}.");
+
+                var refreshed = await LoadEligibleRootDevicesAsync(context.Database, context.CompanyId);
+                root = refreshed.FirstOrDefault(x => x.ClientId.Equals(clientId, StringComparison.Ordinal))
+                    ?? throw new InvalidOperationException("O dispositivo raiz desapareceu da empresa após a desvinculação.");
+                if (root.IsLinked)
+                    throw new InvalidOperationException($"O dispositivo raiz {root.Name} ainda aparece vinculado no Softcomshop.");
+
+                PostEvent("selfHostConfigurationProgress", new
+                {
+                    stage = "rootUnlinked",
+                    message = $"Dispositivo raiz {root.Name} desvinculado e confirmado. Preparando o novo vínculo..."
+                });
+            }
+
+            deviceUrl = await ExecuteOnlineAsync(
+                context.Database,
+                "obter URL oficial do dispositivo raiz",
+                service => service.GetDeviceUrlAsync(context.Database, root.ClientId, _shutdown.Token));
+        }
+
+        var configureTableDatabase = backend == "softcomshop" && ReadBool(payload, "configureTableDatabase", false);
+        return new SelfHostDesiredConfiguration(
+            backend,
+            port,
+            ReadBool(payload, "smartEnabled", true),
+            deviceUrl,
+            backend == "softshop" ? ReadString(payload, "sqlServer")?.Trim() : null,
+            backend == "softshop" ? ReadString(payload, "sqlPort")?.Trim() : null,
+            backend == "softshop" ? ReadString(payload, "sqlUser")?.Trim() : null,
+            backend == "softshop" ? ReadString(payload, "sqlPassword") : null,
+            backend == "softshop" ? ReadString(payload, "sqlDatabase")?.Trim() : null,
+            configureTableDatabase,
+            configureTableDatabase ? ReadString(payload, "mysqlServer")?.Trim() : null,
+            configureTableDatabase ? ReadString(payload, "mysqlPort")?.Trim() : null,
+            configureTableDatabase ? ReadString(payload, "mysqlUser")?.Trim() : null,
+            configureTableDatabase ? ReadString(payload, "mysqlPassword") : null,
+            configureTableDatabase ? ReadString(payload, "mysqlDatabase")?.Trim() : null);
+    }
+
+    private async Task<IReadOnlyList<OAuthClientInfo>> LoadEligibleRootDevicesAsync(string database, long companyId)
+    {
+        var items = await ExecuteOnlineAsync(
+            database,
+            "listar dispositivos raiz do SelfHost",
+            service => service.GetOAuthClientsAsync(database, companyId, _shutdown.Token));
+        return items
+            .Where(x => !string.IsNullOrWhiteSpace(x.ClientId) &&
+                        !x.Name.StartsWith("SELFHOST_", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase)
+            .ToArray();
+    }
+
+    private SelfHostShopContext ReadSelfHostShopContext(JsonElement payload)
+    {
+        var database = EnvironmentCatalog.NormalizeDatabaseName(
+            ReadString(payload, "database") ?? throw new InvalidOperationException("Selecione o cliente Softcomshop."));
+        var companyId = ReadLong(payload, "companyId")
+            ?? throw new InvalidOperationException("Selecione a empresa do dispositivo raiz.");
+        return new SelfHostShopContext(database, companyId);
+    }
+
+    private sealed record SelfHostShopContext(string Database, long CompanyId);
 
     private async Task LoadFiscalSeriesAsync(JsonElement payload)
     {
@@ -1262,6 +1578,100 @@ public sealed class MainForm : Form
         _settingsService.Save(settings);
         SendBootstrap();
         PostEvent("toast", new { type = "success", message = "Package name salvo." });
+    }
+
+    private async Task LoadTestAutomationAsync(JsonElement payload)
+    {
+        PostBusy("testAutomationCatalog", true);
+        try
+        {
+            if (ReadBool(payload, "refreshDevices", false))
+                await RefreshAndroidAsync();
+
+            var catalog = _testAutomationService.LoadCatalog(_androidDevices, _deviceCatalog);
+            PostEvent("testAutomationCatalog", catalog);
+        }
+        finally
+        {
+            PostBusy("testAutomationCatalog", false);
+        }
+    }
+
+    private async Task RunTestAutomationAsync(JsonElement payload)
+    {
+        var request = payload.Deserialize<TestAutomationRunRequest>(JsonOptions)
+            ?? throw new InvalidOperationException("Informe o dispositivo e a suíte de testes.");
+
+        CancellationTokenSource runCancellation;
+        lock (_testAutomationGate)
+        {
+            if (_testAutomationRun is not null)
+                throw new InvalidOperationException("Já existe uma execução de testes em andamento.");
+            runCancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
+            _testAutomationRun = runCancellation;
+        }
+
+        PostBusy("testAutomationRun", true);
+        PostEvent("testAutomationStarted", new
+        {
+            request.Serial,
+            request.DeviceTag,
+            request.SuiteId,
+            testCase = request.TestCase ?? string.Empty
+        });
+        WriteLog("TESTES", $"Execução iniciada em {request.Serial}, perfil {request.DeviceTag}.");
+
+        try
+        {
+            var result = await _testAutomationService.RunAsync(
+                request,
+                _androidDevices,
+                _deviceCatalog,
+                runCancellation.Token,
+                progress => PostEvent("testAutomationProgress", progress));
+            PostEvent("testAutomationFinished", result);
+            WriteLog("TESTES", result.Success
+                ? $"Execução concluída com sucesso em {request.Serial}."
+                : result.Canceled
+                    ? $"Execução cancelada em {request.Serial}."
+                    : $"Execução finalizada com falhas em {request.Serial}.",
+                result.Success ? "INFO" : result.Canceled ? "WARN" : "ERROR");
+        }
+        catch (Exception ex)
+        {
+            var message = SensitiveDataSanitizer.Clean(ex.Message);
+            PostEvent("testAutomationError", new { message });
+            WriteLog("TESTES", message, "ERROR");
+        }
+        finally
+        {
+            lock (_testAutomationGate)
+            {
+                if (ReferenceEquals(_testAutomationRun, runCancellation))
+                    _testAutomationRun = null;
+            }
+            runCancellation.Dispose();
+            PostBusy("testAutomationRun", false);
+        }
+    }
+
+    private void CancelTestAutomation()
+    {
+        lock (_testAutomationGate)
+        {
+            if (_testAutomationRun is null) return;
+            _testAutomationRun.Cancel();
+        }
+        PostEvent("testAutomationCanceling", new { message = "Cancelando a execução e os processos iniciados por ela..." });
+    }
+
+    private void OpenTestReport()
+    {
+        var reportPath = _testAutomationService.GetExistingReportPath();
+        if (reportPath is null)
+            throw new InvalidOperationException("Nenhum relatório Allure foi gerado ainda.");
+
+        Process.Start(new ProcessStartInfo(reportPath) { UseShellExecute = true });
     }
 
     private void SaveSmartTefSettings(JsonElement payload, bool notify)
@@ -2805,6 +3215,8 @@ public sealed class MainForm : Form
             var enriched = element.EnumerateObject().ToDictionary(x => x.Name, x => x.Value.Clone(), StringComparer.OrdinalIgnoreCase);
             enriched["serial"] = JsonSerializer.SerializeToElement(context.Job.Serial);
             enriched["friendlyName"] = JsonSerializer.SerializeToElement(context.Job.FriendlyName);
+            if (type == "smartPreparationFinished" && !enriched.ContainsKey("module"))
+                enriched["module"] = JsonSerializer.SerializeToElement("smart_pdv");
             payload = enriched;
         }
 
@@ -3098,6 +3510,10 @@ public sealed class MainForm : Form
         // Nunca bloqueia a thread da janela esperando Docker/CLI responder.
         // O encerramento do container e best-effort em segundo plano.
         try { _shutdown.Cancel(); } catch { }
+        lock (_testAutomationGate)
+        {
+            try { _testAutomationRun?.Cancel(); } catch { }
+        }
         try { _ = Task.Run(() => _dockerDbBridgeService.StopAsync(CancellationToken.None)); } catch { }
         try { _scrcpyService.Dispose(); } catch { }
         try { _selfHostDeviceService.Dispose(); } catch { }

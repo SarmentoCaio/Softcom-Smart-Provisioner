@@ -48,4 +48,29 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
   </ItemGroup>
+
+  <PropertyGroup>
+    <SelfHostBridgePublishDir>$(BaseIntermediateOutputPath)SelfHostBridge\$(Configuration)\</SelfHostBridgePublishDir>
+  </PropertyGroup>
+
+  <Target Name="PublishSelfHostBridge" BeforeTargets="Build;Publish" Condition="'$(DesignTimeBuild)' != 'true'">
+    <MSBuild
+      Projects="..\SoftcomSmartProvisioner.SelfHostBridge\SoftcomSmartProvisioner.SelfHostBridge.csproj"
+      Targets="Publish"
+      Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=true;PublishDir=$(MSBuildProjectDirectory)\$(SelfHostBridgePublishDir)" />
+  </Target>
+
+  <Target Name="CopySelfHostBridgeToOutput" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <ItemGroup>
+      <SelfHostBridgeOutput Include="$(SelfHostBridgePublishDir)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(SelfHostBridgeOutput)" DestinationFiles="@(SelfHostBridgeOutput->'$(TargetDir)SelfHostBridge\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopySelfHostBridgeToPublish" AfterTargets="Publish" DependsOnTargets="PublishSelfHostBridge" Condition="'$(DesignTimeBuild)' != 'true'">
+    <ItemGroup>
+      <SelfHostBridgePublishOutput Include="$(SelfHostBridgePublishDir)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(SelfHostBridgePublishOutput)" DestinationFiles="@(SelfHostBridgePublishOutput->'$(PublishDir)SelfHostBridge\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+  </Target>
 </Project>

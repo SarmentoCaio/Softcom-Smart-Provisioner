@@ -22,6 +22,9 @@
         <button class="nav-item active" data-page="provision">
           <span class="nav-icon">◇</span><span>Provisionar</span>
         </button>
+        <button class="nav-item" data-page="tests">
+          <span class="nav-icon">&#129514;</span><span>Testes</span>
+        </button>
         <button class="nav-item" data-page="logs">
           <span class="nav-icon">≡</span><span>Logs</span>
         </button>
@@ -56,8 +59,8 @@
           <article class="panel setup-panel">
             <div class="panel-heading">
               <div class="setup-heading-copy">
-                <span class="eyebrow">1. AMBIENTE E CLIENTE</span>
-                <h2>Softcomshop</h2>
+                <span class="eyebrow">1. RETAGUARDA E CLIENTE</span>
+                <h2 id="setup-backend-title">Softcomshop Web</h2>
                 <span class="setup-company-summary hidden" id="setup-company-summary"></span>
               </div>
               <div class="heading-actions">
@@ -66,38 +69,81 @@
               </div>
             </div>
 
-            <div class="access-mode-card access-mode-inline">
-              <span class="field-caption">Modo de acesso</span>
-              <div class="segmented access-mode" id="access-mode-switch">
-                <button class="active" data-access="online">Online</button>
-                <button data-access="docker">Docker</button>
+            <div class="backend-mode-card">
+              <span class="field-caption">Retaguarda</span>
+              <div class="segmented backend-mode" id="backend-mode-switch">
+                <button class="active" data-backend="softcomshop">Softcomshop Web</button>
+                <button data-backend="softshop">Softshop Desktop</button>
               </div>
-              <small id="access-mode-helper">Usa a sessão Web do Softcomshop.</small>
+              <small id="backend-mode-helper">Escolha onde o cliente está configurado.</small>
             </div>
 
-            <label class="field">
-              <span>Cliente</span>
-              <div class="field-row database-row">
-                <div class="database-combobox" id="database-combobox">
-                  <input id="database-input" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="database-suggestions" placeholder="Digite o nome do cliente, ex.: balerion">
-                  <div class="database-suggestions hidden" id="database-suggestions" role="listbox"></div>
+            <div id="softcomshop-client-config">
+              <div class="access-mode-card access-mode-inline">
+                <span class="field-caption">Modo de acesso</span>
+                <div class="segmented access-mode" id="access-mode-switch">
+                  <button class="active" data-access="online">Online</button>
+                  <button data-access="docker">Docker</button>
                 </div>
-                <button class="secondary" id="use-database">Usar</button>
-                <button class="secondary hidden" id="load-databases">Buscar bancos</button>
+                <small id="access-mode-helper">Usa a sessão Web do Softcomshop.</small>
               </div>
-              <small id="client-helper">Informe o nome do cliente. O Provisioner usa a sessão WEB do Softcomshop e não acessa VPN/MySQL.</small>
-            </label>
 
-            <div class="inline-actions">
-              <button class="ghost hidden" id="connect-docker">Iniciar Docker</button>
-              <button class="ghost hidden" id="connect-vpn">Conectar VPN</button>
-              <button class="ghost" id="open-client-site" disabled>Abrir Softcomshop</button>
+              <label class="field">
+                <span>Cliente</span>
+                <div class="field-row database-row">
+                  <div class="database-combobox" id="database-combobox">
+                    <input id="database-input" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="database-suggestions" placeholder="Digite o nome do cliente, ex.: balerion">
+                    <div class="database-suggestions hidden" id="database-suggestions" role="listbox"></div>
+                  </div>
+                  <button class="secondary" id="use-database">Usar</button>
+                  <button class="secondary hidden" id="load-databases">Buscar bancos</button>
+                </div>
+                <small id="client-helper">Informe o nome do cliente. O Provisioner usa a sessão WEB do Softcomshop e não acessa VPN/MySQL.</small>
+              </label>
+
+              <div class="inline-actions">
+                <button class="ghost hidden" id="connect-docker">Iniciar Docker</button>
+                <button class="ghost hidden" id="connect-vpn">Conectar VPN</button>
+                <button class="ghost" id="open-client-site" disabled>Abrir Softcomshop</button>
+              </div>
+
+              <div class="callout hidden" id="database-error"></div>
             </div>
 
-            <div class="callout hidden" id="database-error"></div>
+            <section class="selfhost-sql-config top-softshop-config hidden" id="selfhost-softshop-config">
+              <div class="selfhost-mysql-heading">
+                <div>
+                  <strong>Banco do Softshop Desktop</strong>
+                  <small>Informe a conexão SQL Server utilizada pelo SelfHost.</small>
+                </div>
+                <span class="mini-status warn" id="selfhost-sql-status">Pendente</span>
+              </div>
+              <div class="selfhost-mysql-fields">
+                <label class="field compact-field selfhost-mysql-server-field">
+                  <span>Servidor\Instância</span>
+                  <input id="selfhost-sql-server" autocomplete="off" placeholder="Ex.: SERVIDOR\INSTANCIA">
+                </label>
+                <label class="field compact-field">
+                  <span>Porta (opcional)</span>
+                  <input id="selfhost-sql-port" inputmode="numeric" autocomplete="off" placeholder="SQL Server">
+                </label>
+                <label class="field compact-field">
+                  <span>Usuário</span>
+                  <input id="selfhost-sql-user" autocomplete="off" value="sa" placeholder="Usuário SQL Server">
+                </label>
+                <label class="field compact-field">
+                  <span>Senha</span>
+                  <input id="selfhost-sql-password" type="password" autocomplete="new-password" placeholder="Senha SQL Server">
+                </label>
+                <label class="field compact-field selfhost-mysql-database-field">
+                  <span>Banco de dados</span>
+                  <input id="selfhost-sql-database" autocomplete="off" placeholder="Nome do banco Softshop">
+                </label>
+              </div>
+            </section>
           </article>
 
-          <article class="panel setup-panel">
+          <article class="panel setup-panel" id="company-setup-panel">
             <div class="panel-heading">
               <div>
                 <span class="eyebrow">2. EMPRESA</span>
@@ -152,10 +198,90 @@
             </label>
 
             <section class="selfhost-panel compact hidden" id="selfhost-config">
-              <div class="field-row compact">
-                <input id="selfhost-base-url" autocomplete="off" placeholder="SelfHost automático (opcional: http://IP:7711)">
+              <div class="selfhost-config-heading">
+                <div>
+                  <strong>Configuração do SelfHost</strong>
+                  <span class="selfhost-status" id="selfhost-status">SelfHost: verificando instalação...</span>
+                </div>
+                <div class="selfhost-heading-actions">
+                  <button type="button" class="ghost compact" id="selfhost-read-config">Ler configuração</button>
+                  <button type="button" class="secondary compact" id="selfhost-toggle-config" aria-expanded="false">Configurar</button>
+                </div>
               </div>
-              <div class="selfhost-status" id="selfhost-status">SelfHost: IP local será detectado automaticamente.</div>
+
+              <div class="selfhost-config-content hidden" id="selfhost-config-content">
+                <div class="selfhost-root-config" id="selfhost-root-config">
+                  <div id="selfhost-softcomshop-config">
+                    <div class="selfhost-device-picker">
+                      <div class="selfhost-device-picker-heading">
+                        <div>
+                          <strong>Dispositivo raiz do SelfHost</strong>
+                          <small>Dispositivo normal do Softcomshop. Cadastros SELFHOST_ são filhos.</small>
+                        </div>
+                        <button type="button" class="secondary compact-button device-add-button" id="selfhost-root-new" disabled>+ Adicionar</button>
+                      </div>
+                      <select id="selfhost-root-select" disabled>
+                        <option value="">Selecione cliente e empresa</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div class="selfhost-config-options">
+                    <label class="field compact-field">
+                      <span>Porta HTTP</span>
+                      <input id="selfhost-port" inputmode="numeric" value="7711">
+                    </label>
+                    <label class="selfhost-smart-toggle">
+                      <input type="checkbox" id="selfhost-smart-enabled" checked>
+                      <span>Smart habilitado</span>
+                    </label>
+                  </div>
+
+                  <label class="field compact-field">
+                    <span>Endereço usado pelas maquinetas</span>
+                    <input id="selfhost-base-url" autocomplete="off" placeholder="Automático (opcional: http://IP:7711)">
+                  </label>
+
+                  <section class="selfhost-mysql-config hidden" id="selfhost-mysql-config">
+                    <div class="selfhost-mysql-heading">
+                      <div>
+                        <strong>Banco de mesas da Comanda</strong>
+                        <small>Mesmos dados da tela Configuração da Comanda do Gerenciador.</small>
+                      </div>
+                      <span class="mini-status warn" id="selfhost-mysql-status">Pendente</span>
+                    </div>
+                    <div class="selfhost-mysql-fields">
+                      <label class="field compact-field selfhost-mysql-server-field">
+                        <span>Nome ou IP</span>
+                        <input id="selfhost-mysql-server" autocomplete="off" placeholder="Servidor MySQL">
+                      </label>
+                      <label class="field compact-field">
+                        <span>Porta</span>
+                        <input id="selfhost-mysql-port" inputmode="numeric" autocomplete="off" placeholder="3306">
+                      </label>
+                      <label class="field compact-field">
+                        <span>Usuário</span>
+                        <input id="selfhost-mysql-user" autocomplete="off" placeholder="Usuário MySQL">
+                      </label>
+                      <label class="field compact-field">
+                        <span>Senha</span>
+                        <input id="selfhost-mysql-password" type="password" autocomplete="new-password" placeholder="Senha MySQL">
+                      </label>
+                      <label class="field compact-field selfhost-mysql-database-field">
+                        <span>Banco de dados</span>
+                        <input id="selfhost-mysql-database" autocomplete="off" placeholder="Nome do banco de mesas">
+                      </label>
+                    </div>
+                  </section>
+
+                  <div class="selfhost-config-summary hidden" id="selfhost-config-summary"></div>
+                  <div class="inline-error-message hidden" id="selfhost-config-error" role="alert"></div>
+                  <div class="inline-actions selfhost-config-actions">
+                    <button type="button" class="secondary" id="selfhost-preview-config" disabled>Pré-visualizar</button>
+                    <button type="button" class="primary" id="selfhost-apply-config" disabled>Configurar SelfHost</button>
+                  </div>
+                </div>
+              </div>
             </section>
 
             <div id="standard-device-config">
@@ -192,7 +318,7 @@
               <div id="existing-device-fields">
                 <label class="field">
                   <span id="device-source-label">Dispositivo Softcomshop</span>
-                  <div class="device-select-row">
+                  <div class="device-select-row provision-device-select-row">
                     <div class="database-combobox device-combobox" id="oauth-combobox">
                       <input id="oauth-input" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="oauth-suggestions" placeholder="Digite o nome do dispositivo" disabled>
                       <div class="database-suggestions hidden" id="oauth-suggestions" role="listbox"></div>
@@ -200,7 +326,7 @@
                         <option value="">Selecione empresa primeiro</option>
                       </select>
                     </div>
-                    <button type="button" class="secondary compact-button hidden" id="selfhost-new-device">+ Novo</button>
+                    <button type="button" class="secondary compact-button device-add-button hidden" id="selfhost-new-device">+ Adicionar</button>
                   </div>
                 </label>
 
@@ -386,6 +512,80 @@
           </div>
 
         </article>
+      </section>
+
+      <section class="page" id="page-tests">
+        <div class="section-heading test-page-heading">
+          <div>
+            <span class="eyebrow">AUTOMAÇÃO</span>
+            <h2>Testes do Smart</h2>
+            <p>Execute as suítes Robot Framework no Android conectado e acompanhe o resultado pelo Allure.</p>
+          </div>
+          <button class="secondary" id="refresh-test-automation">Atualizar catálogo</button>
+        </div>
+
+        <div class="test-prerequisites" id="test-prerequisites">
+          <span class="test-check pending">Projeto</span>
+          <span class="test-check pending">Ambiente</span>
+          <span class="test-check pending">uv</span>
+          <span class="test-check pending">Appium</span>
+        </div>
+
+        <div class="grid two test-setup-grid">
+          <article class="panel">
+            <div class="panel-heading">
+              <div><span class="eyebrow">1. DISPOSITIVO</span><h2>Maquineta para o teste</h2></div>
+              <span class="mini-status" id="test-device-status">Aguardando</span>
+            </div>
+            <label class="field">
+              <span>Android conectado</span>
+              <select id="test-device"><option value="">Selecione um dispositivo</option></select>
+              <small>O perfil é relacionado ao UDID; o modelo Android aparece apenas como complemento.</small>
+            </label>
+            <label class="field hidden" id="test-device-tag-field">
+              <span>Perfil da automação</span>
+              <select id="test-device-tag"><option value="">Selecione o perfil</option></select>
+              <small id="test-device-tag-help">Selecione manualmente quando o mesmo UDID estiver duplicado no catálogo.</small>
+            </label>
+            <div class="test-device-details" id="test-device-details">Nenhum Android selecionado.</div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div><span class="eyebrow">2. CENÁRIO</span><h2>Suíte e caso de teste</h2></div>
+              <span class="mini-status" id="test-suite-count">0 suítes</span>
+            </div>
+            <label class="field">
+              <span>Módulo</span>
+              <select id="test-suite"><option value="">Selecione uma suíte</option></select>
+            </label>
+            <label class="field">
+              <span>Caso</span>
+              <select id="test-case" disabled><option value="">Todos os casos da suíte</option></select>
+            </label>
+            <label class="field">
+              <span>Filtro por tag (opcional)</span>
+              <select id="test-include-tag" disabled><option value="">Sem filtro — executar a seleção acima</option></select>
+              <small>Somente tags realmente existentes na suíte selecionada são exibidas.</small>
+            </label>
+          </article>
+        </div>
+
+        <article class="panel test-run-panel">
+          <div class="test-run-copy">
+            <span class="eyebrow">3. EXECUÇÃO</span>
+            <h2 id="test-run-title">Pronto para configurar</h2>
+            <p id="test-run-message">Selecione um Android e uma suíte. Os testes podem criar ou alterar dados no ambiente selecionado pela automação.</p>
+          </div>
+          <div class="test-run-actions">
+            <button class="danger-soft hidden" id="cancel-test-automation">Cancelar</button>
+            <button class="secondary hidden" id="open-test-report">Abrir relatório</button>
+            <button class="primary big" id="run-test-automation" disabled>Executar testes</button>
+          </div>
+          <pre class="test-run-summary hidden" id="test-run-summary"></pre>
+        </article>
+
+        <div class="inline-error hidden" id="test-automation-error"></div>
       </section>
 
       <section class="page" id="page-logs">
@@ -609,6 +809,28 @@
       <div class="inline-actions modal-actions">
         <button type="button" class="secondary" id="selfhost-create-cancel">Cancelar</button>
         <button type="button" class="primary" id="selfhost-create-confirm">Criar</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="selfhost-root-create-modal" role="dialog" aria-modal="true" aria-labelledby="selfhost-root-create-title">
+    <div class="modal-card compact-modal">
+      <div class="modal-heading">
+        <div>
+          <span class="eyebrow">SELFHOST</span>
+          <h3 id="selfhost-root-create-title">Novo dispositivo raiz</h3>
+        </div>
+        <button type="button" class="icon-button" id="selfhost-root-create-close" aria-label="Fechar">×</button>
+      </div>
+      <label class="field">
+        <span>Nome</span>
+        <input id="selfhost-root-create-name" autocomplete="off" placeholder="Ex.: SELFHOST LOJA CENTRO">
+      </label>
+      <div class="inline-error-message hidden" id="selfhost-root-create-error" role="alert"></div>
+      <small class="modal-helper">Este é o dispositivo raiz usado pelo próprio SelfHost. O prefixo SELFHOST_ fica reservado aos dispositivos filhos.</small>
+      <div class="inline-actions modal-actions">
+        <button type="button" class="secondary" id="selfhost-root-create-cancel">Cancelar</button>
+        <button type="button" class="primary" id="selfhost-root-create-confirm">Criar</button>
       </div>
     </div>
   </div>

@@ -60,11 +60,13 @@ public sealed class SelfHostDeviceService : IDisposable
         var modernSettings = File.Exists(Path.Combine(installPath, "binaries", "appsettings.json"));
         var modern = modernDb || modernSettings;
 
-        var description = legacy
-            ? "Config2.json (SelfHost 4.0)"
-            : modern
+        var description = generation == "SelfHost 4.0"
+            ? (legacy
+                ? "Config.json / Config2.json (SelfHost 4.0)"
+                : "Configuracao 4.0 ainda nao gerada (Config.json / Config2.json)")
+            : (modern
                 ? "selfhost-config.db / binaries\\appsettings.json (SelfHost 4.1+)"
-                : "Configuracao nao localizada";
+                : "Configuracao 4.1+ nao localizada");
 
         return new SelfHostInstallationInfo(true, version, generation, installPath, legacy, modern, description);
     }

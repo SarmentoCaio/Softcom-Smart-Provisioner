@@ -158,6 +158,32 @@ public sealed class SmartUiAutomationService
 
         await Task.Delay(1800, cancellationToken);
 
+        // O onboarding do Smart 8.1+ no K2 e uma interface Compose completamente
+        // diferente do fluxo legado 8.0. Nesta ROM Android 7, `uiautomator dump`
+        // retira a AuthActivity do primeiro plano e devolve o terminal ao launcher.
+        // A decisao precisa ocorrer ANTES da primeira leitura da arvore Android.
+        var smart81SdkLevel = !isLegacySmart
+            ? await GetAndroidSdkLevelAsync(serial, cancellationToken)
+            : 0;
+        if (ShouldUseSmart81K2OnboardingFlow(
+                smartFlow,
+                smart81SdkLevel,
+                module,
+                provisioningProfile,
+                packageName,
+                clearData))
+        {
+            return await SubmitDeviceUrlSmart81K2OnboardingAsync(
+                serial,
+                url,
+                module,
+                packageName,
+                confirmedSmartDeviceId,
+                progress,
+                beforeSubmitAsync,
+                cancellationToken);
+        }
+
         // Smart 8.0 / Android 7: o mapeamento real do K2_MINI mostrou que
         // `uiautomator dump` falha na LoginActivity com "ERROR: could not get idle state".
         // Portanto NUNCA lemos a arvore de acessibilidade enquanto essa Activity estiver
@@ -713,9 +739,10 @@ public sealed class SmartUiAutomationService
                 BuildSummary(snapshot.Nodes), string.Empty);
         }
 
-        // Fecha o teclado para garantir que o botao Confirmar fique acessivel.
+        // Fecha apenas o teclado realmente visivel. Em alguns K2/Android 7 o ADB consegue
+        // preencher o EditText sem abrir o IME; enviar BACK nesse estado fecha o Smart.
         await Task.Delay(350, cancellationToken);
-        await _adb.KeyEventAsync(serial, "KEYCODE_BACK", cancellationToken);
+        await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
         await Task.Delay(350, cancellationToken);
 
         snapshot = await ReadUiAsync(serial, cancellationToken);
@@ -836,6 +863,214 @@ public sealed class SmartUiAutomationService
             finalSnapshot.Success ? BuildSummary(finalSnapshot.Nodes) : string.Empty,
             smartDeviceId);
     }
+
+    private async Task<SmartAutomationResult> SubmitDeviceUrlSmart81K2OnboardingAsync(
+        string serial,
+        string url,
+        string module,
+        string packageName,
+        string? confirmedSmartDeviceId,
+        Action<string, string>? progress,
+        Func<string, Task>? beforeSubmitAsync,
+        CancellationToken cancellationToken)
+    {
+        progress?.Invoke(
+            "smart81-k2",
+            "Smart 8.1+ no K2/Android 7 detectado. Usando a rota propria Bem-vindo -> Modulo -> URL, sem UIAutomator.");
+
+        var display = await GetAndroidDisplaySizeAsync(serial, cancellationToken);
+        if (!display.Success)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-k2-display",
+                display.Message,
+                string.Empty,
+                string.Empty);
+        }
+
+        var activity = await WaitForForegroundActivityAsync(
+            serial,
+            current => IsSmart81AuthActivity(current, packageName),
+            20,
+            cancellationToken);
+        if (!IsSmart81AuthActivity(activity, packageName))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-k2-launch",
+                string.IsNullOrWhiteSpace(activity)
+                    ? "O Smart 8.1+ foi aberto, mas a AuthActivity nao estabilizou no K2."
+                    : $"O Smart 8.1+ foi aberto, mas outra tela ficou em primeiro plano: {activity}.",
+                activity,
+                string.Empty);
+        }
+
+        var scaler = new ReferenceScaler(display.Width, display.Height, 1080, 1920);
+        var (startX, startY) = scaler.Scale(540, 763);
+        progress?.Invoke("smart81-k2-start", "Abrindo a configuracao inicial propria do Smart 8.1+...");
+        var start = await _adb.TapAsync(serial, startX, startY, cancellationToken);
+        if (!start.Success)
+        {
+            return BuildSmart81K2AdbFailure(packageName, "smart81-k2-start", "Iniciar Configuracao", start, activity);
+        }
+
+        await Task.Delay(900, cancellationToken);
+        activity = await GetForegroundActivityAsync(serial, cancellationToken);
+        if (!IsSmart81AuthActivity(activity, packageName))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-k2-module",
+                $"O Smart 8.1+ deixou a AuthActivity antes da selecao do modulo. Activity atual: {activity}.",
+                activity,
+                string.Empty);
+        }
+
+        var moduleReferenceY = GetSmart81K2ModuleReferenceY(module);
+        if (moduleReferenceY <= 0)
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-k2-module",
+                $"O modulo '{module}' ainda nao possui ponto mapeado na selecao do Smart 8.1+ do K2.",
+                activity,
+                string.Empty);
+        }
+
+        var (moduleX, moduleY) = scaler.Scale(1014, moduleReferenceY);
+        progress?.Invoke("smart81-k2-module", $"Selecionando {GetModuleLabel(module)} na tela propria do Smart 8.1+...");
+        var selectModule = await _adb.TapAsync(serial, moduleX, moduleY, cancellationToken);
+        if (!selectModule.Success)
+        {
+            return BuildSmart81K2AdbFailure(packageName, "smart81-k2-module", GetModuleLabel(module), selectModule, activity);
+        }
+
+        await Task.Delay(450, cancellationToken);
+        var (advanceX, advanceY) = scaler.Scale(540, 1808);
+        progress?.Invoke("smart81-k2-advance", "Avancando para a tela de URL do Smart 8.1+...");
+        var advance = await _adb.TapAsync(serial, advanceX, advanceY, cancellationToken);
+        if (!advance.Success)
+        {
+            return BuildSmart81K2AdbFailure(packageName, "smart81-k2-advance", "Avancar", advance, activity);
+        }
+
+        await Task.Delay(1000, cancellationToken);
+        activity = await GetForegroundActivityAsync(serial, cancellationToken);
+        if (!IsSmart81AuthActivity(activity, packageName))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-k2-url",
+                $"O Smart 8.1+ nao permaneceu na AuthActivity ao abrir a configuracao de {GetModuleLabel(module)}. Activity atual: {activity}.",
+                activity,
+                string.Empty);
+        }
+
+        // No Android 7 deste K2, o Device ID exibido pelo Smart coincide com o
+        // ANDROID_ID do aparelho. Esse fallback ja e usado e validado no fluxo 8.0
+        // apenas para SDK <= 25; nao e aplicado a Androids modernos.
+        var smartDeviceId = FirstNonEmpty(
+            confirmedSmartDeviceId?.Trim() ?? string.Empty,
+            await GetAndroidIdFallbackAsync(serial, cancellationToken));
+        if (beforeSubmitAsync is not null)
+        {
+            if (string.IsNullOrWhiteSpace(smartDeviceId))
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "smart81-k2-device-id",
+                    "A tela de configuracao do Smart 8.1+ abriu, mas o Device ID do K2 nao pode ser obtido com seguranca.",
+                    activity,
+                    string.Empty);
+            }
+
+            await beforeSubmitAsync(smartDeviceId);
+        }
+
+        var (urlX, urlY) = scaler.Scale(540, 640);
+        progress?.Invoke("smart81-k2-url", "Informando a URL na tela propria do Smart 8.1+...");
+        var focusUrl = await _adb.TapAsync(serial, urlX, urlY, cancellationToken);
+        if (!focusUrl.Success)
+        {
+            return BuildSmart81K2AdbFailure(packageName, "smart81-k2-url", "campo Digite a URL", focusUrl, activity, smartDeviceId);
+        }
+
+        await Task.Delay(250, cancellationToken);
+        var clear = await _adb.ClearFocusedTextAsync(serial, 128, cancellationToken);
+        if (!clear.Success)
+        {
+            return BuildSmart81K2AdbFailure(packageName, "smart81-k2-url", "limpeza do campo URL", clear, activity, smartDeviceId);
+        }
+
+        var input = await _adb.InputTextAsync(serial, url, cancellationToken);
+        if (!input.Success)
+        {
+            return BuildSmart81K2AdbFailure(packageName, "smart81-k2-url", "preenchimento da URL", input, activity, smartDeviceId);
+        }
+
+        await Task.Delay(350, cancellationToken);
+        await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
+        await Task.Delay(450, cancellationToken);
+
+        activity = await GetForegroundActivityAsync(serial, cancellationToken);
+        if (!IsSmart81AuthActivity(activity, packageName))
+        {
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "smart81-k2-confirm",
+                $"A URL foi informada, mas o Smart 8.1+ deixou a AuthActivity antes da confirmacao. Activity atual: {activity}.",
+                activity,
+                smartDeviceId);
+        }
+
+        var (confirmX, confirmY) = scaler.Scale(540, 1808);
+        progress?.Invoke("smart81-k2-confirm", "Confirmando a URL no fluxo inicial do Smart 8.1+...");
+        var confirm = await _adb.TapAsync(serial, confirmX, confirmY, cancellationToken);
+        if (!confirm.Success)
+        {
+            return BuildSmart81K2AdbFailure(packageName, "smart81-k2-confirm", "Confirmar", confirm, activity, smartDeviceId);
+        }
+
+        // Nao consulta UIAutomator durante sincronizacao no K2. O chamador valida o
+        // vinculo pelo SelfHost/Softcomshop e somente depois fecha o OK por uma unica
+        // acao controlada em DismissConfirmedSynchronizationAsync.
+        await Task.Delay(1800, cancellationToken);
+        progress?.Invoke(
+            "smart81-k2-sync-pending",
+            "URL confirmada no Smart 8.1+ do K2. Aguardando a confirmacao remota do Device ID, sem ler a arvore Android.");
+        return new SmartAutomationResult(
+            true,
+            packageName,
+            "smart81-k2-sync-pending",
+            "A configuracao do Smart 8.1+ foi enviada; o vinculo sera confirmado remotamente antes de finalizar.",
+            activity,
+            smartDeviceId);
+    }
+
+    private static SmartAutomationResult BuildSmart81K2AdbFailure(
+        string packageName,
+        string stage,
+        string operation,
+        ProcessResult result,
+        string activity,
+        string smartDeviceId = "") =>
+        new(
+            false,
+            packageName,
+            stage,
+            string.IsNullOrWhiteSpace(result.CombinedOutput)
+                ? $"O ADB nao conseguiu executar: {operation}."
+                : result.CombinedOutput.Trim(),
+            activity,
+            smartDeviceId);
 
     private async Task<SmartAutomationResult> SubmitDeviceUrlLegacy80Async(
         string serial,
@@ -2184,6 +2419,69 @@ public sealed class SmartUiAutomationService
             return false;
         }
 
+        // O sucesso do Smart 8.1 no K2 e um dialogo Compose dentro da AuthActivity.
+        // Ele nao usa o AlertDialog/resource-id do Smart 8.0 e o UIAutomator e instavel
+        // nesta ROM. O WindowManager expoe uma segunda janela do package enquanto o
+        // modal esta aberto, permitindo validar o estado antes de tocar no OK.
+        var installedVersion = await _adb.GetPackageVersionNameAsync(
+            serial,
+            packageName,
+            cancellationToken);
+        var sdkLevel = await GetAndroidSdkLevelAsync(serial, cancellationToken);
+        var foreground = await GetForegroundActivityAsync(serial, cancellationToken);
+        var smart81K2Dialog =
+            string.Equals(AdbService.ClassifySmartFlow(installedVersion), "Smart 8.1+", StringComparison.OrdinalIgnoreCase) &&
+            sdkLevel is > 0 and <= 25 &&
+            IsLegacy80LargeSelfServiceModule(module) &&
+            IsSmart81AuthActivity(foreground, packageName);
+
+        if (smart81K2Dialog)
+        {
+            var dialogReady = false;
+            for (var attempt = 0; attempt < 30; attempt++)
+            {
+                var windows = await _adb.ShellAsync(
+                    serial,
+                    "dumpsys window windows",
+                    cancellationToken,
+                    8000);
+                if (windows.Success && HasAdditionalWindowForPackage(windows.CombinedOutput, packageName))
+                {
+                    dialogReady = true;
+                    break;
+                }
+
+                await Task.Delay(500, cancellationToken);
+            }
+
+            if (!dialogReady)
+            {
+                progress?.Invoke(
+                    "smart81-k2-sync-ok-wait",
+                    "O vinculo foi confirmado, mas o modal final do Smart 8.1+ ainda nao foi exposto pelo WindowManager. Nenhum toque foi enviado fora de hora.");
+                return false;
+            }
+
+            var (okX, okY) = GetSmart81K2SynchronizationOkPoint(display.Width, display.Height);
+            progress?.Invoke(
+                "smart81-k2-sync-ok",
+                $"Atualizacao concluida no Smart 8.1+. Acionando OK em {okX},{okY}, sem UIAutomator...");
+            var tap = await _adb.TapAsync(serial, okX, okY, cancellationToken);
+            if (!tap.Success)
+            {
+                return false;
+            }
+
+            await Task.Delay(900, cancellationToken);
+            var afterTap = await _adb.ShellAsync(
+                serial,
+                "dumpsys window windows",
+                cancellationToken,
+                8000);
+            return afterTap.Success &&
+                   !HasAdditionalWindowForPackage(afterTap.CombinedOutput, packageName);
+        }
+
         // No K2 (Android 7), consultar o UIAutomator enquanto o dialogo final esta
         // visivel pode fazer o Smart recuar para a selecao de modulo antes do toque.
         // Como este metodo so e chamado depois da confirmacao autoritativa do vinculo,
@@ -2385,6 +2683,27 @@ public sealed class SmartUiAutomationService
             Math.Clamp((int)Math.Round(width * (832d / 1080d)), 1, Math.Max(1, width - 1)),
             Math.Clamp((int)Math.Round(height * (1020d / 1920d)), 1, Math.Max(1, height - 1))
         );
+
+    private static (int X, int Y) GetSmart81K2SynchronizationOkPoint(int width, int height) =>
+        (
+            Math.Clamp((int)Math.Round(width * (540d / 1080d)), 1, Math.Max(1, width - 1)),
+            Math.Clamp((int)Math.Round(height * (1089d / 1920d)), 1, Math.Max(1, height - 1))
+        );
+
+    private static bool HasAdditionalWindowForPackage(string? windowDump, string? packageName)
+    {
+        if (string.IsNullOrWhiteSpace(windowDump) || string.IsNullOrWhiteSpace(packageName))
+        {
+            return false;
+        }
+
+        var count = windowDump
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Count(line =>
+                line.Contains("Window #", StringComparison.OrdinalIgnoreCase) &&
+                line.Contains(packageName, StringComparison.OrdinalIgnoreCase));
+        return count >= 2;
+    }
 
     private static bool HasAdditionalWindowForActivity(string? windowDump, string? activity)
     {
@@ -3068,6 +3387,13 @@ public sealed class SmartUiAutomationService
         progress?.Invoke("package", "Identificando o package do Smart TEF neste dispositivo...");
         var packageName = await ResolveTefPackageAsync(serial, configuredPackage, cancellationToken);
         progress?.Invoke("package", $"Package TEF validado para este job: {packageName}.");
+        var smartVersion = await _adb.GetPackageVersionNameAsync(serial, packageName, cancellationToken);
+        var smartFlow = AdbService.ClassifySmartFlow(smartVersion);
+        progress?.Invoke(
+            "smart-version",
+            string.IsNullOrWhiteSpace(smartVersion)
+                ? "Versao do Smart TEF nao identificada; a rota sera validada pela Activity atual."
+                : $"Smart TEF {smartVersion} detectado. Perfil de interface: {smartFlow}.");
 
         if (clearData)
         {
@@ -3104,11 +3430,11 @@ public sealed class SmartUiAutomationService
             await Task.Delay(500, cancellationToken);
         }
 
-        // O fluxo por Activity/resource-id pertence ao Smart 8.0 oficial e nao ao
-        // perfil do Mercado Pago. O perfil altera somente layout/coordenadas. Assim
-        // Stone/L400 e outras variantes softcom.mobile.smart* percorrem suas proprias
-        // Activities sem herdar o layout especial do N950.
-        var useActivityNavigation = IsActivityBasedSmartTefPackage(packageName);
+        // O fluxo por LoginActivity -> EmpresaActivity -> TefSetupActivity pertence
+        // somente ao Smart legado. O Smart 8.1 usa AuthActivity e onboarding Compose:
+        // Bem-vindo -> selecao Smart TEF -> Avancar -> configuracao. O package pode ser
+        // o mesmo nas duas versoes, portanto ele sozinho nunca decide a rota.
+        var useActivityNavigation = ShouldUseActivityBasedSmartTefNavigation(packageName, smartFlow);
         if (useActivityNavigation)
         {
             progress?.Invoke(
@@ -3552,7 +3878,7 @@ public sealed class SmartUiAutomationService
                 string.Empty);
         }
 
-        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        if (!await IsExpectedSmartTefActivityAsync(serial, packageName, layout, cancellationToken))
         {
             return new TefDirectResult(
                 false,
@@ -3628,7 +3954,7 @@ public sealed class SmartUiAutomationService
         await Task.Delay(250, cancellationToken);
 
         progress?.Invoke("tef-manual", "Abrindo Digitar dados manualmente...");
-        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        if (!await IsExpectedSmartTefActivityAsync(serial, packageName, layout, cancellationToken))
         {
             return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes de abrir os dados manuais.", string.Empty);
         }
@@ -3660,7 +3986,7 @@ public sealed class SmartUiAutomationService
         // POS nao disponibiliza temporariamente a arvore de acessibilidade.
         progress?.Invoke("tef-cnpj", "Informando CNPJ do Smart TEF...");
         await NormalizeSmartTefManualScrollAsync(serial, layout, cancellationToken);
-        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        if (!await IsExpectedSmartTefActivityAsync(serial, packageName, layout, cancellationToken))
         {
             return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes do preenchimento do CNPJ.", string.Empty);
         }
@@ -3680,7 +4006,7 @@ public sealed class SmartUiAutomationService
 
         progress?.Invoke("tef-company", "Informando Empresa ID do Smart TEF...");
         await NormalizeSmartTefManualScrollAsync(serial, layout, cancellationToken);
-        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        if (!await IsExpectedSmartTefActivityAsync(serial, packageName, layout, cancellationToken))
         {
             return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes do preenchimento da Empresa ID.", string.Empty);
         }
@@ -3700,7 +4026,7 @@ public sealed class SmartUiAutomationService
 
         progress?.Invoke("tef-token", "Informando token do Smart TEF...");
         await NormalizeSmartTefManualScrollAsync(serial, layout, cancellationToken);
-        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        if (!await IsExpectedSmartTefActivityAsync(serial, packageName, layout, cancellationToken))
         {
             return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes do preenchimento do Token.", string.Empty);
         }
@@ -3721,7 +4047,7 @@ public sealed class SmartUiAutomationService
         await Task.Delay(300, cancellationToken);
 
         progress?.Invoke("tef-submit", "Confirmando a configuracao do Smart TEF...");
-        if (!await IsExpectedSmartTefActivityAsync(serial, layout, cancellationToken))
+        if (!await IsExpectedSmartTefActivityAsync(serial, packageName, layout, cancellationToken))
         {
             return new TefDirectResult(false, "tef-activity", "A tela de configuracao TEF foi fechada antes da confirmacao.", string.Empty);
         }
@@ -3784,7 +4110,7 @@ public sealed class SmartUiAutomationService
                     {
                         return new TefDirectResult(true, "tef-concluded", string.Empty, beforeTapActivity);
                     }
-                    if (!IsSmartTefSetupActivity(beforeTapActivity))
+                    if (!IsExpectedSmartTefActivity(beforeTapActivity, packageName))
                     {
                         return new TefDirectResult(
                             false,
@@ -3851,7 +4177,7 @@ public sealed class SmartUiAutomationService
                     {
                         return new TefDirectResult(true, "tef-concluded", string.Empty, afterTapActivity);
                     }
-                    if (!IsSmartTefSetupActivity(afterTapActivity))
+                    if (!IsExpectedSmartTefActivity(afterTapActivity, packageName))
                     {
                         return new TefDirectResult(
                             false,
@@ -4207,6 +4533,7 @@ public sealed class SmartUiAutomationService
 
     private async Task<bool> IsExpectedSmartTefActivityAsync(
         string serial,
+        string packageName,
         SmartTefLayout layout,
         CancellationToken cancellationToken)
     {
@@ -4216,7 +4543,7 @@ public sealed class SmartUiAutomationService
         }
 
         var activity = await GetLegacySmartActivityAsync(serial, cancellationToken);
-        return IsSmartTefSetupActivity(activity);
+        return IsExpectedSmartTefActivity(activity, packageName);
     }
 
     private async Task<string> GetForegroundActivityAsync(
@@ -4653,6 +4980,49 @@ public sealed class SmartUiAutomationService
         string.Equals(module, "smart_totem", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(module, "smart_autopagamento", StringComparison.OrdinalIgnoreCase);
 
+    private static bool ShouldUseSmart81K2OnboardingFlow(
+        string? smartFlow,
+        int sdkLevel,
+        string? module,
+        string? provisioningProfile,
+        string? packageName,
+        bool clearData)
+    {
+        if (!clearData ||
+            !string.Equals(smartFlow, "Smart 8.1+", StringComparison.OrdinalIgnoreCase) ||
+            sdkLevel > 25 ||
+            !IsLegacy80LargeSelfServiceModule(module))
+        {
+            return false;
+        }
+
+        // O catalogo e a fonte primaria. O package .redeflex e mantido como fallback
+        // porque algumas instalacoes antigas do catalogo ainda nao possuem TOTEM_K2_UDID.
+        return string.Equals(provisioningProfile?.Trim(), "totemk2", StringComparison.OrdinalIgnoreCase) ||
+               (!string.IsNullOrWhiteSpace(packageName) &&
+                packageName.Contains("redeflex", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsSmart81AuthActivity(string? activity, string packageName) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        activity.Contains(packageName + "/", StringComparison.OrdinalIgnoreCase) &&
+        activity.EndsWith(
+            "softcom.mobile.smart.views.activities.loginnew.AuthActivity",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static int GetSmart81K2ModuleReferenceY(string? module) =>
+        (module ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "smart_pdv" => 239,
+            "smart_comanda" => 335,
+            "smart_pre_venda" => 431,
+            "smart_tef" => 527,
+            "smart_minimercado" => 623,
+            "smart_totem" => 719,
+            "smart_autopagamento" => 815,
+            _ => 0
+        };
+
     private static bool ShouldPreserveLegacy80Keyboard(string? provisioningProfile) =>
         IsMercadoPagoN950Profile(provisioningProfile);
 
@@ -4665,6 +5035,16 @@ public sealed class SmartUiAutomationService
     private static bool IsActivityBasedSmartTefPackage(string? packageName) =>
         !string.IsNullOrWhiteSpace(packageName) &&
         packageName.Trim().StartsWith("softcom.mobile.smart", StringComparison.OrdinalIgnoreCase);
+
+    private static bool ShouldUseActivityBasedSmartTefNavigation(
+        string? packageName,
+        string? smartFlow) =>
+        IsActivityBasedSmartTefPackage(packageName) &&
+        !string.Equals(smartFlow, "Smart 8.1+", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsExpectedSmartTefActivity(string? activity, string packageName) =>
+        !string.IsNullOrWhiteSpace(activity) &&
+        (IsSmartTefSetupActivity(activity) || IsSmart81AuthActivity(activity, packageName));
 
     private static string GetLegacy80ModuleResourceId(string module) =>
         (module ?? string.Empty).Trim().ToLowerInvariant() switch
@@ -5098,7 +5478,7 @@ public sealed class SmartUiAutomationService
         // Isso evita falhas desnecessarias ao reaproveitar uma configuracao parcial.
         if (string.Equals(field.Text?.Trim(), value?.Trim(), StringComparison.Ordinal))
         {
-            await _adb.KeyEventAsync(serial, "KEYCODE_BACK", cancellationToken);
+            await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
             await Task.Delay(180, cancellationToken);
             return new FieldFillResult(true, string.Empty, BuildSummary(snapshot.Nodes));
         }
@@ -5137,7 +5517,7 @@ public sealed class SmartUiAutomationService
         }
 
         await Task.Delay(180, cancellationToken);
-        await _adb.KeyEventAsync(serial, "KEYCODE_BACK", cancellationToken);
+        await _adb.HideSoftKeyboardIfVisibleAsync(serial, cancellationToken);
         await Task.Delay(250, cancellationToken);
         return new FieldFillResult(true, string.Empty, BuildSummary(snapshot.Nodes));
     }
@@ -5147,24 +5527,33 @@ public sealed class SmartUiAutomationService
         string? configuredPackage,
         CancellationToken cancellationToken)
     {
-        if (!string.IsNullOrWhiteSpace(configuredPackage) &&
-            !configuredPackage.Contains("redeflex", StringComparison.OrdinalIgnoreCase) &&
-            await _adb.IsPackageInstalledAsync(serial, configuredPackage, cancellationToken))
-        {
-            return configuredPackage.Trim();
-        }
+        var configuredPackageInstalled = !string.IsNullOrWhiteSpace(configuredPackage) &&
+                                         await _adb.IsPackageInstalledAsync(
+                                             serial,
+                                             configuredPackage,
+                                             cancellationToken);
 
         var detection = await _adb.DetectSmartPackageAsync(serial, cancellationToken);
-        if (!string.IsNullOrWhiteSpace(detection.PackageName) &&
-            !detection.PackageName.Contains("redeflex", StringComparison.OrdinalIgnoreCase))
-        {
-            return detection.PackageName;
-        }
+        return SelectProvisioningPackage(configuredPackage, configuredPackageInstalled, detection);
+    }
 
-        // SubmitDeviceUrl configura o Smart padrao. A variante RedeFlex possui fluxo
-        // dedicado e nao pode ser escolhida como fallback apenas por estar em foreground.
+    private static string SelectProvisioningPackage(
+        string? configuredPackage,
+        bool configuredPackageInstalled,
+        SmartPackageDetection detection)
+    {
+        // O mesmo identificador .redeflex e usado tanto pelo fluxo TEF quanto por builds
+        // normais do Smart 8.1 em alguns terminais (por exemplo, o K2). A decisao do fluxo
+        // continua sendo feita pelo modulo selecionado; o sufixo do package nao o torna TEF.
+        if (configuredPackageInstalled && !string.IsNullOrWhiteSpace(configuredPackage))
+            return configuredPackage.Trim();
+
+        if (!string.IsNullOrWhiteSpace(detection.PackageName))
+            return detection.PackageName.Trim();
+
         var candidates = detection.Candidates
-            .Where(x => !x.Contains("redeflex", StringComparison.OrdinalIgnoreCase))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(AdbService.SmartPackageScore)
             .ThenBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
