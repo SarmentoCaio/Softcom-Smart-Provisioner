@@ -521,7 +521,18 @@
             <h2>Testes do Smart</h2>
             <p>Execute as suítes Robot Framework no Android conectado e acompanhe o resultado pelo Allure.</p>
           </div>
-          <button class="secondary" id="refresh-test-automation">Atualizar catálogo</button>
+          <div class="test-source-toolbar">
+            <label class="test-source-field">
+              <span>Fonte dos testes</span>
+              <select id="test-automation-channel">
+                <option value="master">Estável (master)</option>
+                <option value="dev">DEV (experimental)</option>
+              </select>
+              <small id="test-automation-version">Verificando branch...</small>
+            </label>
+            <button class="secondary" id="update-test-automation-source">Aplicar e atualizar</button>
+            <button class="ghost" id="refresh-test-automation">Atualizar catálogo</button>
+          </div>
         </div>
 
         <div class="test-prerequisites" id="test-prerequisites">

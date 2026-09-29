@@ -65,6 +65,37 @@ public sealed class AdbServiceTests
         Assert.Equal("input touchscreen swipe 532 852 533 852 5000", command);
     }
 
+    [Fact]
+    public void InputTextEscapesDeviceUrlQueryForAndroidShell()
+    {
+        var command = AdbService.BuildInputTextCommand(
+            "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=abc&key=a%20b");
+
+        Assert.Equal(
+            "input text https://cliente.meusoftcom.com.br/softauth/device/add\\?client_id=abc\\&key=a%20b",
+            command);
+        Assert.DoesNotContain("'", command);
+    }
+
+    [Fact]
+    public void InputTextEscapesAllSeparatorsAndKeepsSpacesCompatibleWithAndroidInput()
+    {
+        var command = AdbService.BuildInputTextCommand("a b&c|d;e$(f)?g");
+
+        Assert.Equal("input text a%sb\\&c\\|d\\;e\\$\\(f\\)\\?g", command);
+    }
+
+    [Fact]
+    public void N950QuotedInputPreservesTheCompleteUrlAsOneShellArgument()
+    {
+        const string value = "https://balerion.meusoftcom.com.br/softauth/device/add?client_id=abc&key=def";
+
+        var command = AdbService.BuildQuotedInputTextCommand(value);
+
+        Assert.Equal("input text 'https://balerion.meusoftcom.com.br/softauth/device/add?client_id=abc&key=def'", command);
+        Assert.DoesNotContain("\\&", command, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData("mShowRequested=true mInputShown=true mWindowVisible=false mIsInputViewShown=false", false)]
     [InlineData("mShowRequested=false mInputShown=false mWindowVisible=false mIsInputViewShown=true", false)]

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
@@ -726,7 +727,18 @@ public sealed class SmartUiAutomationService
 
         // O campo vem vazio no fluxo inicial. Limpar antes evita concatenacao ao reutilizar a tela.
         await _adb.KeyEventAsync(serial, "KEYCODE_MOVE_END", cancellationToken);
-        var input = await _adb.InputTextAsync(serial, url, cancellationToken);
+        var useN950QuotedInput = ShouldUseQuotedDeviceLinkInput(provisioningProfile);
+        if (useN950QuotedInput)
+        {
+            progress?.Invoke(
+                "input-n950",
+                "Mercado Pago N950 detectado. Usando a digitação única protegida que concluiu os últimos provisionamentos válidos; " +
+                BuildSafeDeviceLinkDescriptor(url));
+        }
+
+        var input = useN950QuotedInput
+            ? await _adb.InputQuotedTextAsync(serial, url, cancellationToken)
+            : await _adb.InputTextAsync(serial, url, cancellationToken);
         if (!input.Success)
         {
             return new SmartAutomationResult(
@@ -749,6 +761,33 @@ public sealed class SmartUiAutomationService
         if (!snapshot.Success)
         {
             return new SmartAutomationResult(false, packageName, "ui", snapshot.Error, string.Empty, string.Empty);
+        }
+
+        // Confirma o valor efetivamente recebido pelo EditText antes de pressionar
+        // Confirmar. Isso evita enviar uma URL truncada pelo shell do Android (caso
+        // observado no Mercado Pago N950, onde `&key=...` não chegou ao campo).
+        var populatedEdit = FindEditable(snapshot.Nodes);
+        if (populatedEdit is not null &&
+            !string.IsNullOrWhiteSpace(populatedEdit.Text) &&
+            !DeviceLinkUrlsMatch(url, populatedEdit.Text))
+        {
+            if (useN950QuotedInput &&
+                CanTrustN950AccessibilityPrefix(url, populatedEdit.Text))
+            {
+                progress?.Invoke(
+                    "input-n950-verify",
+                    "A acessibilidade do N950 expos somente o prefixo da URL. Host, rota e client_id conferem; seguindo para Confirmar.");
+            }
+            else
+            {
+                return new SmartAutomationResult(
+                    false,
+                    packageName,
+                    "input-verify",
+                    "O Android recebeu uma URL de vinculo incompleta. A configuracao foi interrompida antes de Confirmar; nenhum segredo foi exibido.",
+                    BuildSafeInputSummary(url, populatedEdit.Text),
+                    smartDeviceId);
+            }
         }
 
         smartDeviceId = FirstNonEmpty(smartDeviceId, ExtractSmartDeviceId(snapshot.Nodes));
@@ -795,6 +834,20 @@ public sealed class SmartUiAutomationService
                 packageName,
                 "sync-complete",
                 $"Modulo {GetModuleLabel(module)} configurado e dados sincronizados com sucesso.",
+                BuildSummary(finalSnapshot.Nodes),
+                smartDeviceId);
+        }
+
+        if (finalSnapshot.Success && IsDeviceLinkRequestRejected(finalSnapshot.Nodes))
+        {
+            var rejection = ExtractSynchronizationFailureMessage(finalSnapshot.Nodes);
+            return new SmartAutomationResult(
+                false,
+                packageName,
+                "link-rejected",
+                string.IsNullOrWhiteSpace(rejection)
+                    ? "O servidor recusou a URL de vinculo informada pelo Smart."
+                    : rejection,
                 BuildSummary(finalSnapshot.Nodes),
                 smartDeviceId);
         }
@@ -5032,6 +5085,9 @@ public sealed class SmartUiAutomationService
             "mercadopagon950",
             StringComparison.OrdinalIgnoreCase);
 
+    private static bool ShouldUseQuotedDeviceLinkInput(string? provisioningProfile) =>
+        IsMercadoPagoN950Profile(provisioningProfile);
+
     private static bool IsActivityBasedSmartTefPackage(string? packageName) =>
         !string.IsNullOrWhiteSpace(packageName) &&
         packageName.Trim().StartsWith("softcom.mobile.smart", StringComparison.OrdinalIgnoreCase);
@@ -5888,7 +5944,14 @@ public sealed class SmartUiAutomationService
         ContainsLabel(nodes, "encontra-se em uso") ||
         ContainsLabel(nodes, "erro ao vincular") ||
         ContainsLabel(nodes, "falha ao vincular") ||
-        ContainsLabel(nodes, "vinculo recusado");
+        ContainsLabel(nodes, "vinculo recusado") ||
+        IsDeviceLinkRequestRejected(nodes);
+
+    private static bool IsDeviceLinkRequestRejected(IEnumerable<UiNode> nodes) =>
+        ContainsLabel(nodes, "a requisicao nao contem chave") ||
+        ContainsLabel(nodes, "requisicao nao contem chave") ||
+        ContainsLabel(nodes, "the key is missing") ||
+        ContainsLabel(nodes, "chave ausente");
 
     private static string ExtractSynchronizationFailureMessage(IEnumerable<UiNode> nodes)
     {
@@ -5902,6 +5965,9 @@ public sealed class SmartUiAutomationService
                 return value.Contains("erro", StringComparison.OrdinalIgnoreCase) ||
                        value.Contains("falha", StringComparison.OrdinalIgnoreCase) ||
                        value.Contains("nao foi possivel", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("nao contem chave", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("key is missing", StringComparison.OrdinalIgnoreCase) ||
+                       value.Contains("chave ausente", StringComparison.OrdinalIgnoreCase) ||
                        value.Contains("em uso", StringComparison.OrdinalIgnoreCase) ||
                        value.Contains("unable", StringComparison.OrdinalIgnoreCase) ||
                        value.Contains("no address", StringComparison.OrdinalIgnoreCase) ||
@@ -5914,6 +5980,120 @@ public sealed class SmartUiAutomationService
         return visibleMessages.Length == 0
             ? "O Smart retornou erro ao registrar ou sincronizar o dispositivo. Confira a mensagem mantida na tela do Android."
             : "O Smart recusou o registro do dispositivo: " + string.Join(" | ", visibleMessages);
+    }
+
+    private static bool DeviceLinkUrlsMatch(string expected, string actual)
+    {
+        expected = WebUtility.HtmlDecode(expected ?? string.Empty).Trim();
+        actual = WebUtility.HtmlDecode(actual ?? string.Empty).Trim();
+        return string.Equals(expected, actual, StringComparison.Ordinal);
+    }
+
+    private static bool CanTrustN950AccessibilityPrefix(string expected, string actual)
+    {
+        expected = WebUtility.HtmlDecode(expected ?? string.Empty).Trim();
+        actual = WebUtility.HtmlDecode(actual ?? string.Empty).Trim();
+
+        if (!Uri.TryCreate(expected, UriKind.Absolute, out var expectedUri) ||
+            !Uri.TryCreate(actual, UriKind.Absolute, out var actualUri) ||
+            !string.Equals(expectedUri.Scheme, actualUri.Scheme, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(expectedUri.Host, actualUri.Host, StringComparison.OrdinalIgnoreCase) ||
+            expectedUri.Port != actualUri.Port ||
+            !string.Equals(expectedUri.AbsolutePath, actualUri.AbsolutePath, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var expectedClientId = GetQueryParameter(expectedUri, "client_id");
+        var actualClientId = GetQueryParameter(actualUri, "client_id");
+        if (string.IsNullOrWhiteSpace(expectedClientId) ||
+            !string.Equals(expectedClientId, actualClientId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        // No N950 o EditText contem a URL completa, mas a arvore de acessibilidade
+        // pode publicar somente o prefixo encerrado logo apos o client_id. Essa
+        // excecao permanece estrita ao prefixo exato para nao aceitar outra URL.
+        return expected.StartsWith(actual, StringComparison.Ordinal) &&
+               GetQueryParameterNames(actualUri)
+                   .All(name => string.Equals(name, "client_id", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string? GetQueryParameter(Uri uri, string name)
+    {
+        foreach (var part in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var pieces = part.Split('=', 2);
+            var parameterName = Uri.UnescapeDataString(pieces[0].Replace('+', ' '));
+            if (!string.Equals(parameterName, name, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            return pieces.Length == 2
+                ? Uri.UnescapeDataString(pieces[1].Replace('+', ' '))
+                : string.Empty;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> GetQueryParameterNames(Uri uri) =>
+        uri.Query
+            .TrimStart('?')
+            .Split('&', StringSplitOptions.RemoveEmptyEntries)
+            .Select(part => part.Split('=', 2)[0])
+            .Select(name => Uri.UnescapeDataString(name.Replace('+', ' ')));
+
+    private static string BuildSafeDeviceLinkDescriptor(string value)
+    {
+        var normalized = WebUtility.HtmlDecode(value ?? string.Empty).Trim();
+        if (!Uri.TryCreate(normalized, UriKind.Absolute, out var uri))
+        {
+            return "URL invalida; valores sensiveis omitidos.";
+        }
+
+        var parameterNames = uri.Query
+            .TrimStart('?')
+            .Split('&', StringSplitOptions.RemoveEmptyEntries)
+            .Select(part => part.Split('=', 2)[0])
+            .Select(Uri.UnescapeDataString)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return $"URL esperada com {normalized.Length} caracteres e parametros [{string.Join(", ", parameterNames)}]. Valores omitidos.";
+    }
+
+    private static string BuildSafeInputSummary(string expected, string actual)
+    {
+        static string[] ParameterNames(string value)
+        {
+            if (!Uri.TryCreate(WebUtility.HtmlDecode(value ?? string.Empty).Trim(), UriKind.Absolute, out var uri))
+            {
+                return Array.Empty<string>();
+            }
+
+            return uri.Query
+                .TrimStart('?')
+                .Split('&', StringSplitOptions.RemoveEmptyEntries)
+                .Select(part => part.Split('=', 2)[0])
+                .Select(Uri.UnescapeDataString)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+
+        var expectedNames = ParameterNames(expected);
+        var actualNames = ParameterNames(actual);
+        var missing = expectedNames
+            .Except(actualNames, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return missing.Length == 0
+            ? $"O conteudo recebido pelo campo diverge da URL gerada (esperado: {WebUtility.HtmlDecode(expected ?? string.Empty).Trim().Length} caracteres; recebido: {WebUtility.HtmlDecode(actual ?? string.Empty).Trim().Length}); valores sensiveis foram omitidos."
+            : "Parametros ausentes no campo: " + string.Join(", ", missing) + ". Valores sensiveis foram omitidos.";
     }
 
     private static bool IsSynchronizationInProgress(IEnumerable<UiNode> nodes) =>
@@ -6033,11 +6213,36 @@ public sealed class SmartUiAutomationService
             .SelectMany(x => new[] { x.Text, x.ContentDescription })
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Select(x => x.Trim())
+            .Select(SanitizeUiSummaryValue)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(16)
             .ToArray();
 
         return values.Length == 0 ? "Nenhum texto acessivel encontrado na tela." : string.Join(" | ", values);
+    }
+
+    private static string SanitizeUiSummaryValue(string value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return value;
+        }
+
+        var parameterNames = uri.Query
+            .TrimStart('?')
+            .Split('&', StringSplitOptions.RemoveEmptyEntries)
+            .Select(part => part.Split('=', 2)[0])
+            .Select(Uri.UnescapeDataString)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(name => $"{name}=[OCULTO]")
+            .ToArray();
+
+        var authorityAndPath = uri.GetLeftPart(UriPartial.Path);
+        return parameterNames.Length == 0
+            ? authorityAndPath
+            : authorityAndPath + "?" + string.Join("&", parameterNames);
     }
 
     private sealed record FieldFillResult(bool Success, string Message, string Summary);

@@ -7,6 +7,8 @@ namespace SoftcomSmartProvisioner.Services;
 public sealed partial class TestAutomationService
 {
     private const int TestTimeoutMilliseconds = 2 * 60 * 60 * 1000;
+    private const int GitTimeoutMilliseconds = 60 * 1000;
+    private static readonly string[] SupportedChannels = ["master", "dev"];
     private readonly string? _explicitRoot;
     private readonly Func<string, IEnumerable<string>, string, CancellationToken, int, Action<string>?, Task<ProcessResult>> _processRunner;
     private readonly Func<string, string?> _commandResolver;
@@ -30,6 +32,7 @@ public sealed partial class TestAutomationService
         {
             return new TestAutomationCatalog(
                 null,
+                new TestAutomationSourceInfo(false, string.Empty, string.Empty, false, SupportedChannels),
                 new TestAutomationPrerequisites(false, false, false, false, _commandResolver("uv") is not null,
                     _commandResolver("appium") is not null),
                 Array.Empty<TestAutomationSuite>(),
@@ -57,9 +60,10 @@ public sealed partial class TestAutomationService
             .ThenBy(device => device.FriendlyName, StringComparer.CurrentCultureIgnoreCase)
             .ToArray();
 
-        var reportPath = Path.Combine(root, "allure-report", "index.html");
+        var reportPath = ResolveLatestReportPath(root);
         return new TestAutomationCatalog(
             root,
+            ReadSourceInfo(root),
             new TestAutomationPrerequisites(
                 true,
                 File.Exists(runnerPath),
@@ -69,8 +73,51 @@ public sealed partial class TestAutomationService
                 _commandResolver("appium") is not null),
             suites,
             devices,
-            File.Exists(reportPath) ? reportPath : null,
+            reportPath,
             warnings);
+    }
+
+    public async Task UpdateSourceAsync(
+        string? requestedChannel,
+        CancellationToken cancellationToken,
+        Action<TestAutomationProgress>? onProgress = null)
+    {
+        var channel = NormalizeChannel(requestedChannel);
+        var root = ResolveProjectRoot()
+            ?? throw new InvalidOperationException("Projeto softcom-smart-automation não localizado.");
+        var git = _commandResolver("git")
+            ?? throw new InvalidOperationException("Git não está disponível no PATH.");
+
+        var status = await RunGitAsync(git, root, ["status", "--porcelain"], cancellationToken, onProgress);
+        EnsureGitSuccess(status, "Não foi possível verificar o estado local do Automation.");
+        if (!string.IsNullOrWhiteSpace(status.StandardOutput))
+            throw new InvalidOperationException(
+                "O Automation possui alterações locais. Preserve ou finalize essas alterações antes de trocar de branch.");
+
+        onProgress?.Invoke(new TestAutomationProgress(
+            DateTimeOffset.Now, "fonte", $"Buscando origin/{channel}...", "INFO"));
+        var fetch = await RunGitAsync(git, root, ["fetch", "origin", channel], cancellationToken, onProgress);
+        EnsureGitSuccess(fetch, $"Não foi possível buscar origin/{channel}.");
+
+        var current = await RunGitAsync(git, root, ["branch", "--show-current"], cancellationToken, onProgress);
+        EnsureGitSuccess(current, "Não foi possível identificar a branch atual do Automation.");
+        if (!string.Equals(current.StandardOutput.Trim(), channel, StringComparison.OrdinalIgnoreCase))
+        {
+            var localBranch = await RunGitAsync(
+                git, root, ["show-ref", "--verify", "--quiet", $"refs/heads/{channel}"], cancellationToken, onProgress);
+            var switchArguments = localBranch.Success
+                ? new[] { "switch", channel }
+                : new[] { "switch", "--track", "-c", channel, $"origin/{channel}" };
+            var branchSwitch = await RunGitAsync(git, root, switchArguments, cancellationToken, onProgress);
+            EnsureGitSuccess(branchSwitch, $"Não foi possível selecionar a branch {channel}.");
+        }
+
+        // Atualiza somente a branch selecionada. Nunca integra DEV em master.
+        var fastForward = await RunGitAsync(
+            git, root, ["merge", "--ff-only", $"origin/{channel}"], cancellationToken, onProgress);
+        EnsureGitSuccess(fastForward, $"A branch local {channel} divergiu de origin/{channel}; atualização automática cancelada.");
+        onProgress?.Invoke(new TestAutomationProgress(
+            DateTimeOffset.Now, "fonte", $"Automation atualizado em {channel}.", "INFO"));
     }
 
     public async Task<TestAutomationRunResult> RunAsync(
@@ -122,6 +169,12 @@ public sealed partial class TestAutomationService
         };
         if (testCase.Length > 0) arguments.AddRange(new[] { "-Test", testCase });
         if (includeTag.Length > 0) arguments.AddRange(new[] { "-Include", includeTag });
+        string? campaignName = null;
+        if (SupportsCampaignRunner(runnerPath))
+        {
+            campaignName = $"provisioner-{DateTime.Now:yyyyMMdd-HHmmss}-{deviceTag}";
+            arguments.AddRange(new[] { "-Campaign", campaignName, "-SaveReports", "all" });
+        }
         arguments.Add("-NoAllureOpen");
 
         var appiumServerUrl = ResolveLocalAppiumServerUrl();
@@ -139,7 +192,9 @@ public sealed partial class TestAutomationService
                 ResolvePowerShell(), arguments, root, cancellationToken, TestTimeoutMilliseconds,
                 line => ForwardSafeProgress(line, onProgress));
             stopwatch.Stop();
-            var reportPath = Path.Combine(root, "allure-report", "index.html");
+            var reportPath = campaignName is null
+                ? ResolveLatestReportPath(root)
+                : ExistingFileOrNull(Path.Combine(root, "results", "campaigns", campaignName, "index.html"));
             var success = result.Success;
             return new TestAutomationRunResult(
                 success,
@@ -173,8 +228,7 @@ public sealed partial class TestAutomationService
     {
         var root = ResolveProjectRoot();
         if (root is null) return null;
-        var report = Path.Combine(root, "allure-report", "index.html");
-        return File.Exists(report) ? report : null;
+        return ResolveLatestReportPath(root);
     }
 
     public string? ResolveProjectRoot()
@@ -309,6 +363,116 @@ public sealed partial class TestAutomationService
         File.Exists(Path.Combine(path, "run_tests.ps1")) &&
         Directory.Exists(Path.Combine(path, "tests"));
 
+    private async Task<ProcessResult> RunGitAsync(
+        string git,
+        string root,
+        IEnumerable<string> arguments,
+        CancellationToken cancellationToken,
+        Action<TestAutomationProgress>? onProgress)
+    {
+        return await _processRunner(
+            git, arguments, root, cancellationToken, GitTimeoutMilliseconds,
+            line =>
+            {
+                if (string.IsNullOrWhiteSpace(line)) return;
+                onProgress?.Invoke(new TestAutomationProgress(
+                    DateTimeOffset.Now, "fonte", SensitiveDataSanitizer.Clean(line.Trim()), "INFO"));
+            });
+    }
+
+    private static void EnsureGitSuccess(ProcessResult result, string message)
+    {
+        if (result.Success) return;
+        var details = SensitiveDataSanitizer.Clean(
+            string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError).Trim();
+        throw new InvalidOperationException(string.IsNullOrWhiteSpace(details) ? message : $"{message} {details}");
+    }
+
+    private TestAutomationSourceInfo ReadSourceInfo(string root)
+    {
+        var git = _commandResolver("git");
+        if (git is null || !Directory.Exists(Path.Combine(root, ".git")))
+            return new TestAutomationSourceInfo(false, string.Empty, string.Empty, false, SupportedChannels);
+
+        var branch = RunGitReadOnly(git, root, ["branch", "--show-current"]);
+        var commit = RunGitReadOnly(git, root, ["rev-parse", "--short", "HEAD"]);
+        var status = RunGitReadOnly(git, root, ["status", "--porcelain"]);
+        return new TestAutomationSourceInfo(
+            true,
+            branch.Trim(),
+            commit.Trim(),
+            !string.IsNullOrWhiteSpace(status),
+            SupportedChannels);
+    }
+
+    private static string RunGitReadOnly(string git, string root, IEnumerable<string> arguments)
+    {
+        try
+        {
+            using var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = git,
+                    WorkingDirectory = root,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                }
+            };
+            foreach (var argument in arguments) process.StartInfo.ArgumentList.Add(argument);
+            process.Start();
+            var output = process.StandardOutput.ReadToEnd();
+            if (!process.WaitForExit(3000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                return string.Empty;
+            }
+            return process.ExitCode == 0 ? output : string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string NormalizeChannel(string? value)
+    {
+        var channel = value?.Trim().ToLowerInvariant() ?? string.Empty;
+        if (!SupportedChannels.Contains(channel, StringComparer.Ordinal))
+            throw new InvalidOperationException("Canal do Automation inválido. Escolha master ou dev.");
+        return channel;
+    }
+
+    private static bool SupportsCampaignRunner(string runnerPath)
+    {
+        try
+        {
+            var content = File.ReadAllText(runnerPath);
+            return content.Contains("$Campaign", StringComparison.Ordinal) &&
+                   content.Contains("$SaveReports", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string? ResolveLatestReportPath(string root)
+    {
+        var legacy = ExistingFileOrNull(Path.Combine(root, "allure-report", "index.html"));
+        var campaignsRoot = Path.Combine(root, "results", "campaigns");
+        if (!Directory.Exists(campaignsRoot)) return legacy;
+        var campaignReport = Directory.EnumerateFiles(campaignsRoot, "index.html", SearchOption.AllDirectories)
+            .Select(path => new FileInfo(path))
+            .OrderByDescending(file => file.LastWriteTimeUtc)
+            .FirstOrDefault()?.FullName;
+        return campaignReport ?? legacy;
+    }
+
+    private static string? ExistingFileOrNull(string path) => File.Exists(path) ? path : null;
+
     private static string DisplaySuiteName(string value) => value.ToLowerInvariant() switch
     {
         "pdv" => "PDV",
@@ -339,6 +503,7 @@ public sealed partial class TestAutomationService
             .Select(line => line.Trim())
             .Where(line => RobotSummaryLine().IsMatch(line) ||
                            line.StartsWith("Debug finalizado", StringComparison.OrdinalIgnoreCase) ||
+                           line.StartsWith("CAMPAIGN ERROR:", StringComparison.OrdinalIgnoreCase) ||
                            line.StartsWith("ERROR:", StringComparison.OrdinalIgnoreCase) ||
                            line.StartsWith("WARN:", StringComparison.OrdinalIgnoreCase))
             .TakeLast(12)
@@ -392,6 +557,10 @@ public sealed partial class TestAutomationService
         line.StartsWith("OK:", StringComparison.OrdinalIgnoreCase) ||
         line.StartsWith("WARN:", StringComparison.OrdinalIgnoreCase) ||
         line.StartsWith("ERROR:", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("CAMPAIGN ERROR:", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("Campanha:", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("Lote:", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("Resumo da campanha:", StringComparison.OrdinalIgnoreCase) ||
         line.StartsWith("DeviceTag:", StringComparison.OrdinalIgnoreCase) ||
         line.StartsWith("Suite:", StringComparison.OrdinalIgnoreCase) ||
         line.StartsWith("Test:", StringComparison.OrdinalIgnoreCase) ||

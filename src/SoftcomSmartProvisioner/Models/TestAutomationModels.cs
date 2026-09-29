@@ -31,8 +31,16 @@ public sealed record TestAutomationPrerequisites(
     bool UvAvailable,
     bool AppiumAvailable);
 
+public sealed record TestAutomationSourceInfo(
+    bool IsGitRepository,
+    string CurrentBranch,
+    string Commit,
+    bool HasLocalChanges,
+    IReadOnlyList<string> AvailableChannels);
+
 public sealed record TestAutomationCatalog(
     string? ProjectRoot,
+    TestAutomationSourceInfo Source,
     TestAutomationPrerequisites Prerequisites,
     IReadOnlyList<TestAutomationSuite> Suites,
     IReadOnlyList<TestAutomationDevice> Devices,

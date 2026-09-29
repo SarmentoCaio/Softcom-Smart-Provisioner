@@ -642,11 +642,62 @@ public sealed class AdbService
         string text,
         CancellationToken cancellationToken = default)
     {
+        return ShellAsync(serial, BuildInputTextCommand(text), cancellationToken, 30000);
+    }
+
+    /// <summary>
+    /// Mantem todo o texto como um unico argumento protegido no shell Android.
+    /// Esse e o mecanismo comprovado nos provisionamentos bem-sucedidos do N950.
+    /// </summary>
+    public Task<ProcessResult> InputQuotedTextAsync(
+        string serial,
+        string text,
+        CancellationToken cancellationToken = default)
+    {
+        return ShellAsync(serial, BuildQuotedInputTextCommand(text), cancellationToken, 30000);
+    }
+
+    public static string BuildQuotedInputTextCommand(string? text)
+    {
         var escaped = (text ?? string.Empty)
             .Replace(" ", "%s", StringComparison.Ordinal)
             .Replace("'", "'\\''", StringComparison.Ordinal);
-        return ShellAsync(serial, $"input text '{escaped}'", cancellationToken, 30000);
+        return $"input text '{escaped}'";
     }
+
+    public static string BuildInputTextCommand(string? text)
+    {
+        // O `adb shell` recompõe os argumentos em uma linha de comando que será
+        // interpretada novamente pelo shell do Android. Aspas simples ao redor do
+        // texto não são suficientes em todas as versões do platform-tools/Android:
+        // no N950 o primeiro `&` da URL encerrou o argumento e descartou `&key=...`.
+        // Escapar individualmente os metacaracteres mantém a query inteira como um
+        // único argumento do comando `input text`.
+        var value = text ?? string.Empty;
+        var escaped = new System.Text.StringBuilder(value.Length + 16);
+        foreach (var character in value)
+        {
+            if (character == ' ')
+            {
+                // Convenção do utilitário Android `input text` para espaço.
+                escaped.Append("%s");
+                continue;
+            }
+
+            if (IsAndroidShellMetaCharacter(character))
+            {
+                escaped.Append('\\');
+            }
+
+            escaped.Append(character);
+        }
+
+        return $"input text {escaped}";
+    }
+
+    private static bool IsAndroidShellMetaCharacter(char value) => value is
+        '\\' or '&' or '|' or ';' or '<' or '>' or '(' or ')' or '$' or '`' or
+        '"' or '\'' or '!' or '*' or '?' or '[' or ']' or '{' or '}' or '#' or '~';
 
     public async Task<bool> CanResolveHostAsync(
         string serial,

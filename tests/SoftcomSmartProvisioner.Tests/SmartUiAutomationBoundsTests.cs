@@ -267,6 +267,169 @@ public sealed class SmartUiAutomationBoundsTests
         Assert.Equal(expectedY, point.Y);
     }
 
+    [Fact]
+    public void DeviceUrlVerificationDetectsTruncatedKeyWithoutExposingValues()
+    {
+        var matches = typeof(SmartUiAutomationService).GetMethod(
+            "DeviceLinkUrlsMatch",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "DeviceLinkUrlsMatch");
+        var summary = typeof(SmartUiAutomationService).GetMethod(
+            "BuildSafeInputSummary",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "BuildSafeInputSummary");
+
+        const string expected = "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=abc&key=segredo";
+        const string actual = "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=abc";
+
+        Assert.False((bool)(matches.Invoke(null, new object[] { expected, actual }) ?? true));
+        var safeSummary = (string)(summary.Invoke(null, new object[] { expected, actual }) ?? string.Empty);
+        Assert.Contains("key", safeSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("segredo", safeSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("abc", safeSummary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void DeviceUrlVerificationReportsOnlySafeLengthsWhenParameterNamesMatch()
+    {
+        var summary = typeof(SmartUiAutomationService).GetMethod(
+            "BuildSafeInputSummary",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "BuildSafeInputSummary");
+
+        const string expected = "https://host/device/add?client_id=abcdef";
+        const string actual = "https://host/device/add?client_id=abcde";
+        var safeSummary = (string)(summary.Invoke(null, new object[] { expected, actual }) ?? string.Empty);
+
+        Assert.Contains($"esperado: {expected.Length}", safeSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains($"recebido: {actual.Length}", safeSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("abcdef", safeSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("abcde", safeSummary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void N950AcceptsAccessibilityPrefixWhenHostPathAndClientIdMatch()
+    {
+        const string expected = "https://cliente.meusoftcom.com.br:7711/softauth/device/add?client_id=abc123&empresa_name=Loja&empresa_cnpj=123&device_name=N950";
+        const string accessibilityValue = "https://cliente.meusoftcom.com.br:7711/softauth/device/add?client_id=abc123";
+
+        Assert.True(CanTrustN950AccessibilityPrefix(expected, accessibilityValue));
+    }
+
+    [Theory]
+    [InlineData(
+        "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=correto&empresa_name=Loja",
+        "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=errado")]
+    [InlineData(
+        "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=correto&empresa_name=Loja",
+        "https://outro.meusoftcom.com.br/softauth/device/add?client_id=correto")]
+    [InlineData(
+        "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=correto&empresa_name=Loja",
+        "https://cliente.meusoftcom.com.br/softauth/outra-rota?client_id=correto")]
+    [InlineData(
+        "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=correto&empresa_name=Loja",
+        "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=correto&empresa_name=Outra")]
+    public void N950RejectsUnsafeAccessibilityValues(string expected, string accessibilityValue)
+    {
+        Assert.False(CanTrustN950AccessibilityPrefix(expected, accessibilityValue));
+    }
+
+    private static bool CanTrustN950AccessibilityPrefix(string expected, string actual)
+    {
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "CanTrustN950AccessibilityPrefix",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(
+                typeof(SmartUiAutomationService).FullName,
+                "CanTrustN950AccessibilityPrefix");
+
+        return (bool)(method.Invoke(null, new object[] { expected, actual }) ?? false);
+    }
+
+    [Fact]
+    public void UiSummaryHidesDeviceUrlParameterValues()
+    {
+        var sanitize = typeof(SmartUiAutomationService).GetMethod(
+            "SanitizeUiSummaryValue",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "SanitizeUiSummaryValue");
+
+        var result = (string)(sanitize.Invoke(null, new object[]
+        {
+            "https://cliente.meusoftcom.com.br/softauth/device/add?client_id=abc&key=segredo"
+        }) ?? string.Empty);
+
+        Assert.Contains("client_id=[OCULTO]", result, StringComparison.Ordinal);
+        Assert.Contains("key=[OCULTO]", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("segredo", result, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("abc", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void MissingRequestKeyIsRecognizedAsImmediateLinkFailure()
+    {
+        var nodeType = typeof(SmartUiAutomationService).GetNestedType(
+            "UiNode",
+            BindingFlags.NonPublic)
+            ?? throw new MissingMemberException(typeof(SmartUiAutomationService).FullName, "UiNode");
+        var node = Activator.CreateInstance(
+            nodeType,
+            "A requisição não contém chave.",
+            string.Empty,
+            string.Empty,
+            "android.widget.TextView",
+            "softcom.mobile.smart2",
+            "A requisição não contém chave.",
+            false,
+            true,
+            0,
+            0,
+            600,
+            80)
+            ?? throw new InvalidOperationException("Nao foi possivel criar o no de teste.");
+        var nodes = Array.CreateInstance(nodeType, 1);
+        nodes.SetValue(node, 0);
+
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "IsSynchronizationFailure",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "IsSynchronizationFailure");
+
+        Assert.True((bool)(method.Invoke(null, new object[] { nodes }) ?? false));
+    }
+
+    [Theory]
+    [InlineData("mercadopagon950", true)]
+    [InlineData("stone", false)]
+    [InlineData("totemk2", false)]
+    [InlineData(null, false)]
+    public void QuotedUrlInputIsRestrictedToMercadoPagoN950(string? profile, bool expected)
+    {
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "ShouldUseQuotedDeviceLinkInput",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "ShouldUseQuotedDeviceLinkInput");
+
+        Assert.Equal(expected, (bool)(method.Invoke(null, new object?[] { profile }) ?? false));
+    }
+
+    [Fact]
+    public void N950SafeDescriptorShowsStructureWithoutValues()
+    {
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "BuildSafeDeviceLinkDescriptor",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(typeof(SmartUiAutomationService).FullName, "BuildSafeDeviceLinkDescriptor");
+
+        const string url = "https://host/softauth/device/add?client_id=abcdef&key=segredo";
+        var descriptor = (string)(method.Invoke(null, new object[] { url }) ?? string.Empty);
+
+        Assert.Contains("client_id", descriptor, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("key", descriptor, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("abcdef", descriptor, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("segredo", descriptor, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static object Parse(string dump, string resourceId)
     {
         var method = typeof(SmartUiAutomationService).GetMethod(

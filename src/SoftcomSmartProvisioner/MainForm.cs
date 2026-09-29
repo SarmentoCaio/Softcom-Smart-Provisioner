@@ -47,6 +47,7 @@ public sealed class MainForm : Form
     private readonly object _settingsMutationGate = new();
     private readonly object _testAutomationGate = new();
     private CancellationTokenSource? _testAutomationRun;
+    private bool _testAutomationSourceUpdating;
     private DeviceCatalogSnapshot _deviceCatalog = new(null, Array.Empty<DeviceCatalogEntry>(), Array.Empty<string>(),
         new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase));
 
@@ -333,6 +334,10 @@ public sealed class MainForm : Form
 
                 case "loadTestAutomation":
                     await LoadTestAutomationAsync(request.Payload);
+                    break;
+
+                case "updateTestAutomationSource":
+                    await UpdateTestAutomationSourceAsync(request.Payload);
                     break;
 
                 case "runTestAutomation":
@@ -1597,6 +1602,46 @@ public sealed class MainForm : Form
         }
     }
 
+    private async Task UpdateTestAutomationSourceAsync(JsonElement payload)
+    {
+        var branch = ReadString(payload, "branch");
+        lock (_testAutomationGate)
+        {
+            if (_testAutomationRun is not null || _testAutomationSourceUpdating)
+                throw new InvalidOperationException("Cancele a execução atual antes de trocar a fonte dos testes.");
+            _testAutomationSourceUpdating = true;
+        }
+
+        PostBusy("testAutomationSource", true);
+        PostEvent("testAutomationSourceUpdating", new { branch });
+        try
+        {
+            await _testAutomationService.UpdateSourceAsync(
+                branch,
+                _shutdown.Token,
+                progress => PostEvent("testAutomationSourceProgress", progress));
+            var catalog = _testAutomationService.LoadCatalog(_androidDevices, _deviceCatalog);
+            PostEvent("testAutomationCatalog", catalog);
+            PostEvent("toast", new
+            {
+                type = "success",
+                message = $"Automation atualizado pela branch {catalog.Source.CurrentBranch}."
+            });
+            WriteLog("TESTES", $"Automation atualizado: {catalog.Source.CurrentBranch} {catalog.Source.Commit}.");
+        }
+        catch (Exception ex)
+        {
+            var message = SensitiveDataSanitizer.Clean(ex.Message);
+            PostEvent("testAutomationError", new { message });
+            WriteLog("TESTES", message, "ERROR");
+        }
+        finally
+        {
+            lock (_testAutomationGate) _testAutomationSourceUpdating = false;
+            PostBusy("testAutomationSource", false);
+        }
+    }
+
     private async Task RunTestAutomationAsync(JsonElement payload)
     {
         var request = payload.Deserialize<TestAutomationRunRequest>(JsonOptions)
@@ -1605,6 +1650,8 @@ public sealed class MainForm : Form
         CancellationTokenSource runCancellation;
         lock (_testAutomationGate)
         {
+            if (_testAutomationSourceUpdating)
+                throw new InvalidOperationException("Aguarde a atualização da fonte dos testes.");
             if (_testAutomationRun is not null)
                 throw new InvalidOperationException("Já existe uma execução de testes em andamento.");
             runCancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
@@ -2122,9 +2169,11 @@ public sealed class MainForm : Form
 
             var automationProfile = string.Equals(module, "smart_tef", StringComparison.OrdinalIgnoreCase)
                 ? "Smart TEF"
-                : IsLegacy80LargeSelfServiceModule(module)
-                    ? "Smart 8.0 tela grande (Totem/AutoPagamento)"
-                    : "fluxo padrao/mobile";
+                : string.Equals(android.ProvisioningProfile, "mercadopagon950", StringComparison.OrdinalIgnoreCase)
+                    ? "Mercado Pago N950 (perfil dedicado)"
+                    : IsLegacy80LargeSelfServiceModule(module)
+                        ? "Smart 8.0 tela grande (Totem/AutoPagamento)"
+                        : "fluxo padrao/mobile";
             Progress(
                 "profile",
                 $"Modulo recebido: {module}. Perfil solicitado: {automationProfile}. Android: {android.FriendlyName} ({android.Model}), SDK {android.AndroidSdk}.");
@@ -2382,26 +2431,42 @@ public sealed class MainForm : Form
                 var effectiveAccessMode = modernSelfHost ? "selfhost" : "online";
                 var previouslyLinkedDeviceId = oauthClient.DeviceId?.Trim() ?? string.Empty;
                 var authoritativeSmartDeviceId = confirmedSmartDeviceId;
+                var registrySelfHostInstallation = selfHostInstallation ?? _selfHostDeviceService.DetectInstallation();
 
-                async Task<IReadOnlyList<OAuthClientInfo>> LoadManagedDevicesAsync(string operation)
+                async Task<IReadOnlyList<DeviceRegistryEntry>> LoadManagedDevicesAsync(string operation)
                 {
-                    if (!modernSelfHost)
-                    {
-                        return await ExecuteOnlineAsync(
+                    var softcomshopDevices = await ExecuteOnlineAsync(
+                        normalizedDatabase,
+                        modernSelfHost ? $"{operation} no Softcomshop" : operation,
+                        service => service.GetOAuthClientsAsync(
                             normalizedDatabase,
-                            operation,
-                            service => service.GetOAuthClientsAsync(normalizedDatabase, company.Id, _shutdown.Token));
+                            company.Id,
+                            _shutdown.Token));
+
+                    if (!registrySelfHostInstallation.Installed)
+                    {
+                        Progress(
+                            "registry-scan",
+                            $"Vinculos verificados em todos os {softcomshopDevices.Count} dispositivos do Softcomshop; nao ha SelfHost local instalado para consulta cruzada.");
+                        return softcomshopDevices
+                            .Select(x => new DeviceRegistryEntry(x, DeviceRegistrySource.Softcomshop))
+                            .ToArray();
                     }
 
                     // A listagem administrativa percorre todas as paginas e, em uma
                     // oscilacao do Softcomshop, uma requisicao GET pode atingir o timeout.
                     // Repetimos somente essa operacao de leitura; POST de criacao ou
                     // desvinculacao nunca e repetido automaticamente.
+                    IReadOnlyList<OAuthClientInfo>? selfHostDevices = null;
                     for (var attempt = 1; attempt <= 2; attempt++)
                     {
                         try
                         {
-                            return await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
+                            // Esta consulta nunca pode usar ListDevicesAsync: ela filtra
+                            // somente SELFHOST_ e esconderia vinculos mantidos em um
+                            // dispositivo comum, como ocorreu no Getnet P3.
+                            selfHostDevices = await _selfHostDeviceService.ListAllDevicesAsync(_shutdown.Token);
+                            break;
                         }
                         catch (TaskCanceledException) when (!_shutdown.IsCancellationRequested && attempt < 2)
                         {
@@ -2417,20 +2482,45 @@ public sealed class MainForm : Form
                         }
                     }
 
-                    throw new InvalidOperationException("Nao foi possivel consultar os dispositivos do SelfHost.");
+                    if (selfHostDevices is null)
+                        throw new InvalidOperationException("Nao foi possivel consultar os dispositivos do SelfHost.");
+
+                    Progress(
+                        "registry-scan",
+                        $"Vinculos verificados em todos os dispositivos das duas fontes: Softcomshop = {softcomshopDevices.Count}; API administrativa SelfHost = {selfHostDevices.Count}.");
+
+                    return selfHostDevices
+                        .Select(x => new DeviceRegistryEntry(x, DeviceRegistrySource.SelfHost))
+                        .Concat(softcomshopDevices.Select(x =>
+                            new DeviceRegistryEntry(x, DeviceRegistrySource.Softcomshop)))
+                        .ToArray();
                 }
 
-                Task<bool> UnlinkManagedDeviceAsync(OAuthClientInfo device) =>
-                    modernSelfHost
-                        ? _selfHostDeviceService.UnlinkDeviceAsync(device.ClientId, _shutdown.Token)
+                Task<bool> UnlinkManagedDeviceAsync(DeviceRegistryEntry entry) =>
+                    entry.Source == DeviceRegistrySource.SelfHost
+                        ? _selfHostDeviceService.UnlinkDeviceAsync(entry.Device.ClientId, _shutdown.Token)
                         : ExecuteOnlineAsync(
                             normalizedDatabase,
-                            $"desvincular {device.Name}",
+                            $"desvincular {entry.Device.Name}",
                             service => service.UnlinkOAuthClientAsync(
                                 normalizedDatabase,
                                 company.Id,
-                                device.ClientId,
+                                entry.Device.ClientId,
                                 _shutdown.Token));
+
+                static OAuthClientInfo[] GetVisibleItems(
+                    IReadOnlyList<DeviceRegistryEntry> entries,
+                    bool useModernSelfHost) =>
+                    entries
+                        .Where(x => useModernSelfHost
+                            ? x.Source == DeviceRegistrySource.SelfHost &&
+                              x.Device.Name.StartsWith("SELFHOST_", StringComparison.OrdinalIgnoreCase)
+                            : x.Source == DeviceRegistrySource.Softcomshop)
+                        .Select(x => x.Device)
+                        .GroupBy(x => x.ClientId, StringComparer.Ordinal)
+                        .Select(x => x.First())
+                        .OrderBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase)
+                        .ToArray();
 
                 // Pre-flight remoto: acontece antes de limpar, abrir ou tocar no Smart.
                 // Alem de consultar novamente o cadastro selecionado, usa apenas um Device ID
@@ -2441,7 +2531,8 @@ public sealed class MainForm : Form
                     "Verificando vinculos existentes antes de abrir o Smart...");
                 var initialManagedDevices = await LoadManagedDevicesAsync("verificacao inicial de vinculos");
                 var selectedRemote = initialManagedDevices.FirstOrDefault(x =>
-                    string.Equals(x.ClientId, oauthClient.ClientId, StringComparison.Ordinal));
+                    string.Equals(x.Device.ClientId, oauthClient.ClientId, StringComparison.Ordinal) &&
+                    (!modernSelfHost || x.Source == DeviceRegistrySource.SelfHost))?.Device;
 
                 if (string.IsNullOrWhiteSpace(authoritativeSmartDeviceId) &&
                     selectedRemote is not null && selectedRemote.IsLinked)
@@ -2449,76 +2540,41 @@ public sealed class MainForm : Form
                     authoritativeSmartDeviceId = selectedRemote.DeviceId.Trim();
                 }
 
-                var initialConflicts = initialManagedDevices
-                    .Where(x =>
-                        (string.Equals(x.ClientId, oauthClient.ClientId, StringComparison.Ordinal) && x.IsLinked) ||
-                        (!string.IsNullOrWhiteSpace(authoritativeSmartDeviceId) &&
-                         string.Equals(x.DeviceId, authoritativeSmartDeviceId, StringComparison.OrdinalIgnoreCase)))
-                    .GroupBy(x => x.ClientId, StringComparer.Ordinal)
-                    .Select(x => x.First())
-                    .ToArray();
+                var initialConflicts = DeviceLinkConflictResolver.FindConflicts(
+                    initialManagedDevices,
+                    oauthClient.ClientId,
+                    authoritativeSmartDeviceId);
 
                 foreach (var conflict in initialConflicts)
                 {
-                    Progress("online-unlink-selected", $"Desvinculando {conflict.Name} antes de iniciar a automacao...");
+                    var source = DeviceLinkConflictResolver.SourceName(conflict.Source);
+                    Progress("online-unlink-selected", $"Desvinculando {conflict.Device.Name} pelo {source} antes de iniciar a automacao...");
                     var selectedUnlinked = await UnlinkManagedDeviceAsync(conflict);
 
                     if (!selectedUnlinked)
                     {
-                        throw new InvalidOperationException($"O Softcomshop nao confirmou a desvinculacao de {conflict.Name}.");
+                        throw new InvalidOperationException($"O {source} nao confirmou a desvinculacao de {conflict.Device.Name}.");
                     }
                 }
 
-                if (initialConflicts.Length > 0)
+                if (initialConflicts.Count > 0)
                 {
                     var afterSelectedUnlink = await LoadManagedDevicesAsync("confirmar desvinculacao do cadastro selecionado");
-                    var stillLinkedSelected = afterSelectedUnlink.FirstOrDefault(x =>
-                        (string.Equals(x.ClientId, oauthClient.ClientId, StringComparison.Ordinal) && x.IsLinked) ||
-                        (!string.IsNullOrWhiteSpace(authoritativeSmartDeviceId) &&
-                         string.Equals(x.DeviceId, authoritativeSmartDeviceId, StringComparison.OrdinalIgnoreCase)));
+                    var stillLinkedSelected = DeviceLinkConflictResolver.FindConflicts(
+                        afterSelectedUnlink,
+                        oauthClient.ClientId,
+                        authoritativeSmartDeviceId).FirstOrDefault();
                     if (stillLinkedSelected is not null)
                     {
+                        var source = DeviceLinkConflictResolver.SourceName(stillLinkedSelected.Source);
                         throw new InvalidOperationException(
-                            $"O vinculo de {stillLinkedSelected.Name} ainda aparece no Softcomshop antes de abrir o Smart.");
+                            $"O vinculo de {stillLinkedSelected.Device.Name} ainda aparece no {source} antes de abrir o Smart.");
                     }
 
-                    Progress("online-unlink-selected", "Vinculos da lista atual confirmados como removidos antes de abrir o Smart.");
-                    PostEvent("oauthClients", new { items = afterSelectedUnlink, companyId = company.Id, accessMode = effectiveAccessMode });
-                }
-
-                // Ao trocar de SelfHost para Online, o mesmo aparelho pode continuar preso
-                // em um cadastro filho administrativo que nao aparece na lista OAuth WEB.
-                // Com um ID real previamente confirmado, verificamos tambem essa fonte.
-                if (!modernSelfHost && !string.IsNullOrWhiteSpace(authoritativeSmartDeviceId))
-                {
-                    var installedSelfHost = _selfHostDeviceService.DetectInstallation();
-                    if (installedSelfHost.Installed && IsModernSelfHost(installedSelfHost))
-                    {
-                        var selfHostDevices = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
-                        var selfHostConflicts = selfHostDevices.Where(x =>
-                            string.Equals(x.DeviceId, authoritativeSmartDeviceId, StringComparison.OrdinalIgnoreCase)).ToArray();
-                        foreach (var conflict in selfHostConflicts)
-                        {
-                            Progress("selfhost-cross-unlink", $"Device ID real localizado em {conflict.Name}. Desvinculando antes de abrir o Smart...");
-                            if (!await _selfHostDeviceService.UnlinkDeviceAsync(conflict.ClientId, _shutdown.Token))
-                            {
-                                throw new InvalidOperationException($"O SelfHost nao confirmou a desvinculacao de {conflict.Name}.");
-                            }
-                        }
-
-                        if (selfHostConflicts.Length > 0)
-                        {
-                            var verifiedSelfHostDevices = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
-                            if (verifiedSelfHostDevices.Any(x =>
-                                string.Equals(x.DeviceId, authoritativeSmartDeviceId, StringComparison.OrdinalIgnoreCase)))
-                            {
-                                throw new InvalidOperationException(
-                                    "O Device ID real ainda aparece vinculado na API administrativa do SelfHost. O Smart nao sera aberto.");
-                            }
-
-                            Progress("selfhost-cross-unlink", "Desvinculacao administrativa confirmada antes de abrir o Smart.");
-                        }
-                    }
+                    Progress("online-unlink-selected", modernSelfHost
+                        ? "Softcomshop e SelfHost confirmaram a remocao dos vinculos antes de abrir o Smart."
+                        : "Vinculos da lista atual confirmados como removidos antes de abrir o Smart.");
+                    PostEvent("oauthClients", new { items = GetVisibleItems(afterSelectedUnlink, modernSelfHost), companyId = company.Id, accessMode = effectiveAccessMode });
                 }
 
                 var onlineUrl = await ExecuteOnlineAsync(
@@ -2540,79 +2596,56 @@ public sealed class MainForm : Form
                         "online-unlink-check",
                         modernSelfHost
                             ? "Validacao final antes do ultimo Confirmar: conferindo se o cadastro selecionado e os vinculos anteriores estao realmente desvinculados..."
-                            : $"Verificando vinculos do Device ID {smartDeviceId} pelo Softcomshop...");
+                            : $"Verificando o Device ID {smartDeviceId} em todos os dispositivos do Softcomshop e do SelfHost local...");
                     var items = await LoadManagedDevicesAsync("verificar vinculos anteriores");
-
-                    var toUnlink = new Dictionary<string, OAuthClientInfo>(StringComparer.Ordinal);
-
-                    // Esta consulta ocorre dentro da automacao, antes de informar a URL,
-                    // do toque prolongado e do Confirmar final. Nao confiamos apenas no
-                    // estado que veio da tela: se o cadastro selecionado reaparecer ligado,
-                    // ele precisa ser liberado e confirmado novamente nesta pre-condicao.
-                    var selectedBeforeSubmit = modernSelfHost
-                        ? items.FirstOrDefault(x =>
-                            string.Equals(x.ClientId, oauthClient.ClientId, StringComparison.Ordinal))
-                        : null;
-                    if (selectedBeforeSubmit is not null && selectedBeforeSubmit.IsLinked)
-                    {
-                        toUnlink[selectedBeforeSubmit.ClientId] = selectedBeforeSubmit;
-                    }
-
-                    // Aqui tratamos apenas conflitos do Device ID informado pelo Smart.
-                    // No Android 8+ o ID do shell pode divergir do ID real do APK. Quando
-                    // estamos reutilizando um cadastro, o device_id administrativo que ele
-                    // possuia antes da liberacao tambem e uma evidencia segura do vinculo.
-                    foreach (var conflict in items.Where(x =>
-                                 string.Equals(x.DeviceId, smartDeviceId, StringComparison.OrdinalIgnoreCase) ||
-                                 (modernSelfHost && !string.IsNullOrWhiteSpace(previouslyLinkedDeviceId) &&
-                                  string.Equals(x.DeviceId, previouslyLinkedDeviceId, StringComparison.OrdinalIgnoreCase))))
-                    {
-                        toUnlink[conflict.ClientId] = conflict;
-                    }
+                    var toUnlink = DeviceLinkConflictResolver.FindConflicts(
+                        items,
+                        modernSelfHost ? oauthClient.ClientId : null,
+                        smartDeviceId,
+                        modernSelfHost ? previouslyLinkedDeviceId : null);
 
                     if (toUnlink.Count > 0)
                     {
-                        Progress("online-unlink", "Desvinculando pelo Softcomshop: " + string.Join(", ", toUnlink.Values.Select(x => x.Name)) + "...");
-                        foreach (var item in toUnlink.Values)
+                        Progress(
+                            "online-unlink",
+                            "Vinculos encontrados: " + string.Join(", ", toUnlink.Select(x =>
+                                $"{x.Device.Name} ({DeviceLinkConflictResolver.SourceName(x.Source)})")) + ".");
+                        foreach (var item in toUnlink)
                         {
                             var changed = await UnlinkManagedDeviceAsync(item);
                             if (!changed)
                             {
-                                throw new InvalidOperationException($"O Softcomshop nao confirmou a desvinculacao de {item.Name}.");
+                                var source = DeviceLinkConflictResolver.SourceName(item.Source);
+                                throw new InvalidOperationException($"O {source} nao confirmou a desvinculacao de {item.Device.Name}.");
                             }
                         }
                     }
                     else
                     {
-                        Progress("online-unlink", "Nenhum vinculo anterior precisa ser removido.");
+                        Progress("online-unlink", modernSelfHost
+                            ? "Nenhum vinculo anterior foi encontrado no Softcomshop nem no SelfHost."
+                            : "Nenhum vinculo anterior foi encontrado em nenhuma das fontes consultadas.");
                     }
 
                     var refreshed = await LoadManagedDevicesAsync("confirmar desvinculacao");
-                    var selectedAfterUnlink = modernSelfHost
-                        ? refreshed.FirstOrDefault(x =>
-                            string.Equals(x.ClientId, oauthClient.ClientId, StringComparison.Ordinal))
-                        : null;
-                    if (selectedAfterUnlink is not null && selectedAfterUnlink.IsLinked)
+                    var remaining = DeviceLinkConflictResolver.FindConflicts(
+                        refreshed,
+                        modernSelfHost ? oauthClient.ClientId : null,
+                        smartDeviceId,
+                        modernSelfHost ? previouslyLinkedDeviceId : null);
+                    if (remaining.Count > 0)
                     {
                         throw new InvalidOperationException(
-                            $"O cadastro selecionado {oauthClient.Name} ainda possui device_id imediatamente antes do ultimo Confirmar.");
-                    }
-
-                    var remaining = refreshed.Where(x =>
-                        string.Equals(x.DeviceId, smartDeviceId, StringComparison.OrdinalIgnoreCase) ||
-                        (modernSelfHost && !string.IsNullOrWhiteSpace(previouslyLinkedDeviceId) &&
-                         string.Equals(x.DeviceId, previouslyLinkedDeviceId, StringComparison.OrdinalIgnoreCase))).ToArray();
-                    if (remaining.Length > 0)
-                    {
-                        throw new InvalidOperationException(
-                            "O Device ID ainda aparece vinculado no Softcomshop: " + string.Join(", ", remaining.Select(x => x.Name)) + ".");
+                            "O ultimo Confirmar foi bloqueado porque ainda existe vinculo em: " +
+                            string.Join(", ", remaining.Select(x =>
+                                $"{x.Device.Name} ({DeviceLinkConflictResolver.SourceName(x.Source)})")) + ".");
                     }
 
                     if (modernSelfHost)
                     {
                         Progress(
                             "selfhost-unlink-confirmed",
-                            "Cadastro selecionado e vinculos anteriores confirmados como desvinculados. O ultimo Confirmar esta liberado.");
+                            "Softcomshop e SelfHost foram relidos e estao sem o vinculo anterior. O ultimo Confirmar esta liberado.");
                     }
 
                     if (_vpnService.IsOpenVpnRunning())
@@ -2666,6 +2699,11 @@ public sealed class MainForm : Form
                             android.AndroidId,
                             onlineAutomation.SmartDeviceId);
                     }
+                    WriteLog(
+                        "SMART",
+                        $"[{serial}][{onlineAutomation.Stage}] {SanitizeSensitiveText(onlineAutomation.Message)} " +
+                        $"Detalhe seguro: {SanitizeSensitiveText(onlineAutomation.UiSummary)}",
+                        "ERROR");
                     PostEvent("smartPreparationFinished", new
                     {
                         success = false,
@@ -2728,7 +2766,9 @@ public sealed class MainForm : Form
                     for (var attempt = 0; attempt < 30; attempt++)
                     {
                         await Task.Delay(1000, _shutdown.Token);
-                        refreshedItems = await LoadManagedDevicesAsync("validar vinculo");
+                        refreshedItems = GetVisibleItems(
+                            await LoadManagedDevicesAsync("validar vinculo"),
+                            useModernSelfHost: false);
                         refreshedClient = refreshedItems.FirstOrDefault(x =>
                             string.Equals(x.ClientId, oauthClient.ClientId, StringComparison.Ordinal));
                         if (refreshedClient is not null && !string.IsNullOrWhiteSpace(refreshedClient.DeviceId))
@@ -2979,6 +3019,11 @@ public sealed class MainForm : Form
 
             if (!automation.Success)
             {
+                WriteLog(
+                    "SMART",
+                    $"[{serial}][{automation.Stage}] {SanitizeSensitiveText(automation.Message)} " +
+                    $"Detalhe seguro: {SanitizeSensitiveText(automation.UiSummary)}",
+                    "ERROR");
                 PostEvent("smartPreparationFinished", new
                 {
                     success = false,

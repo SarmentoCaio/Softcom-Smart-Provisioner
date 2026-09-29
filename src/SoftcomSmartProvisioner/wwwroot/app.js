@@ -40,7 +40,9 @@
     testAutomation: null,
     testAutomationLoaded: false,
     testAutomationRunning: false,
+    testAutomationSourceUpdating: false,
     testAutomationProgress: [],
+    testAutomationChannel: "dev",
     testDeviceSerial: "",
     testDeviceTag: "",
     testSuiteId: "",
@@ -136,6 +138,7 @@
       update: $("check-update"),
       updateInstall: $("install-update"),
       testAutomationCatalog: $("refresh-test-automation"),
+      testAutomationSource: $("update-test-automation-source"),
       testAutomationRun: $("run-test-automation")
     };
     const el = map[key];
@@ -151,6 +154,7 @@
       if (key === "update") el.textContent = active ? "Verificando..." : "Verificar agora";
       if (key === "updateInstall") el.textContent = active ? "Atualizando..." : "Atualizar agora";
       if (key === "testAutomationCatalog") el.textContent = active ? "Atualizando..." : "Atualizar catálogo";
+      if (key === "testAutomationSource") el.textContent = active ? "Buscando..." : "Aplicar e atualizar";
       if (key === "testAutomationRun") el.textContent = active ? "Executando..." : "Executar testes";
     }
 
@@ -176,6 +180,10 @@
     }
     if (key === "testAutomationRun") {
       state.testAutomationRunning = active;
+      updateTestRunActions();
+    }
+    if (key === "testAutomationSource") {
+      state.testAutomationSourceUpdating = active;
       updateTestRunActions();
     }
   }
@@ -1574,6 +1582,23 @@
     if (!catalog) return;
     renderTestPrerequisites();
 
+    const source = catalog.source || {};
+    const channels = source.availableChannels || ["master", "dev"];
+    if (channels.includes(source.currentBranch)) state.testAutomationChannel = source.currentBranch;
+    const channelSelect = $("test-automation-channel");
+    if (channelSelect) {
+      channelSelect.value = channels.includes(state.testAutomationChannel) ? state.testAutomationChannel : "dev";
+      channelSelect.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating;
+    }
+    const version = $("test-automation-version");
+    if (version) {
+      const branch = source.currentBranch || "branch não identificada";
+      const commit = source.commit ? ` · ${source.commit}` : "";
+      const dirty = source.hasLocalChanges ? " · alterações locais" : "";
+      version.textContent = `${branch}${commit}${dirty}`;
+      version.classList.toggle("warn", !!source.hasLocalChanges);
+    }
+
     const devices = catalog.devices || [];
     if (!devices.some(x => x.serial === state.testDeviceSerial)) {
       const preferred = devices.find(x => x.isOnline && x.suggestedDeviceTag) || devices.find(x => x.isOnline);
@@ -1609,7 +1634,7 @@
       prerequisites?.environmentAvailable && prerequisites?.uvAvailable && state.testDeviceSerial &&
       state.testDeviceTag && state.testSuiteId);
     const run = $("run-test-automation");
-    if (run) run.disabled = state.testAutomationRunning || !ready;
+    if (run) run.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating || !ready;
     $("cancel-test-automation")?.classList.toggle("hidden", !state.testAutomationRunning);
   }
 
@@ -2219,6 +2244,13 @@
       clearInlineError("test-automation-error");
       send("loadTestAutomation", { refreshDevices: true });
     });
+    $("test-automation-channel")?.addEventListener("change", e => {
+      state.testAutomationChannel = e.target.value === "master" ? "master" : "dev";
+    });
+    $("update-test-automation-source")?.addEventListener("click", () => {
+      clearInlineError("test-automation-error");
+      send("updateTestAutomationSource", { branch: state.testAutomationChannel });
+    });
     $("test-device")?.addEventListener("change", e => {
       state.testDeviceSerial = e.target.value;
       state.testDeviceTag = selectedTestDevice()?.suggestedDeviceTag || "";
@@ -2275,6 +2307,16 @@
         state.testAutomationProgress = [];
         clearInlineError("test-automation-error");
         renderTestRunState("running", "Testes em execução", `Executando ${payload.testCase || "a suíte selecionada"} em ${payload.serial}.`);
+        break;
+      case "testAutomationSourceUpdating":
+        state.testAutomationProgress = [];
+        clearInlineError("test-automation-error");
+        renderTestRunState("running", "Atualizando fonte dos testes", `Buscando a branch ${payload.branch || "selecionada"} sem fazer merge entre DEV e master.`);
+        break;
+      case "testAutomationSourceProgress":
+        state.testAutomationProgress.push(payload);
+        if (state.testAutomationProgress.length > 200) state.testAutomationProgress.splice(0, state.testAutomationProgress.length - 200);
+        renderTestProgress();
         break;
       case "testAutomationProgress":
         state.testAutomationProgress.push(payload);

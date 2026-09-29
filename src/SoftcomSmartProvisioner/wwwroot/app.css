@@ -145,6 +145,18 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .page.active { display: block; }
 
 .test-page-heading { margin-bottom: 16px; }
+.test-source-toolbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.test-source-field { display: grid; gap: 3px; min-width: 180px; }
+.test-source-field > span { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .5px; }
+.test-source-field select { min-height: 36px; padding: 7px 30px 7px 10px; }
+.test-source-field small { color: var(--muted); font-size: 10px; }
+.test-source-field small.warn { color: var(--warning); }
 .test-prerequisites {
   display: flex;
   flex-wrap: wrap;

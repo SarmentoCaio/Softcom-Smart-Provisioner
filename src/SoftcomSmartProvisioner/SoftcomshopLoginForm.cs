@@ -19,6 +19,7 @@ public sealed class SoftcomshopLoginForm : Form
     private readonly Label _info = new();
     private bool _initialNavigationCompleted;
     private bool _automaticSubmitInProgress;
+    private bool _savedCredentialAttempted;
     private bool _manualMode;
     private int _automaticAttempt;
 
@@ -78,6 +79,8 @@ public sealed class SoftcomshopLoginForm : Form
         _webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
         _webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
         _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+        _webView.CoreWebView2.Settings.IsPasswordAutosaveEnabled = true;
+        _webView.CoreWebView2.Settings.IsGeneralAutofillEnabled = true;
         _webView.NavigationCompleted += OnNavigationCompleted;
         _webView.Source = new Uri(_targetUrl);
     }
@@ -136,6 +139,20 @@ public sealed class SoftcomshopLoginForm : Form
             return;
         }
 
+        // O perfil persistente do WebView2 pode possuir uma credencial salva pelo
+        // proprio usuario. Damos tempo para o autofill preencher o formulario e o
+        // submetemos sem transportar ou expor a senha para o codigo .NET.
+        if (!_savedCredentialAttempted)
+        {
+            _savedCredentialAttempted = true;
+            await Task.Delay(500);
+            if (await TrySubmitSavedCredentialsAsync())
+            {
+                _automaticSubmitInProgress = true;
+                return;
+            }
+        }
+
         var password = AutomaticPasswords[_automaticAttempt++];
         var submitted = await TrySubmitCredentialsAsync(AutomaticEmail, password);
         if (submitted)
@@ -146,6 +163,43 @@ public sealed class SoftcomshopLoginForm : Form
 
         // Se a pagina de login mudou e nao foi possivel identificar o formulario, nao insiste cegamente.
         RevealForManualLogin("Nao foi possivel identificar automaticamente o formulario de login. Informe usuario e senha.");
+    }
+
+    private async Task<bool> TrySubmitSavedCredentialsAsync()
+    {
+        const string script = """
+            (() => {
+              const inputs = Array.from(document.querySelectorAll('input'));
+              const emailInput = document.querySelector('input[name="email"], input[type="email"], input[id*="email" i], input[name*="usuario" i], input[id*="usuario" i]')
+                || inputs.find(x => /email|usuario|login/i.test(`${x.name || ''} ${x.id || ''} ${x.placeholder || ''}`));
+              const passwordInput = document.querySelector('input[name="password"], input[type="password"], input[id*="senha" i], input[name*="senha" i]')
+                || inputs.find(x => /password|senha/i.test(`${x.name || ''} ${x.id || ''} ${x.placeholder || ''}`));
+              if (!emailInput || !passwordInput || !emailInput.value || !passwordInput.value) return false;
+
+              const form = emailInput.form || passwordInput.form || emailInput.closest('form') || passwordInput.closest('form');
+              if (form) {
+                if (typeof form.requestSubmit === 'function') form.requestSubmit();
+                else form.submit();
+                return true;
+              }
+
+              const button = document.querySelector('button[type="submit"], input[type="submit"]')
+                || Array.from(document.querySelectorAll('button')).find(b => /entrar|login|acessar/i.test((b.innerText || b.textContent || '').trim()));
+              if (!button) return false;
+              button.click();
+              return true;
+            })();
+            """;
+
+        try
+        {
+            var raw = await _webView.CoreWebView2.ExecuteScriptAsync(script);
+            return string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task<bool> TrySubmitCredentialsAsync(string email, string password)
@@ -212,6 +266,36 @@ public sealed class SoftcomshopLoginForm : Form
         Opacity = 1;
         Activate();
         BringToFront();
+        _ = ClearAutomaticPasswordForManualLoginAsync();
+    }
+
+    private async Task ClearAutomaticPasswordForManualLoginAsync()
+    {
+        const string script = """
+            (() => {
+              const inputs = Array.from(document.querySelectorAll('input'));
+              const passwordInput = document.querySelector('input[name="password"], input[type="password"], input[id*="senha" i], input[name*="senha" i]')
+                || inputs.find(x => /password|senha/i.test(`${x.name || ''} ${x.id || ''} ${x.placeholder || ''}`));
+              if (!passwordInput) return false;
+              const proto = Object.getPrototypeOf(passwordInput);
+              const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+              if (descriptor && descriptor.set) descriptor.set.call(passwordInput, '');
+              else passwordInput.value = '';
+              passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
+              passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
+              passwordInput.focus();
+              return true;
+            })();
+            """;
+
+        try
+        {
+            await _webView.CoreWebView2.ExecuteScriptAsync(script);
+        }
+        catch
+        {
+            // A tela manual continua utilizavel mesmo se o formulario remoto mudar.
+        }
     }
 
     private static bool IsLoginPath(string path)
