@@ -1,7 +1,7 @@
 {
-  "version": "1.0.3",
-  "downloadUrl": "https://github.com/SarmentoCaio/Softcom-Smart-Provisioner/releases/download/v1.0.3/Softcom-Smart-Provisioner-v1.0.3.zip",
-  "sha256": "36ff17dff474d86e9073d9ba75298f5a1aa485e921bfac6df2a6cc723e956940",
+  "version": "1.0.4",
+  "downloadUrl": "https://github.com/SarmentoCaio/Softcom-Smart-Provisioner/releases/download/v1.0.4/Softcom-Smart-Provisioner-v1.0.4.zip",
+  "sha256": "497c588b21edd0198b72bc38a31aa56f684183f5836e8c7e7f23e7542232ff4d",
   "required": false,
-  "notes": "Atualizacao automatica v1.0.3. Consulte as notas da Release no GitHub."
+  "notes": "Atualizacao automatica v1.0.4. Consulte as notas da Release no GitHub."
 }
