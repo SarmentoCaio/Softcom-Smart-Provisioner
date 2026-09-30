@@ -99,6 +99,10 @@ feito pelo Gerenciador no banco Softshop por `ContextoRemoto` e `SH_Dispositivos
 
 Antes de configurar, o Provisioner exige o Gerenciador fechado, para o MonitorService, encerra somente o `SelfHost.exe` da instalação detectada e cria backup de `Config.json`, `Config2.json` e configurações auxiliares existentes. Depois grava, relê, reinicia o serviço com timeout e valida sem registrar tokens ou credenciais.
 
+Ao selecionar SelfHost — explicitamente ou por um módulo que o exige — o Provisioner identifica o cliente pela URL base gravada na configuração oficial (`balerion.meusoftcom.com.br`, `jormungandr.meusoftcom.com.br` etc.) e compara com o cliente escolhido na tela. Se forem diferentes, a configuração é expandida, a interface informa os dois clientes e bloqueia a listagem/provisão de dispositivos SelfHost até que o vínculo raiz seja reconfigurado para o cliente selecionado.
+
+A parada aguarda o estado `STOPPED` do serviço e confirma o encerramento dos executáveis da instalação detectada. Processos residuais dessa instalação são finalizados antes do backup; em caso de falha, o Provisioner tenta restaurar o serviço e orienta a execução como administrador.
+
 No SelfHost 4.0, as credenciais raiz autenticam diretamente no Softcomshop. Por isso, a validação final usa os healthchecks locais e confirma autenticação/empresa pela API do Softcomshop. A autenticação local em `/authentication/token` é reservada aos dispositivos filhos. No SelfHost 4.1+, permanece a validação local prevista para essa geração.
 
 ## Ações

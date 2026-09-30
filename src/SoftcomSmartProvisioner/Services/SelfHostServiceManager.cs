@@ -12,7 +12,6 @@ public sealed class SelfHostServiceManager
     public async Task StopAsync(string installRoot, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {
         var limit = timeout ?? DefaultTimeout;
-        var deadline = DateTime.UtcNow + limit;
         if (await QueryStateAsync(cancellationToken) != 1)
         {
             var result = await RunScAsync("stop", MonitorServiceName, cancellationToken, tolerateFailure: false);
@@ -20,33 +19,21 @@ public sealed class SelfHostServiceManager
             await WaitServiceStateAsync(1, limit, cancellationToken);
         }
 
+        var deadline = DateTime.UtcNow + limit;
         var expectedExe = Path.GetFullPath(Path.Combine(installRoot, "SelfHost.exe"));
-        foreach (var process in Process.GetProcessesByName("SelfHost"))
-        {
-            using (process)
-            {
-                string? path = null;
-                try { path = process.MainModule?.FileName; } catch { }
-                if (!string.Equals(path, expectedExe, StringComparison.OrdinalIgnoreCase) || process.HasExited) continue;
-                process.CloseMainWindow();
-                using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                wait.CancelAfter(TimeSpan.FromSeconds(5));
-                try { await process.WaitForExitAsync(wait.Token); }
-                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
-                if (!process.HasExited)
-                {
-                    process.Kill(entireProcessTree: false);
-                    await process.WaitForExitAsync(cancellationToken);
-                }
-            }
-        }
+        await TerminateInstallationProcessAsync(
+            "SelfHost", expectedExe, deadline, allowGracefulClose: true, cancellationToken);
 
         // O SCM pode informar STOPPED alguns instantes antes de o executável do
         // serviço desaparecer. O backup só começa quando os dois processos desta
         // instalação realmente encerraram, evitando a corrida observada no 4.0.
         var expectedMonitorExe = Path.GetFullPath(Path.Combine(installRoot, "Selfhost.MonitorService.exe"));
+        await TerminateInstallationProcessAsync(
+            "Selfhost.MonitorService", expectedMonitorExe, deadline, allowGracefulClose: false, cancellationToken);
         await WaitProcessExitAsync("SelfHost", expectedExe, deadline, cancellationToken);
         await WaitProcessExitAsync("Selfhost.MonitorService", expectedMonitorExe, deadline, cancellationToken);
+        if (await QueryStateAsync(cancellationToken) != 1)
+            throw new InvalidOperationException($"O serviço {MonitorServiceName} voltou a iniciar antes do backup.");
     }
 
     public async Task StartAsync(string installRoot, int port, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
@@ -146,23 +133,92 @@ public sealed class SelfHostServiceManager
         throw new TimeoutException($"O processo {processName} não encerrou dentro do tempo limite.");
     }
 
+    public static bool HasRunningInstallationProcess(string installRoot)
+    {
+        var root = Path.GetFullPath(installRoot);
+        return HasExpectedProcess("SelfHost", Path.Combine(root, "SelfHost.exe")) ||
+               HasExpectedProcess("Selfhost.MonitorService", Path.Combine(root, "Selfhost.MonitorService.exe"));
+    }
+
+    private static async Task TerminateInstallationProcessAsync(
+        string processName,
+        string expectedExe,
+        DateTime deadline,
+        bool allowGracefulClose,
+        CancellationToken cancellationToken)
+    {
+        while (DateTime.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var matching = GetExpectedProcesses(processName, expectedExe);
+            if (matching.Count == 0) return;
+
+            foreach (var process in matching)
+            {
+                using (process)
+                {
+                    try
+                    {
+                        if (process.HasExited) continue;
+                        if (allowGracefulClose && process.CloseMainWindow())
+                        {
+                            using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                            wait.CancelAfter(TimeSpan.FromSeconds(5));
+                            try { await process.WaitForExitAsync(wait.Token); }
+                            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
+                        }
+                        if (!process.HasExited)
+                        {
+                            process.Kill(entireProcessTree: false);
+                            await process.WaitForExitAsync(cancellationToken);
+                        }
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+                    {
+                        throw new InvalidOperationException(
+                            $"Não foi possível finalizar {processName} da instalação selecionada. Execute o Provisioner como administrador.",
+                            ex);
+                    }
+                }
+            }
+        }
+
+        throw new TimeoutException($"O processo {processName} não encerrou dentro do tempo limite.");
+    }
+
     private static bool HasExpectedProcess(string processName, string expectedExe)
     {
-        foreach (var process in Process.GetProcessesByName(processName))
+        var matching = GetExpectedProcesses(processName, expectedExe);
+        foreach (var process in matching)
         {
             using (process)
             {
-                try
-                {
-                    if (!process.HasExited && string.Equals(
-                            process.MainModule?.FileName,
-                            expectedExe,
-                            StringComparison.OrdinalIgnoreCase)) return true;
-                }
-                catch { }
+                if (!process.HasExited) return true;
             }
         }
 
         return false;
+    }
+
+    private static List<Process> GetExpectedProcesses(string processName, string expectedExe)
+    {
+        var expectedPath = Path.GetFullPath(expectedExe);
+        var matching = new List<Process>();
+        foreach (var process in Process.GetProcessesByName(processName))
+        {
+            try
+            {
+                var actualPath = process.MainModule?.FileName;
+                if (!process.HasExited && !string.IsNullOrWhiteSpace(actualPath) &&
+                    string.Equals(Path.GetFullPath(actualPath), expectedPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    matching.Add(process);
+                    continue;
+                }
+            }
+            catch { }
+            process.Dispose();
+        }
+        return matching;
     }
 }

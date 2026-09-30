@@ -18,6 +18,7 @@ public sealed class AppSettings
     public bool SaveSmartTefConfiguration { get; set; }
     public bool AutoCheckUpdates { get; set; } = true;
     public bool AutoInstallUpdates { get; set; } = true;
+    public string TestAutomationChannel { get; set; } = "dev";
     public string UpdateChannel { get; set; } = "stable";
     public string StableManifestUrl { get; set; } = string.Empty;
     public string BetaManifestUrl { get; set; } = string.Empty;

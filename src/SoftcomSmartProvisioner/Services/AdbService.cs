@@ -4,7 +4,7 @@ using SoftcomSmartProvisioner.Models;
 
 namespace SoftcomSmartProvisioner.Services;
 
-public sealed class AdbService
+public sealed class AdbService : IAdbPackageFileService
 {
     private readonly string _toolsDirectory;
     private readonly string _adbPath;
@@ -163,6 +163,103 @@ public sealed class AdbService
         CancellationToken cancellationToken = default,
         int timeoutMilliseconds = 30000) =>
         RunAsync(BuildShellArguments(serial, command), cancellationToken, timeoutMilliseconds);
+
+    public Task<ProcessResult> RunAsAsync(
+        string serial,
+        string packageName,
+        IReadOnlyList<string> commandArguments,
+        CancellationToken cancellationToken = default,
+        int timeoutMilliseconds = 30000)
+    {
+        var arguments = BuildRunAsArguments(serial, packageName, commandArguments);
+        return RunAsync(arguments, cancellationToken, timeoutMilliseconds);
+    }
+
+    public Task<ProcessResult> ReadRunAsTextFileAsync(
+        string serial,
+        string packageName,
+        string relativePath,
+        CancellationToken cancellationToken = default,
+        int timeoutMilliseconds = 30000) =>
+        RunAsync(
+            BuildReadRunAsTextFileArguments(serial, packageName, relativePath),
+            cancellationToken,
+            timeoutMilliseconds);
+
+    public async Task<ProcessResult> WriteRunAsTextFileAsync(
+        string serial,
+        string packageName,
+        string relativePath,
+        string content,
+        CancellationToken cancellationToken = default,
+        int timeoutMilliseconds = 30000)
+    {
+        var directory = relativePath.Contains('/')
+            ? relativePath[..relativePath.LastIndexOf('/')]
+            : string.Empty;
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            var created = await RunAsAsync(
+                serial,
+                packageName,
+                ["mkdir", "-p", directory],
+                cancellationToken,
+                timeoutMilliseconds);
+            if (!created.Success) return created;
+        }
+
+        var written = await RunAsync(
+            BuildWriteRunAsTextFileArguments(serial, packageName, relativePath),
+            cancellationToken,
+            timeoutMilliseconds,
+            content);
+        if (!written.Success) return written;
+
+        var temporaryPath = relativePath + ".softcom-provisioner.tmp";
+        var moved = await RunAsAsync(
+            serial,
+            packageName,
+            ["mv", temporaryPath, relativePath],
+            cancellationToken,
+            timeoutMilliseconds);
+        if (!moved.Success) return moved;
+
+        return await RunAsAsync(
+            serial,
+            packageName,
+            ["chmod", "600", relativePath],
+            cancellationToken,
+            timeoutMilliseconds);
+    }
+
+    public static string[] BuildRunAsArguments(
+        string serial,
+        string packageName,
+        IReadOnlyList<string> commandArguments)
+    {
+        ValidateAdbIdentifier(serial, nameof(serial), allowHyphen: true);
+        ValidateAdbIdentifier(packageName, nameof(packageName), allowHyphen: false);
+        if (commandArguments.Count == 0)
+            throw new ArgumentException("Informe o comando que sera executado com run-as.", nameof(commandArguments));
+        return new[] { "-s", serial.Trim(), "shell", "run-as", packageName.Trim() }
+            .Concat(commandArguments)
+            .ToArray();
+    }
+
+    public static string[] BuildReadRunAsTextFileArguments(string serial, string packageName, string relativePath)
+    {
+        ValidateRunAsPath(relativePath);
+        var prefix = BuildRunAsArguments(serial, packageName, ["cat", relativePath]);
+        prefix[2] = "exec-out";
+        return prefix;
+    }
+
+    public static string[] BuildWriteRunAsTextFileArguments(string serial, string packageName, string relativePath)
+    {
+        ValidateRunAsPath(relativePath);
+        var temporaryPath = relativePath + ".softcom-provisioner.tmp";
+        return BuildRunAsArguments(serial, packageName, ["tee", temporaryPath]);
+    }
 
     public static string[] BuildShellArguments(string serial, string command)
     {
@@ -814,7 +911,8 @@ public sealed class AdbService
     private Task<ProcessResult> RunAsync(
         IEnumerable<string> arguments,
         CancellationToken cancellationToken,
-        int timeoutMilliseconds = 30000)
+        int timeoutMilliseconds = 30000,
+        string? standardInput = null)
     {
         if (!IsAvailable)
         {
@@ -826,7 +924,24 @@ public sealed class AdbService
             arguments,
             _toolsDirectory,
             cancellationToken,
-            timeoutMilliseconds);
+            timeoutMilliseconds,
+            standardInput);
+    }
+
+    private static void ValidateAdbIdentifier(string value, string parameterName, bool allowHyphen)
+    {
+        var pattern = allowHyphen ? @"^[A-Za-z0-9._:-]+$" : @"^[A-Za-z0-9._]+$";
+        if (string.IsNullOrWhiteSpace(value) || !Regex.IsMatch(value.Trim(), pattern))
+            throw new ArgumentException("Identificador ADB invalido.", parameterName);
+    }
+
+    private static void ValidateRunAsPath(string relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath) ||
+            Path.IsPathRooted(relativePath) ||
+            relativePath.Contains("..", StringComparison.Ordinal) ||
+            !Regex.IsMatch(relativePath, @"^[A-Za-z0-9._/-]+$"))
+            throw new ArgumentException("Caminho relativo run-as invalido.", nameof(relativePath));
     }
 
     private async Task<string> ReadShellValueAsync(string serial, string command, CancellationToken cancellationToken)

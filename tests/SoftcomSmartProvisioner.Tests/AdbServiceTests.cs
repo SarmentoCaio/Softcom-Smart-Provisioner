@@ -20,6 +20,48 @@ public sealed class AdbServiceTests
     }
 
     [Fact]
+    public void RunAsReadAlwaysUsesExplicitSerialAndPackage()
+    {
+        var args = AdbService.BuildReadRunAsTextFileArguments(
+            "P31824AA70363",
+            "softcom.mobile.smart2",
+            SmartPrinterConfigurationService.PreferencesPath);
+
+        Assert.Equal(
+            new[]
+            {
+                "-s", "P31824AA70363", "exec-out", "run-as", "softcom.mobile.smart2",
+                "cat", "shared_prefs/prefdispositivos.xml"
+            },
+            args);
+    }
+
+    [Fact]
+    public void RunAsWriteUsesStdinAndTemporaryFileWithoutEmbeddingContent()
+    {
+        var args = AdbService.BuildWriteRunAsTextFileArguments(
+            "KM54257740097",
+            "softcom.mobile.smart2",
+            SmartPrinterConfigurationService.PreferencesPath);
+
+        Assert.Equal("KM54257740097", args[1]);
+        Assert.Contains("softcom.mobile.smart2", args);
+        Assert.Contains("tee", args);
+        Assert.Contains("shared_prefs/prefdispositivos.xml.softcom-provisioner.tmp", args);
+        Assert.DoesNotContain(args, x => x.Contains("listadispositivospareados", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("../shared_prefs/prefdispositivos.xml")]
+    [InlineData("/data/data/package/preferences.xml")]
+    [InlineData("shared_prefs/pref dispositivos.xml")]
+    public void RunAsRejectsUnsafeRelativePaths(string path)
+    {
+        Assert.Throws<ArgumentException>(() =>
+            AdbService.BuildReadRunAsTextFileArguments("ABC123", "softcom.mobile.smart2", path));
+    }
+
+    [Fact]
     public void RealSmartPackageOutranksOtherSoftcomApplications()
     {
         Assert.True(AdbService.SmartPackageScore("softcom.mobile.smart2") >

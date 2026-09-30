@@ -57,6 +57,40 @@ public sealed class TestAutomationServiceTests : IDisposable
     }
 
     [Fact]
+    public void DiscoversTotemSuiteWithFriendlyName()
+    {
+        CreateAutomationProject();
+        var suiteDirectory = Path.Combine(_root, "tests", "regression", "totem");
+        Directory.CreateDirectory(suiteDirectory);
+        File.WriteAllText(Path.Combine(suiteDirectory, "totem.robot"),
+            "*** Test Cases ***\nCT01 - Totem - Home Ready\n    [Tags]    smoke    totem\n    No Operation\n");
+
+        var suite = TestAutomationService.DiscoverSuites(_root)
+            .Single(item => item.Id == "totem/totem.robot");
+
+        Assert.Equal("Autoatendimento (Totem)", suite.Name);
+        Assert.Equal(new[] { "CT01 - Totem - Home Ready" }, suite.TestCases);
+    }
+
+    [Fact]
+    public void MapsK2ToTotemAutomationProfile()
+    {
+        CreateAutomationProject();
+        File.AppendAllText(Path.Combine(_root, ".env"), "\nTOTEM_K2_UDID=KM54257740097\n");
+        File.AppendAllText(Path.Combine(_root, "resources", "data", "devices.yaml"),
+            "  totem_k2:\n    udid: \"${TOTEM_K2_UDID}\"\n");
+        var service = CreateService();
+        var deviceCatalog = DeviceCatalogService.Parse(new[] { "TOTEM_K2_UDID=KM54257740097" });
+
+        var device = Assert.Single(service.LoadCatalog(
+            new[] { Device("KM54257740097", "Totem - K2") }, deviceCatalog).Devices);
+
+        Assert.Equal("totem_k2", device.SuggestedDeviceTag);
+        Assert.Equal(new[] { "totem_k2" }, device.DeviceTags);
+        Assert.False(device.RequiresProfileSelection);
+    }
+
+    [Fact]
     public void DuplicateAutomationProfilesRequireExplicitSelection()
     {
         CreateAutomationProject(includeAlias: true);
@@ -77,7 +111,7 @@ public sealed class TestAutomationServiceTests : IDisposable
         IReadOnlyList<string>? capturedArguments = null;
         var service = new TestAutomationService(
             _root,
-            (_, arguments, _, _, _, progress) =>
+            (_, arguments, _, _, _, progress, _) =>
             {
                 capturedArguments = arguments.ToArray();
                 progress?.Invoke("> Iniciando execução...");
@@ -105,7 +139,7 @@ public sealed class TestAutomationServiceTests : IDisposable
         IReadOnlyList<string>? capturedArguments = null;
         var service = new TestAutomationService(
             _root,
-            (_, arguments, _, _, _, _) =>
+            (_, arguments, _, _, _, _, _) =>
             {
                 capturedArguments = arguments.ToArray();
                 return Task.FromResult(new ProcessResult(0, "1 test, 1 passed, 0 failed", string.Empty));
@@ -126,13 +160,44 @@ public sealed class TestAutomationServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Android7RunUsesDedicatedLegacyAppiumHome()
+    {
+        CreateAutomationProject();
+        var legacyHome = Path.Combine(_root, ".appium-k2");
+        Directory.CreateDirectory(Path.Combine(legacyHome, "node_modules", "appium-uiautomator2-driver"));
+        File.WriteAllText(
+            Path.Combine(legacyHome, "node_modules", "appium-uiautomator2-driver", "package.json"),
+            "{}");
+        IReadOnlyDictionary<string, string?>? capturedEnvironment = null;
+        var service = new TestAutomationService(
+            _root,
+            (_, _, _, _, _, _, environment) =>
+            {
+                capturedEnvironment = environment;
+                return Task.FromResult(new ProcessResult(0, "1 test, 1 passed, 0 failed", string.Empty));
+            },
+            _ => "available");
+        var deviceCatalog = DeviceCatalogService.Parse(new[] { "STONE_UDID=STONE123" });
+        var android7 = Device("STONE123", "K2") with { AndroidSdk = "25" };
+
+        var result = await service.RunAsync(
+            new TestAutomationRunRequest("STONE123", "stone", "pdv/pdv.robot", null, null),
+            new[] { android7 }, deviceCatalog, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.NotNull(capturedEnvironment);
+        Assert.Equal(Path.GetFullPath(legacyHome), capturedEnvironment!["APPIUM_HOME"]);
+        Assert.StartsWith("http://", capturedEnvironment["APPIUM_SERVER_URL"]);
+    }
+
+    [Fact]
     public async Task SourceUpdateRefusesDirtyAutomationWithoutFetchingOrSwitching()
     {
         CreateAutomationProject();
         var invocations = new List<string[]>();
         var service = new TestAutomationService(
             _root,
-            (_, arguments, _, _, _, _) =>
+            (_, arguments, _, _, _, _, _) =>
             {
                 var values = arguments.ToArray();
                 invocations.Add(values);
@@ -156,7 +221,7 @@ public sealed class TestAutomationServiceTests : IDisposable
         var invocations = new List<string[]>();
         var service = new TestAutomationService(
             _root,
-            (_, arguments, _, _, _, _) =>
+            (_, arguments, _, _, _, _, _) =>
             {
                 var values = arguments.ToArray();
                 invocations.Add(values);
@@ -175,6 +240,34 @@ public sealed class TestAutomationServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task SourceUpdateSupportsSarmentoBranchWithoutMergingDevOrMaster()
+    {
+        CreateAutomationProject();
+        Directory.CreateDirectory(Path.Combine(_root, ".git"));
+        var invocations = new List<string[]>();
+        var service = new TestAutomationService(
+            _root,
+            (_, arguments, _, _, _, _, _) =>
+            {
+                var values = arguments.ToArray();
+                invocations.Add(values);
+                var output = values.SequenceEqual(new[] { "branch", "--show-current" }) ? "dev\n" : string.Empty;
+                var exitCode = values.SequenceEqual(new[] { "show-ref", "--verify", "--quiet", "refs/heads/DEV-Sarmento" }) ? 1 : 0;
+                return Task.FromResult(new ProcessResult(exitCode, output, string.Empty));
+            },
+            _ => "available");
+
+        await service.UpdateSourceAsync("DEV-Sarmento", CancellationToken.None);
+
+        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "fetch", "origin", "DEV-Sarmento" }));
+        Assert.Contains(invocations, args => args.SequenceEqual(
+            new[] { "switch", "--track", "-c", "DEV-Sarmento", "origin/DEV-Sarmento" }));
+        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "merge", "--ff-only", "origin/DEV-Sarmento" }));
+        Assert.DoesNotContain(invocations, args => args.Contains("origin/dev", StringComparer.Ordinal));
+        Assert.DoesNotContain(invocations, args => args.Contains("origin/master", StringComparer.Ordinal));
+    }
+
+    [Fact]
     public async Task CancellationIsReturnedAsCanceledResult()
     {
         CreateAutomationProject();
@@ -182,7 +275,7 @@ public sealed class TestAutomationServiceTests : IDisposable
         cancellation.Cancel();
         var service = new TestAutomationService(
             _root,
-            (_, _, _, token, _, _) => Task.FromCanceled<ProcessResult>(token),
+            (_, _, _, token, _, _, _) => Task.FromCanceled<ProcessResult>(token),
             _ => "available");
         var deviceCatalog = DeviceCatalogService.Parse(new[] { "STONE_UDID=STONE123" });
 
@@ -201,7 +294,7 @@ public sealed class TestAutomationServiceTests : IDisposable
         var runnerCalled = false;
         var service = new TestAutomationService(
             _root,
-            (_, _, _, _, _, _) =>
+            (_, _, _, _, _, _, _) =>
             {
                 runnerCalled = true;
                 return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));

@@ -24,6 +24,8 @@ public sealed class MainForm : Form
     private readonly AdbService _adbService;
     private readonly ScrcpyService _scrcpyService;
     private readonly SmartUiAutomationService _smartAutomationService;
+    private readonly SmartPrinterProfileService _smartPrinterProfileService = new();
+    private readonly SmartPrinterConfigurationService _smartPrinterConfigurationService;
     private readonly DatabaseService _databaseService;
     private readonly SecretStore _secretStore;
     private readonly SettingsService _settingsService;
@@ -78,6 +80,7 @@ public sealed class MainForm : Form
             WriteLog("CATALOGO", $"{_deviceCatalog.DuplicateSerials.Count} UDID(s) duplicado(s) serão marcados para validação.", "WARN");
         _multiDeviceProvisioningService.JobChanged += snapshot => PostEvent("provisionJob", snapshot);
         _adbService = new AdbService(toolsDirectory);
+        _smartPrinterConfigurationService = new SmartPrinterConfigurationService(_adbService);
         _scrcpyService = new ScrcpyService(toolsDirectory);
         _smartAutomationService = new SmartUiAutomationService(_adbService);
         _vpnService = new VpnService(_secretStore, _settingsService, _appDataDirectory, message => WriteLog("VPN", message));
@@ -403,6 +406,7 @@ public sealed class MainForm : Form
             {
                 hasSavedToken = !string.IsNullOrWhiteSpace(_secretStore.Get(SecretStore.SmartTefToken))
             },
+            smartPrinterProfiles = _smartPrinterProfileService.GetAll(),
             logs = _logService.GetRecent(),
             capabilities = new
             {
@@ -655,6 +659,7 @@ public sealed class MainForm : Form
             if (ShouldUseSelfHost(payload, module))
             {
                 var selfHostInstallation = RequireSelfHostInstallation();
+                await EnsureSelfHostTargetsClientAsync(normalizedDatabase, selfHostInstallation);
                 items = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
                 listScope = IsModernSelfHost(selfHostInstallation) ? "selfhost41" : "selfhost40";
                 WriteLog(
@@ -724,6 +729,7 @@ public sealed class MainForm : Form
                 var nfeSeries = ReadString(payload, "nfeSeries")?.Trim() ?? string.Empty;
                 var nfeInitialNumberText = ReadString(payload, "nfeInitialNumber")?.Trim() ?? string.Empty;
                 var selfHostInstallation = RequireSelfHostInstallation();
+                await EnsureSelfHostTargetsClientAsync(normalizedDatabase, selfHostInstallation);
                 var modernSelfHost = IsModernSelfHost(selfHostInstallation);
 
                 var useNfce = !modernSelfHost || !string.IsNullOrWhiteSpace(nfceSeries);
@@ -916,7 +922,7 @@ public sealed class MainForm : Form
         SelfHostDeviceService.SelfHostInstallationInfo? installation = null;
         SelfHostBridgeResult? before = null;
         SelfHostBridgeResult? configured = null;
-        var serviceStopped = false;
+        var serviceMayBeStopped = false;
         var desiredPort = 7711;
         string? backupPath = null;
         try
@@ -929,8 +935,8 @@ public sealed class MainForm : Form
             SelfHostServiceManager.EnsurePortAvailable(desiredPort, before.Configuration?.PortaHttp);
 
             PostEvent("selfHostConfigurationProgress", new { stage = "stopping", message = "Parando o SelfHost para criar um backup consistente..." });
+            serviceMayBeStopped = true;
             await _selfHostServiceManager.StopAsync(installation.InstallPath, cancellationToken: _shutdown.Token);
-            serviceStopped = true;
             backupPath = _selfHostBackupService.CreateStoppedBackup(installation.InstallPath, installation.Generation);
             WriteLog("SELFHOST", $"Ponto de restauração preparado antes da configuração em {backupPath}.");
 
@@ -940,7 +946,7 @@ public sealed class MainForm : Form
 
             PostEvent("selfHostConfigurationProgress", new { stage = "restarting", message = "Reiniciando o SelfHost e aguardando a porta local..." });
             await _selfHostServiceManager.StartAsync(installation.InstallPath, desiredPort, cancellationToken: _shutdown.Token);
-            serviceStopped = false;
+            serviceMayBeStopped = false;
 
             PostEvent("selfHostConfigurationProgress", new { stage = "validating", message = "Validando healthchecks, autenticação e empresa..." });
             var validation = await _selfHostBridgeService.ValidateAsync(
@@ -960,7 +966,7 @@ public sealed class MainForm : Form
         }
         finally
         {
-            if (serviceStopped && installation is not null)
+            if (serviceMayBeStopped && installation is not null)
             {
                 try
                 {
@@ -976,6 +982,17 @@ public sealed class MainForm : Form
             }
             PostBusy("selfHostConfiguration", false);
         }
+    }
+
+    private async Task EnsureSelfHostTargetsClientAsync(
+        string database,
+        SelfHostDeviceService.SelfHostInstallationInfo installation)
+    {
+        var current = await _selfHostBridgeService.ReadAsync(installation.InstallPath, _shutdown.Token);
+        if (SelfHostClientMatcher.IsDesktop(current.Configuration))
+            throw new InvalidOperationException("O SelfHost está configurado para Softshop Desktop e não pode listar dispositivos do Softcomshop Web.");
+        if (!SelfHostClientMatcher.Matches(current.Configuration, database))
+            throw new InvalidOperationException(SelfHostClientMatcher.DescribeMismatch(current.Configuration, database));
     }
 
     private async Task<SelfHostDesiredConfiguration> BuildSelfHostDesiredConfigurationAsync(
@@ -1594,6 +1611,7 @@ public sealed class MainForm : Form
                 await RefreshAndroidAsync();
 
             var catalog = _testAutomationService.LoadCatalog(_androidDevices, _deviceCatalog);
+            SaveTestAutomationChannel(catalog.Source.CurrentBranch);
             PostEvent("testAutomationCatalog", catalog);
         }
         finally
@@ -1621,6 +1639,7 @@ public sealed class MainForm : Form
                 _shutdown.Token,
                 progress => PostEvent("testAutomationSourceProgress", progress));
             var catalog = _testAutomationService.LoadCatalog(_androidDevices, _deviceCatalog);
+            SaveTestAutomationChannel(catalog.Source.CurrentBranch);
             PostEvent("testAutomationCatalog", catalog);
             PostEvent("toast", new
             {
@@ -1640,6 +1659,14 @@ public sealed class MainForm : Form
             lock (_testAutomationGate) _testAutomationSourceUpdating = false;
             PostBusy("testAutomationSource", false);
         }
+    }
+
+    private void SaveTestAutomationChannel(string? channel)
+    {
+        if (string.IsNullOrWhiteSpace(channel)) return;
+        var settings = _settingsService.Load();
+        settings.TestAutomationChannel = channel;
+        _settingsService.Save(settings);
     }
 
     private async Task RunTestAutomationAsync(JsonElement payload)
@@ -1851,6 +1878,7 @@ public sealed class MainForm : Form
         if (ShouldUseSelfHost(payload, module))
         {
             var selfHostInstallation = RequireSelfHostInstallation();
+            await EnsureSelfHostTargetsClientAsync(database, selfHostInstallation);
             string selfHostUrl;
             if (IsModernSelfHost(selfHostInstallation))
             {
@@ -1931,6 +1959,7 @@ public sealed class MainForm : Form
             if (ShouldUseSelfHost(payload, module))
             {
                 var selfHostInstallation = RequireSelfHostInstallation();
+                await EnsureSelfHostTargetsClientAsync(database, selfHostInstallation);
                 if (IsModernSelfHost(selfHostInstallation))
                 {
                     var normalizedDatabase = EnvironmentCatalog.NormalizeDatabaseName(database);
@@ -2253,6 +2282,8 @@ public sealed class MainForm : Form
                 ?? throw new InvalidOperationException(ShouldUseSelfHost(payload, module) ? "Selecione um dispositivo SelfHost." : "Selecione um dispositivo Softcomshop.");
             var useSelfHost = ShouldUseSelfHost(payload, module);
             var selfHostInstallation = useSelfHost ? RequireSelfHostInstallation() : null;
+            if (selfHostInstallation is not null)
+                await EnsureSelfHostTargetsClientAsync(database, selfHostInstallation);
             var modernSelfHost = selfHostInstallation is not null && IsModernSelfHost(selfHostInstallation);
             var confirmedSmartDeviceId = GetConfirmedSmartDeviceId(serial, android.AndroidId);
 
@@ -2407,6 +2438,34 @@ public sealed class MainForm : Form
                         Progress,
                         _shutdown.Token);
                 }
+                SmartPrinterConfigurationResult? selfHostPrinter = null;
+                if (selfHostLinked)
+                {
+                    selfHostPrinter = await ApplyInternalSmartConfigurationAsync(
+                        payload,
+                        android,
+                        selfHostAutomation.PackageName,
+                        module,
+                        Progress,
+                        _shutdown.Token);
+                    if (selfHostPrinter is { Success: false })
+                    {
+                        PostEvent("smartPreparationFinished", new
+                        {
+                            success = false,
+                            module,
+                            accessMode = "selfhost",
+                            stage = selfHostPrinter.Stage,
+                            message = selfHostPrinter.Message,
+                            packageName = selfHostAutomation.PackageName,
+                            smartDeviceId = selfHostExpectedDeviceId,
+                            adbAndroidId = android.AndroidId,
+                            url = selfHostUrl,
+                            linkConfirmed = true
+                        });
+                        return;
+                    }
+                }
                 var selfHostItems = await _selfHostDeviceService.ListDevicesAsync(_shutdown.Token);
                 var selfHostFailure = selfHostRefreshed is null || string.IsNullOrWhiteSpace(selfHostRefreshed.DeviceId)
                     ? $"A URL foi confirmada no Smart, mas o SelfHost nao registrou um Device ID em {oauthClient.Name}."
@@ -2417,8 +2476,8 @@ public sealed class MainForm : Form
                     success = selfHostLinked, module, accessMode = "selfhost", stage = selfHostLinked ? "linked" : "verify",
                     message = selfHostLinked
                         ? smartUiFinalized
-                            ? $"Dispositivo SelfHost vinculado com sucesso. device_id = {selfHostExpectedDeviceId}; confirmacao final encerrada no Smart."
-                            : $"Dispositivo SelfHost vinculado com sucesso. device_id = {selfHostExpectedDeviceId}; o Android nao expos o botao OK para fechamento automatico."
+                            ? $"Dispositivo SelfHost vinculado com sucesso. device_id = {selfHostExpectedDeviceId}; confirmacao final encerrada no Smart.{BuildPrinterCompletionSuffix(selfHostPrinter)}"
+                            : $"Dispositivo SelfHost vinculado com sucesso. device_id = {selfHostExpectedDeviceId}; o Android nao expos o botao OK para fechamento automatico.{BuildPrinterCompletionSuffix(selfHostPrinter)}"
                         : selfHostFailure,
                     packageName = selfHostAutomation.PackageName, smartDeviceId = selfHostAutomation.SmartDeviceId, adbAndroidId = android.AndroidId, url = selfHostUrl
                 });
@@ -2807,6 +2866,32 @@ public sealed class MainForm : Form
                             _shutdown.Token);
                     }
 
+                    var onlinePrinter = await ApplyInternalSmartConfigurationAsync(
+                        payload,
+                        android,
+                        onlineAutomation.PackageName,
+                        module,
+                        Progress,
+                        _shutdown.Token);
+                    if (onlinePrinter is { Success: false })
+                    {
+                        PostEvent("smartPreparationFinished", new
+                        {
+                            success = false,
+                            module,
+                            accessMode = effectiveAccessMode,
+                            stage = onlinePrinter.Stage,
+                            message = onlinePrinter.Message,
+                            packageName = onlineAutomation.PackageName,
+                            url = onlineUrl,
+                            deviceId = linkedDeviceId,
+                            smartDeviceId = linkedDeviceId,
+                            adbAndroidId = android.AndroidId,
+                            linkConfirmed = true
+                        });
+                        return;
+                    }
+
                     Progress(
                         modernSelfHost ? "selfhost-complete" : "online-complete",
                         modernSelfHost
@@ -2829,8 +2914,8 @@ public sealed class MainForm : Form
                         accessMode = effectiveAccessMode,
                         stage = "linked",
                         message = !smartUiFinalized
-                            ? $"Dispositivo vinculado com sucesso e device_id = {linkedDeviceId} confirmado. A tela final do Smart nao expos o botao para fechamento automatico; se ela ainda estiver aberta, toque em OK."
-                            : $"Dispositivo vinculado com sucesso. O Softcomshop confirmou device_id = {linkedDeviceId} e o procedimento foi finalizado.",
+                            ? $"Dispositivo vinculado com sucesso e device_id = {linkedDeviceId} confirmado. A tela final do Smart nao expos o botao para fechamento automatico; se ela ainda estiver aberta, toque em OK.{BuildPrinterCompletionSuffix(onlinePrinter)}"
+                            : $"Dispositivo vinculado com sucesso. O Softcomshop confirmou device_id = {linkedDeviceId} e o procedimento foi finalizado.{BuildPrinterCompletionSuffix(onlinePrinter)}",
                         packageName = onlineAutomation.PackageName,
                         url = onlineUrl,
                         deviceId = linkedDeviceId,
@@ -3099,12 +3184,37 @@ public sealed class MainForm : Form
             if (linked)
             {
                 WriteLog("SMART", $"Vinculo confirmado no banco para Device ID {expectedDeviceId}.");
+                var databasePrinter = await ApplyInternalSmartConfigurationAsync(
+                    payload,
+                    android,
+                    automation.PackageName,
+                    module,
+                    Progress,
+                    _shutdown.Token);
+                if (databasePrinter is { Success: false })
+                {
+                    PostEvent("smartPreparationFinished", new
+                    {
+                        success = false,
+                        module,
+                        stage = databasePrinter.Stage,
+                        message = databasePrinter.Message,
+                        accessMode,
+                        packageName = automation.PackageName,
+                        url,
+                        deviceId = expectedDeviceId,
+                        smartDeviceId = automation.SmartDeviceId,
+                        adbAndroidId = android.AndroidId,
+                        linkConfirmed = true
+                    });
+                    return;
+                }
                 PostEvent("smartPreparationFinished", new
                 {
                     success = true,
                     module,
                     stage = "linked",
-                    message = $"Dispositivo vinculado com sucesso. O banco confirmou device_id = {expectedDeviceId}.",
+                    message = $"Dispositivo vinculado com sucesso. O banco confirmou device_id = {expectedDeviceId}.{BuildPrinterCompletionSuffix(databasePrinter)}",
                     accessMode,
                     packageName = automation.PackageName,
                     url,
@@ -3314,6 +3424,50 @@ public sealed class MainForm : Form
             _ => defaultValue
         };
     }
+
+    private async Task<SmartPrinterConfigurationResult?> ApplyInternalSmartConfigurationAsync(
+        JsonElement payload,
+        DeviceInfo android,
+        string packageName,
+        string module,
+        Action<string, string> progress,
+        CancellationToken cancellationToken)
+    {
+        var preset = ReadString(payload, "configurationPreset")?.Trim();
+        if (!string.Equals(preset, "module-default", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(module, "smart_tef", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var profile = _smartPrinterProfileService.Resolve(module, android.ProvisioningProfile);
+        if (profile is null)
+        {
+            return SmartPrinterConfigurationResult.Failed(
+                "printer-profile",
+                $"O vinculo foi confirmado, mas ainda nao existe perfil de impressora para o modulo {module} no dispositivo {android.FriendlyName}.");
+        }
+
+        if (string.IsNullOrWhiteSpace(packageName))
+        {
+            return SmartPrinterConfigurationResult.Failed(
+                "printer-package",
+                "O vinculo foi confirmado, mas o package real do Smart nao estava disponivel para aplicar a impressora.",
+                profile);
+        }
+
+        return await _smartPrinterConfigurationService.ApplyAsync(
+            android.Serial,
+            packageName,
+            profile,
+            progress,
+            cancellationToken);
+    }
+
+    private static string BuildPrinterCompletionSuffix(SmartPrinterConfigurationResult? result) =>
+        result is { Success: true, Profile: not null }
+            ? $" Impressora {result.Profile.DisplayName} aplicada."
+            : string.Empty;
 
     private SelfHostDeviceService.SelfHostInstallationInfo RequireSelfHostInstallation()
     {

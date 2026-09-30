@@ -209,6 +209,8 @@
                 </div>
               </div>
 
+              <div class="selfhost-client-guidance hidden" id="selfhost-client-guidance" role="status"></div>
+
               <div class="selfhost-config-content hidden" id="selfhost-config-content">
                 <div class="selfhost-root-config" id="selfhost-root-config">
                   <div id="selfhost-softcomshop-config">
@@ -497,6 +499,15 @@
             </span>
           </label>
 
+          <label class="field internal-config-field" id="internal-config-field">
+            <span>Configurações internas após o vínculo</span>
+            <select id="configuration-preset">
+              <option value="none">Somente provisionar</option>
+              <option value="module-default">Aplicar configuração padrão do módulo</option>
+            </select>
+            <small id="configuration-preset-summary">Selecione um módulo e um Android para consultar o perfil disponível.</small>
+          </label>
+
           <div class="final-actions">
             <button class="secondary big" id="validate-link" disabled>Validar</button>
             <button class="primary big" id="prepare-smart" disabled>Provisionar selecionados</button>
@@ -525,8 +536,9 @@
             <label class="test-source-field">
               <span>Fonte dos testes</span>
               <select id="test-automation-channel">
-                <option value="master">Estável (master)</option>
-                <option value="dev">DEV (experimental)</option>
+                <option value="master">Padrão estável (master)</option>
+                <option value="dev">Padrão em desenvolvimento (dev)</option>
+                <option value="DEV-Sarmento">Sarmento (DEV-Sarmento)</option>
               </select>
               <small id="test-automation-version">Verificando branch...</small>
             </label>
@@ -764,6 +776,7 @@
         <div><span>Dispositivos</span><strong id="provision-confirm-devices">—</strong></div>
         <div><span>Acesso</span><strong id="provision-confirm-access">—</strong></div>
         <div><span>Dados locais</span><strong id="provision-confirm-data">—</strong></div>
+        <div><span>Configuração interna</span><strong id="provision-confirm-preset">—</strong></div>
       </div>
       <div class="provision-confirm-warning">
         Vínculos anteriores serão verificados antes do envio. O resultado será acompanhado individualmente em cada dispositivo.

@@ -13,7 +13,7 @@ public sealed class SelfHostBackupService
     public string CreateStoppedBackup(string installRoot, string generation)
     {
         EnsureConfigurationToolsClosed();
-        if (Process.GetProcessesByName("SelfHost").Any() || Process.GetProcessesByName("Selfhost.MonitorService").Any())
+        if (SelfHostServiceManager.HasRunningInstallationProcess(installRoot))
             throw new InvalidOperationException("O backup exige SelfHost e MonitorService parados.");
 
         var backupRoot = Path.Combine(

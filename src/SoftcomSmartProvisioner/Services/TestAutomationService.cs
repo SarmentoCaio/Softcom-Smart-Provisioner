@@ -8,14 +8,14 @@ public sealed partial class TestAutomationService
 {
     private const int TestTimeoutMilliseconds = 2 * 60 * 60 * 1000;
     private const int GitTimeoutMilliseconds = 60 * 1000;
-    private static readonly string[] SupportedChannels = ["master", "dev"];
+    private static readonly string[] SupportedChannels = ["master", "dev", "DEV-Sarmento"];
     private readonly string? _explicitRoot;
-    private readonly Func<string, IEnumerable<string>, string, CancellationToken, int, Action<string>?, Task<ProcessResult>> _processRunner;
+    private readonly Func<string, IEnumerable<string>, string, CancellationToken, int, Action<string>?, IReadOnlyDictionary<string, string?>?, Task<ProcessResult>> _processRunner;
     private readonly Func<string, string?> _commandResolver;
 
     public TestAutomationService(
         string? explicitRoot = null,
-        Func<string, IEnumerable<string>, string, CancellationToken, int, Action<string>?, Task<ProcessResult>>? processRunner = null,
+        Func<string, IEnumerable<string>, string, CancellationToken, int, Action<string>?, IReadOnlyDictionary<string, string?>?, Task<ProcessResult>>? processRunner = null,
         Func<string, string?>? commandResolver = null)
     {
         _explicitRoot = explicitRoot;
@@ -137,9 +137,11 @@ public sealed partial class TestAutomationService
         if (!catalog.Prerequisites.UvAvailable)
             throw new InvalidOperationException("O comando uv não está disponível no PATH.");
 
+        var connectedDevice = connectedDevices.FirstOrDefault(x =>
+            string.Equals(x.Serial, request.Serial, StringComparison.OrdinalIgnoreCase));
         var device = catalog.Devices.FirstOrDefault(x =>
             string.Equals(x.Serial, request.Serial, StringComparison.OrdinalIgnoreCase));
-        if (device is null || !device.IsOnline)
+        if (connectedDevice is null || device is null || !device.IsOnline)
             throw new InvalidOperationException("O Android selecionado não está conectado.");
 
         var deviceTag = NormalizeDeviceTag(request.DeviceTag);
@@ -178,19 +180,32 @@ public sealed partial class TestAutomationService
         arguments.Add("-NoAllureOpen");
 
         var appiumServerUrl = ResolveLocalAppiumServerUrl();
-        var previousAppiumServerUrl = Environment.GetEnvironmentVariable("APPIUM_SERVER_URL", EnvironmentVariableTarget.Process);
+        var childEnvironment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["APPIUM_SERVER_URL"] = appiumServerUrl
+        };
+        var legacyAppiumHome = ResolveLegacyAppiumHome(root, connectedDevice);
+        if (legacyAppiumHome is not null)
+            childEnvironment["APPIUM_HOME"] = legacyAppiumHome;
 
         var stopwatch = Stopwatch.StartNew();
         using var heartbeatCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var heartbeatTask = ReportHeartbeatAsync(stopwatch, onProgress, heartbeatCancellation.Token);
         try
         {
-            Environment.SetEnvironmentVariable("APPIUM_SERVER_URL", appiumServerUrl, EnvironmentVariableTarget.Process);
             onProgress?.Invoke(new TestAutomationProgress(
                 DateTimeOffset.Now, "preparando", $"Preparando {suite.Name} para {device.FriendlyName}. Appium: {appiumServerUrl}", "INFO"));
+            if (legacyAppiumHome is not null)
+            {
+                onProgress?.Invoke(new TestAutomationProgress(
+                    DateTimeOffset.Now,
+                    "appium",
+                    "Android 7 detectado. Usando o ambiente Appium compativel com o K2.",
+                    "INFO"));
+            }
             var result = await _processRunner(
                 ResolvePowerShell(), arguments, root, cancellationToken, TestTimeoutMilliseconds,
-                line => ForwardSafeProgress(line, onProgress));
+                line => ForwardSafeProgress(line, onProgress), childEnvironment);
             stopwatch.Stop();
             var reportPath = campaignName is null
                 ? ResolveLatestReportPath(root)
@@ -218,7 +233,6 @@ public sealed partial class TestAutomationService
         }
         finally
         {
-            Environment.SetEnvironmentVariable("APPIUM_SERVER_URL", previousAppiumServerUrl, EnvironmentVariableTarget.Process);
             heartbeatCancellation.Cancel();
             try { await heartbeatTask; } catch (OperationCanceledException) { }
         }
@@ -377,7 +391,31 @@ public sealed partial class TestAutomationService
                 if (string.IsNullOrWhiteSpace(line)) return;
                 onProgress?.Invoke(new TestAutomationProgress(
                     DateTimeOffset.Now, "fonte", SensitiveDataSanitizer.Clean(line.Trim()), "INFO"));
-            });
+            }, null);
+    }
+
+    private static string? ResolveLegacyAppiumHome(string automationRoot, DeviceInfo device)
+    {
+        if (!int.TryParse(device.AndroidSdk, out var sdk) || sdk >= 26) return null;
+
+        var configured = Environment.GetEnvironmentVariable("SOFTCOM_LEGACY_APPIUM_HOME")?.Trim();
+        var candidates = new[]
+        {
+            configured,
+            Path.Combine(Directory.GetParent(automationRoot)?.FullName ?? automationRoot, ".appium-k2"),
+            Path.Combine(automationRoot, ".appium-k2")
+        };
+
+        foreach (var candidate in candidates.Where(path => !string.IsNullOrWhiteSpace(path)))
+        {
+            var fullPath = Path.GetFullPath(candidate!);
+            if (File.Exists(Path.Combine(fullPath, "node_modules", "appium-uiautomator2-driver", "package.json")))
+                return fullPath;
+        }
+
+        throw new InvalidOperationException(
+            "O Android 7 exige o ambiente Appium legado. Configure SOFTCOM_LEGACY_APPIUM_HOME " +
+            "ou instale o driver compativel na pasta .appium-k2 ao lado do projeto Automation.");
     }
 
     private static void EnsureGitSuccess(ProcessResult result, string message)
@@ -440,9 +478,14 @@ public sealed partial class TestAutomationService
     private static string NormalizeChannel(string? value)
     {
         var channel = value?.Trim().ToLowerInvariant() ?? string.Empty;
-        if (!SupportedChannels.Contains(channel, StringComparer.Ordinal))
-            throw new InvalidOperationException("Canal do Automation inválido. Escolha master ou dev.");
-        return channel;
+        return channel switch
+        {
+            "master" => "master",
+            "dev" => "dev",
+            "dev-sarmento" => "DEV-Sarmento",
+            _ => throw new InvalidOperationException(
+                "Canal do Automation inválido. Escolha master, dev ou DEV-Sarmento.")
+        };
     }
 
     private static bool SupportsCampaignRunner(string runnerPath)
@@ -478,6 +521,7 @@ public sealed partial class TestAutomationService
         "pdv" => "PDV",
         "commands" => "Comanda",
         "minimarket" => "Minimercado",
+        "totem" => "Autoatendimento (Totem)",
         _ => value
     };
 

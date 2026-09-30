@@ -691,6 +691,9 @@ select:focus, input:focus { border-color: rgba(255,106,0,.65); box-shadow: 0 0 0
 }
 .provision-option strong { display: block; font-size: 11px; }
 .provision-option small { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.internal-config-field { grid-column: 1 / -1; }
+.internal-config-field small { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.internal-config-field small.warning { color: #ffb46a; }
 
 /* Package Android em primeiro plano */
 .package-item.package-current {
@@ -1036,6 +1039,10 @@ select, input { padding: 8px 9px; border-radius: 8px; }
 .selfhost-status.ok { color:#63d89b !important; }
 .selfhost-status.warn { color:#f0b967 !important; }
 .selfhost-status.bad { color:#ef7777 !important; }
+.selfhost-client-guidance { margin:8px 0 2px; padding:8px 10px; border:1px solid rgba(240,185,103,.4); border-radius:9px; background:rgba(240,185,103,.08); color:#f1c983; font-size:11px; line-height:1.45; }
+.selfhost-client-guidance.ok { border-color:rgba(99,216,155,.35); background:rgba(99,216,155,.07); color:#79dfa9; }
+.selfhost-client-guidance.warn { border-color:rgba(240,185,103,.4); background:rgba(240,185,103,.08); color:#f1c983; }
+.selfhost-client-guidance.bad { border-color:rgba(239,119,119,.45); background:rgba(239,119,119,.08); color:#f39797; }
 .selfhost-root-config { display:grid; gap:8px; }
 .selfhost-root-config .field { margin-bottom:0; }
 .selfhost-root-field select { width:100%; min-width:0; }

@@ -51,6 +51,7 @@
     updateRequired: false,
     latestVersion: "",
     hasSavedTefToken: false,
+    smartPrinterProfiles: [],
     tefSettingsInitialized: false,
     busy: new Set()
   };
@@ -107,6 +108,7 @@
     $("provision-confirm-devices").textContent = selectedProvisionDevicesLabel();
     $("provision-confirm-access").textContent = options.accessLabel || "—";
     $("provision-confirm-data").textContent = options.clearData ? "Serão limpos" : "Serão preservados";
+    $("provision-confirm-preset").textContent = options.configurationLabel || "Somente provisionar";
     modal.classList.remove("hidden");
     setTimeout(() => $("provision-confirm-submit")?.focus(), 0);
   }
@@ -254,6 +256,9 @@
     if ($("update-auto-install")) $("update-auto-install").checked = b.settings.autoInstallUpdates !== false;
     if ($("update-stable-url")) $("update-stable-url").value = b.settings.stableManifestUrl || "";
     if ($("update-beta-url")) $("update-beta-url").value = b.settings.betaManifestUrl || "";
+    if (["master", "dev", "DEV-Sarmento"].includes(b.settings.testAutomationChannel)) {
+      state.testAutomationChannel = b.settings.testAutomationChannel;
+    }
     const activeManifest = (b.settings.updateChannel === "beta" ? b.settings.betaManifestUrl : b.settings.stableManifestUrl) || "";
     if ($("update-status-badge") && !state.updateAvailable) {
       $("update-status-badge").textContent = activeManifest ? "Configurado" : "Não configurado";
@@ -867,10 +872,34 @@
     return hasRequiredText && validPort && hasPassword;
   }
 
+  function configuredSelfHostClient(config = state.selfHostConfiguration) {
+    try {
+      const host = new URL(config?.softcomShopUrlBase || "").hostname.toLowerCase();
+      return host.endsWith(".meusoftcom.com.br")
+        ? host.slice(0, -".meusoftcom.com.br".length)
+        : host;
+    } catch {
+      return "";
+    }
+  }
+
+  function selfHostClientMatchesSelection(config = state.selfHostConfiguration) {
+    if (!config || !state.database || state.selfHostBackend === "softshop") return true;
+    const configured = configuredSelfHostClient(config);
+    const selected = displayDatabaseName(state.database).trim().toLowerCase();
+    return !!configured && configured === selected;
+  }
+
+  function selfHostClientMismatch(config = state.selfHostConfiguration) {
+    if (!config || !state.database || state.selfHostBackend === "softshop") return false;
+    return !!configuredSelfHostClient(config) && !selfHostClientMatchesSelection(config);
+  }
+
   function isStoredSelfHostConfigurationComplete(config = state.selfHostConfiguration) {
     if (config?.isComplete !== true) return false;
     const storedDesktop = String(config?.tipoBancoDados || "").toLowerCase().includes("desktop");
     if ((state.selfHostBackend === "softshop") !== storedDesktop) return false;
+    if (!storedDesktop && !selfHostClientMatchesSelection(config)) return false;
     return state.module !== "smart_comanda" || storedDesktop || config?.isTableDatabaseComplete === true;
   }
 
@@ -880,6 +909,9 @@
     if (installed && !state.selfHostConfigurationLoaded && !state.selfHostReadRequested) {
       state.selfHostReadRequested = true;
       send("readSelfHostConfiguration");
+    }
+    if (state.selfHostConfigurationLoaded && selfHostClientMismatch()) {
+      state.selfHostConfigExpanded = true;
     }
     if (!state.selfHostConfigExpanded || state.selfHostBackend !== "softcomshop" || !state.database || !state.company) {
       state.selfHostRootDevices = [];
@@ -908,10 +940,30 @@
         status.textContent = `SelfHost ${sh.version || "?"} · ${sh.generation || ""} · configuração não carregada`;
         status.className = "selfhost-status";
       } else {
+        const mismatch = selfHostClientMismatch(config);
         const complete = isStoredSelfHostConfigurationComplete(config);
-        const label = complete ? "Configurado" : (config?.hasClientId || config?.hasClientSecret ? "Configuração incompleta" : "Não configurado");
+        const label = mismatch
+          ? `Configurado para ${configuredSelfHostClient(config) || "outro cliente"}`
+          : (complete ? "Configurado" : (config?.hasClientId || config?.hasClientSecret ? "Configuração incompleta" : "Não configurado"));
         status.textContent = `SelfHost ${sh.version || "?"} · ${sh.generation || ""} · ${label}`;
-        status.className = `selfhost-status ${complete ? "ok" : "warn"}`;
+        status.className = `selfhost-status ${complete && !mismatch ? "ok" : "warn"}`;
+      }
+    }
+
+    const clientGuidance = $("selfhost-client-guidance");
+    if (clientGuidance) {
+      const mismatch = selfHostClientMismatch(config);
+      const configuredClient = configuredSelfHostClient(config);
+      const selectedClient = state.database ? displayDatabaseName(state.database) : "";
+      const comparable = state.selfHostBackend === "softcomshop" && !!selectedClient && !!configuredClient;
+      clientGuidance.classList.toggle("hidden", !comparable);
+      clientGuidance.classList.toggle("warn", !!mismatch);
+      clientGuidance.classList.remove("bad");
+      clientGuidance.classList.toggle("ok", comparable && !mismatch);
+      if (mismatch) {
+        clientGuidance.innerHTML = `O SelfHost está configurado para o cliente <strong>${escapeHtml(configuredClient)}</strong>. Para usar <strong>${escapeHtml(selectedClient)}</strong>, selecione abaixo um dispositivo raiz desse cliente e clique em <strong>Configurar SelfHost</strong>.`;
+      } else if (comparable) {
+        clientGuidance.innerHTML = `SelfHost confirmado para o cliente selecionado: <strong>${escapeHtml(selectedClient)}</strong>.`;
       }
     }
 
@@ -1221,6 +1273,60 @@
     }
 
     updateActions();
+    renderInternalConfiguration();
+  }
+
+  function selectedPrinterProfiles(module = state.module) {
+    const selected = new Set(state.androidSerials || []);
+    return state.androidDevices
+      .filter(device => selected.has(device.serial))
+      .map(device => ({
+        device,
+        profile: state.smartPrinterProfiles.find(profile =>
+          String(profile.module || "").toLowerCase() === String(module || "").toLowerCase() &&
+          String(profile.provisioningProfile || "").toLowerCase() === String(device.provisioningProfile || "").toLowerCase()) || null
+      }));
+  }
+
+  function renderInternalConfiguration() {
+    const field = $("internal-config-field");
+    const select = $("configuration-preset");
+    const summary = $("configuration-preset-summary");
+    if (!field || !select || !summary) return;
+    const tef = isTefMode();
+    field.classList.toggle("hidden", tef);
+    if (tef) {
+      select.value = "none";
+      return;
+    }
+
+    const matches = selectedPrinterProfiles();
+    if (!matches.length) {
+      summary.textContent = "Selecione um Android para consultar o perfil do módulo.";
+      summary.classList.remove("warning");
+      return;
+    }
+    const missing = matches.filter(x => !x.profile);
+    if (missing.length) {
+      summary.textContent = `[VALIDAR] Sem perfil para ${missing.map(x => x.device.friendlyName || x.device.serial).join(", ")} neste módulo.`;
+      summary.classList.add("warning");
+      return;
+    }
+    summary.textContent = matches.map(x => `${x.device.friendlyName}: ${x.profile.description} (${x.profile.driver})`).join(" · ");
+    summary.classList.remove("warning");
+  }
+
+  function getConfigurationPreset(module = state.module) {
+    if (module === "smart_tef") return "none";
+    return $("configuration-preset")?.value || "none";
+  }
+
+  function getConfigurationPresetLabel(module = state.module) {
+    if (getConfigurationPreset(module) !== "module-default") return "Somente provisionar";
+    const profiles = selectedPrinterProfiles(module);
+    return profiles.length && profiles.every(x => x.profile)
+      ? profiles.map(x => `${x.profile.description} (${x.profile.driver})`).join(" · ")
+      : "Padrão do módulo [VALIDAR]";
   }
 
   function assignProvisioningTargets() {
@@ -1583,7 +1689,7 @@
     renderTestPrerequisites();
 
     const source = catalog.source || {};
-    const channels = source.availableChannels || ["master", "dev"];
+    const channels = source.availableChannels || ["master", "dev", "DEV-Sarmento"];
     if (channels.includes(source.currentBranch)) state.testAutomationChannel = source.currentBranch;
     const channelSelect = $("test-automation-channel");
     if (channelSelect) {
@@ -2011,6 +2117,7 @@
     $("module-select").addEventListener("change", e => {
       const wasSelfHost = isSelfHostMode();
       state.module = e.target.value;
+      renderInternalConfiguration();
       const remainsSelfHost = wasSelfHost && isSelfHostMode();
 
       // Trocar apenas o modulo nao altera a origem dos dispositivos quando o SelfHost
@@ -2037,6 +2144,7 @@
     $("selfhost-base-url")?.addEventListener("input", e => {
       state.selfHostBaseUrl = e.target.value.trim();
     });
+    $("configuration-preset")?.addEventListener("change", renderInternalConfiguration);
 
     ["tef-device-name", "tef-cnpj", "tef-empresa-id", "tef-token"].forEach(id => {
       $(id).addEventListener("input", () => {
@@ -2128,6 +2236,7 @@
           moduleLabel: "Smart TEF",
           accessLabel: "Configuração direta no Android",
           clearData,
+          configurationLabel: "Somente provisionar",
           onConfirm: () => {
             renderValidation({ status: "ready", title: "Configurando Smart TEF", detail: "Percorrendo o fluxo inicial do package detectado e preenchendo os dados manuais." });
             setBusy("provision", true);
@@ -2156,6 +2265,11 @@
         toast("Selecione um cadastro diferente para cada Android escolhido.", "error");
         return;
       }
+      if (getConfigurationPreset(requestedModule) === "module-default" &&
+          selectedPrinterProfiles(requestedModule).some(x => !x.profile)) {
+        toast("A configuração padrão ainda não foi mapeada para todos os Androids selecionados neste módulo.", "error");
+        return;
+      }
 
       const moduleLabel = $("module-select").selectedOptions[0]?.textContent || "Smart";
       const modeInfo = requestedUseSelfHost
@@ -2173,6 +2287,7 @@
         moduleLabel,
         accessLabel: requestedUseSelfHost ? "SelfHost" : state.accessMode === "online" ? "Softcomshop Web" : "Docker local",
         clearData,
+        configurationLabel: getConfigurationPresetLabel(requestedModule),
         onConfirm: () => {
           renderValidation({ status: "ready", title: "Iniciando preparação", detail: "Validando o cenário e abrindo o Smart nos Androids selecionados." });
           setBusy("provision", true);
@@ -2187,7 +2302,8 @@
             module: requestedModule,
             useSelfHost: requestedUseSelfHost,
             selfHostBaseUrl: getSelfHostBaseUrl(),
-            clearData
+            clearData,
+            configurationPreset: getConfigurationPreset(requestedModule)
           });
         }
       });
@@ -2245,7 +2361,8 @@
       send("loadTestAutomation", { refreshDevices: true });
     });
     $("test-automation-channel")?.addEventListener("change", e => {
-      state.testAutomationChannel = e.target.value === "master" ? "master" : "dev";
+      const requested = e.target.value;
+      state.testAutomationChannel = ["master", "dev", "DEV-Sarmento"].includes(requested) ? requested : "dev";
     });
     $("update-test-automation-source")?.addEventListener("click", () => {
       clearInlineError("test-automation-error");
@@ -2290,7 +2407,9 @@
     switch (type) {
       case "bootstrap":
         state.bootstrap = payload;
+        state.smartPrinterProfiles = payload.smartPrinterProfiles || [];
         renderBootstrap();
+        renderInternalConfiguration();
         updateActions();
         break;
       case "busy":
@@ -2568,7 +2687,10 @@
         break;
       case "selfHostConfigurationProgress":
         clearInlineError("selfhost-config-error");
-        if ($("selfhost-status")) $("selfhost-status").textContent = payload.message || "Configurando SelfHost...";
+        if ($("selfhost-status")) {
+          $("selfhost-status").textContent = payload.message || "Configurando SelfHost...";
+          $("selfhost-status").className = "selfhost-status ok";
+        }
         break;
       case "selfHostConfigurationConfigured": {
         const result = payload.result || {};
@@ -2633,9 +2755,14 @@
         break;
       case "smartPreparationFinished": {
         const tef = payload.module === "smart_tef";
+        const internalConfigFailed = !payload.success && payload.linkConfirmed;
         renderValidation({
           status: payload.success ? "success" : "danger",
-          title: payload.success ? (tef ? "Smart TEF configurado" : "Smart vinculado") : (tef ? "Erro ao configurar Smart TEF" : "Erro ao vincular dispositivo"),
+          title: payload.success
+            ? (tef ? "Smart TEF configurado" : "Smart vinculado")
+            : internalConfigFailed
+              ? "Vínculo concluído; configuração interna falhou"
+              : (tef ? "Erro ao configurar Smart TEF" : "Erro ao vincular dispositivo"),
           detail: payload.message || "Processo finalizado."
         });
         if (!tef && payload.url) {

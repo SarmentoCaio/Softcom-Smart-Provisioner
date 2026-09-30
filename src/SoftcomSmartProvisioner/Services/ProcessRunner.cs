@@ -18,7 +18,8 @@ public static class ProcessRunner
         IEnumerable<string> arguments,
         string workingDirectory,
         CancellationToken cancellationToken,
-        int timeoutMilliseconds = 30000)
+        int timeoutMilliseconds = 30000,
+        string? standardInput = null)
     {
         using var process = new Process
         {
@@ -30,10 +31,14 @@ public static class ProcessRunner
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                RedirectStandardInput = standardInput is not null,
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8
             }
         };
+
+        if (standardInput is not null)
+            process.StartInfo.StandardInputEncoding = Encoding.UTF8;
 
         foreach (var argument in arguments)
         {
@@ -44,6 +49,13 @@ public static class ProcessRunner
 
         var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+
+        if (standardInput is not null)
+        {
+            await process.StandardInput.WriteAsync(standardInput.AsMemory(), cancellationToken);
+            await process.StandardInput.FlushAsync(cancellationToken);
+            process.StandardInput.Close();
+        }
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(timeoutMilliseconds);
@@ -72,7 +84,8 @@ public static class ProcessRunner
         string workingDirectory,
         CancellationToken cancellationToken,
         int timeoutMilliseconds,
-        Action<string>? onOutputLine)
+        Action<string>? onOutputLine,
+        IReadOnlyDictionary<string, string?>? environmentVariables = null)
     {
         using var process = new Process
         {
@@ -91,6 +104,15 @@ public static class ProcessRunner
 
         foreach (var argument in arguments)
             process.StartInfo.ArgumentList.Add(argument);
+
+        if (environmentVariables is not null)
+        {
+            foreach (var (name, value) in environmentVariables)
+            {
+                if (value is null) process.StartInfo.Environment.Remove(name);
+                else process.StartInfo.Environment[name] = value;
+            }
+        }
 
         process.Start();
         var stdout = new StringBuilder();
