@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  PUBLIC_RELEASE_REPOSITORY: SarmentoCaio/Softcom-Smart-Provisioner-Releases
+
 jobs:
   release:
     runs-on: windows-latest
@@ -79,17 +82,41 @@ jobs:
           "zipPath=$zipPath" >> $env:GITHUB_OUTPUT
           "sha256=$sha" >> $env:GITHUB_OUTPUT
 
-      - name: Criar Release no GitHub
+      - name: Gerar manifesto do canal publico
+        id: manifest
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = "${{ steps.version.outputs.tag }}"
+          $zipName = "${{ steps.package.outputs.zipName }}"
+          $sha = "${{ steps.package.outputs.sha256 }}"
+          $releaseRepo = "$env:PUBLIC_RELEASE_REPOSITORY"
+          $downloadUrl = "https://github.com/$releaseRepo/releases/download/$tag/$zipName"
+          $manifestPath = Join-Path $PWD "latest.json"
+
+          $manifest = [ordered]@{
+            version = $version
+            downloadUrl = $downloadUrl
+            sha256 = $sha
+            required = $false
+            notes = "Atualizacao automatica v$version. Consulte as notas da Release no GitHub."
+          }
+          $manifest | ConvertTo-Json | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+          "manifestPath=$manifestPath" >> $env:GITHUB_OUTPUT
+
+      - name: Criar Release no canal publico
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
         run: |
           $tag = "${{ steps.version.outputs.tag }}"
           $version = "${{ steps.version.outputs.version }}"
           $zip = "${{ steps.package.outputs.zipPath }}"
-          gh release create $tag $zip `
+          $manifest = "${{ steps.manifest.outputs.manifestPath }}"
+          gh release create $tag $zip $manifest `
+            --repo "$env:PUBLIC_RELEASE_REPOSITORY" `
             --title "Softcom Smart Provisioner v$version" `
-            --generate-notes `
+            --notes "Canal publico de atualizacao automatica. O codigo-fonte permanece no repositorio privado." `
             --latest
 
       - name: Atualizar latest.json na main
@@ -101,8 +128,8 @@ jobs:
           $tag = "${{ steps.version.outputs.tag }}"
           $zipName = "${{ steps.package.outputs.zipName }}"
           $sha = "${{ steps.package.outputs.sha256 }}"
-          $repo = "${{ github.repository }}"
-          $downloadUrl = "https://github.com/$repo/releases/download/$tag/$zipName"
+          $releaseRepo = "$env:PUBLIC_RELEASE_REPOSITORY"
+          $downloadUrl = "https://github.com/$releaseRepo/releases/download/$tag/$zipName"
 
           git fetch origin main
           git checkout main
@@ -137,4 +164,5 @@ jobs:
           "- Versao: **${{ steps.version.outputs.version }}**" >> $env:GITHUB_STEP_SUMMARY
           "- Pacote: **${{ steps.package.outputs.zipName }}**" >> $env:GITHUB_STEP_SUMMARY
           "- SHA-256: ${{ steps.package.outputs.sha256 }}" >> $env:GITHUB_STEP_SUMMARY
-          "- update/latest.json atualizado automaticamente na branch main." >> $env:GITHUB_STEP_SUMMARY
+          "- Canal publico: **$env:PUBLIC_RELEASE_REPOSITORY**" >> $env:GITHUB_STEP_SUMMARY
+          "- update/latest.json de transicao atualizado automaticamente na branch main." >> $env:GITHUB_STEP_SUMMARY

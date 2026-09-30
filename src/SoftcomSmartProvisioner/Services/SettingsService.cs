@@ -5,12 +5,17 @@ namespace SoftcomSmartProvisioner.Services;
 
 public sealed class SettingsService
 {
-    private readonly string _filePath;
+    internal const string LegacyPrivateStableManifestUrl =
+        "https://raw.githubusercontent.com/SarmentoCaio/Softcom-Smart-Provisioner/refs/heads/main/update/latest.json";
 
-    public SettingsService(string appDataDirectory)
+    private readonly string _filePath;
+    private readonly string _baseDirectory;
+
+    public SettingsService(string appDataDirectory, string? baseDirectory = null)
     {
         Directory.CreateDirectory(appDataDirectory);
         _filePath = Path.Combine(appDataDirectory, "settings.json");
+        _baseDirectory = baseDirectory ?? AppContext.BaseDirectory;
     }
 
     public AppSettings Load()
@@ -35,7 +40,7 @@ public sealed class SettingsService
 
         NormalizeRecentOnlineClients(settings);
         NormalizeConfirmedSmartDeviceIds(settings);
-        ApplyPackagedUpdateDefaults(settings);
+        ApplyPackagedUpdateDefaults(settings, _baseDirectory);
         return settings;
     }
 
@@ -84,20 +89,30 @@ public sealed class SettingsService
         value.Length <= 128 &&
         value.All(x => char.IsLetterOrDigit(x) || x is '-' or '_' or '.');
 
-    private static void ApplyPackagedUpdateDefaults(AppSettings settings)
+    private static void ApplyPackagedUpdateDefaults(AppSettings settings, string baseDirectory)
     {
         try
         {
-            var defaultsPath = Path.Combine(AppContext.BaseDirectory, "update-defaults.json");
+            var defaultsPath = Path.Combine(baseDirectory, "update-defaults.json");
             if (!File.Exists(defaultsPath)) return;
             using var document = JsonDocument.Parse(File.ReadAllText(defaultsPath));
             var root = document.RootElement;
 
-            if (string.IsNullOrWhiteSpace(settings.StableManifestUrl) &&
-                root.TryGetProperty("stableManifestUrl", out var stable) &&
+            if (root.TryGetProperty("stableManifestUrl", out var stable) &&
                 stable.ValueKind == JsonValueKind.String)
             {
-                settings.StableManifestUrl = stable.GetString() ?? string.Empty;
+                var packagedStableUrl = stable.GetString() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(settings.StableManifestUrl) ||
+                    string.Equals(
+                        settings.StableManifestUrl.Trim(),
+                        LegacyPrivateStableManifestUrl,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    // A v1.0.3 gravava o feed no repositorio de codigo. Ao tornar o codigo
+                    // privado novamente, as instalacoes existentes precisam migrar para o
+                    // canal publico de binarios sem sobrescrever URLs personalizadas.
+                    settings.StableManifestUrl = packagedStableUrl;
+                }
             }
 
             if (string.IsNullOrWhiteSpace(settings.BetaManifestUrl) &&
