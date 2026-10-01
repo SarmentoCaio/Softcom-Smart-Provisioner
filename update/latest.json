@@ -1,7 +1,7 @@
 {
-  "version": "1.0.4",
-  "downloadUrl": "https://github.com/SarmentoCaio/Softcom-Smart-Provisioner-Releases/releases/download/v1.0.4/Softcom-Smart-Provisioner-v1.0.4.zip",
-  "sha256": "7d646a6759ec2bed8f6a135d3b6b64a73bfddd9b8dfbd22e4b85f4bfa0f94ba1",
+  "version": "1.0.4.1",
+  "downloadUrl": "https://github.com/SarmentoCaio/Softcom-Smart-Provisioner-Releases/releases/download/v1.0.4.1/Softcom-Smart-Provisioner-v1.0.4.1.zip",
+  "sha256": "f6ce371024c1870e9179e5e4b7ead48954ff81bdf355edf6142eac02557d16bf",
   "required": false,
-  "notes": "Atualizacao automatica v1.0.4. O codigo-fonte permanece no repositorio privado."
+  "notes": "Atualizacao emergencial v1.0.4.1: corrige a verificacao de vinculos no modo Softcomshop Online."
 }
