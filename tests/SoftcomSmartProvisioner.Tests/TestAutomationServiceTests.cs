@@ -8,6 +8,144 @@ public sealed class TestAutomationServiceTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "smart-provisioner-tests-" + Guid.NewGuid().ToString("N"));
 
     [Fact]
+    public void FindsAutomationProjectWhenInstalledBesideProjetos()
+    {
+        var installed = Path.Combine(_root, "Softcom Smart Provisioner");
+        var automation = Path.Combine(_root, "Projetos", "softcom-smart-automation");
+        Directory.CreateDirectory(installed);
+        Directory.CreateDirectory(Path.Combine(automation, "tests", "regression", "pdv"));
+        File.WriteAllText(Path.Combine(automation, "run_tests.ps1"), "param()");
+        File.WriteAllText(Path.Combine(automation, "tests", "regression", "pdv", "pdv.robot"),
+            "*** Test Cases ***\nCT01 - Pedido\n    No Operation\n");
+
+        var service = new TestAutomationService(
+            commandResolver: _ => null,
+            workingDirectory: installed,
+            baseDirectory: installed);
+
+        Assert.Equal(automation, service.ResolveProjectRoot());
+        var catalog = service.LoadCatalog(Array.Empty<DeviceInfo>(), DeviceCatalogService.Parse(Array.Empty<string>()));
+        Assert.Equal(automation, catalog.ProjectRoot);
+        Assert.Single(catalog.Suites);
+    }
+
+    [Fact]
+    public async Task FirstUseClonesDevIntoManagedFolderWithoutBundlingEnvironment()
+    {
+        var installed = Path.Combine(_root, "installed");
+        var managed = Path.Combine(_root, "local", "automation");
+        Directory.CreateDirectory(installed);
+        string[]? cloneArguments = null;
+        var service = new TestAutomationService(
+            processRunner: (_, arguments, _, _, _, _, _) =>
+            {
+                cloneArguments = arguments.ToArray();
+                var staging = cloneArguments[^1];
+                Directory.CreateDirectory(Path.Combine(staging, ".git"));
+                Directory.CreateDirectory(Path.Combine(staging, "tests"));
+                File.WriteAllText(Path.Combine(staging, "run_tests.ps1"), "param()");
+                return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));
+            },
+            commandResolver: name => name == "git" ? "git.exe" : null,
+            workingDirectory: installed,
+            baseDirectory: installed,
+            managedRoot: managed);
+
+        await service.CloneForFirstUseAsync(CancellationToken.None);
+
+        Assert.NotNull(cloneArguments);
+        Assert.Equal("clone", cloneArguments![0]);
+        Assert.Contains("dev", cloneArguments);
+        Assert.Equal(managed, service.ResolveProjectRoot());
+        Assert.False(File.Exists(Path.Combine(managed, ".env")));
+        Assert.False(service.LoadCatalog(Array.Empty<DeviceInfo>(),
+            DeviceCatalogService.Parse(Array.Empty<string>())).Prerequisites.EnvironmentAvailable);
+    }
+
+    [Fact]
+    public void EnvironmentImportNeverOverwritesExistingFile()
+    {
+        CreateAutomationProject();
+        var original = File.ReadAllText(Path.Combine(_root, ".env"));
+        var sourceDirectory = Path.Combine(_root, "source");
+        Directory.CreateDirectory(sourceDirectory);
+        var source = Path.Combine(sourceDirectory, ".env");
+        File.WriteAllText(source, "STONE_UDID=OTHER");
+        var service = CreateService();
+
+        Assert.Throws<InvalidOperationException>(() => service.ImportEnvironment(source));
+        Assert.Equal(original, File.ReadAllText(Path.Combine(_root, ".env")));
+    }
+
+    [Fact]
+    public void EnvironmentImportCopiesExistingConfigurationOnlyLocally()
+    {
+        CreateAutomationProject();
+        File.Delete(Path.Combine(_root, ".env"));
+        var sourceDirectory = Path.Combine(_root, "source");
+        Directory.CreateDirectory(sourceDirectory);
+        var source = Path.Combine(sourceDirectory, ".env");
+        File.WriteAllText(source, "STONE_UDID=STONE123\nSMART_LOGIN_EMAIL=qa@example.test\n");
+        var service = CreateService();
+
+        service.ImportEnvironment(source);
+
+        Assert.Equal(File.ReadAllText(source), File.ReadAllText(Path.Combine(_root, ".env")));
+        Assert.True(service.LoadCatalog(Array.Empty<DeviceInfo>(),
+            DeviceCatalogService.Parse(Array.Empty<string>())).Prerequisites.EnvironmentAvailable);
+    }
+
+    [Fact]
+    public async Task WorktreeGitFileCanUpdateAnArbitraryRemoteBranch()
+    {
+        CreateAutomationProject();
+        File.WriteAllText(Path.Combine(_root, ".git"), "gitdir: elsewhere");
+        var invocations = new List<string[]>();
+        var service = new TestAutomationService(
+            _root,
+            (_, arguments, _, _, _, _, _) =>
+            {
+                var values = arguments.ToArray();
+                invocations.Add(values);
+                var output = values.SequenceEqual(new[] { "rev-parse", "--show-toplevel" }) ? _root :
+                    values.SequenceEqual(new[] { "branch", "--show-current" }) ? "dev" : string.Empty;
+                var exitCode = values.SequenceEqual(new[] { "show-ref", "--verify", "--quiet", "refs/heads/feature/qa" }) ? 1 : 0;
+                return Task.FromResult(new ProcessResult(exitCode, output, string.Empty));
+            }, _ => "git.exe");
+
+        await service.UpdateSourceAsync("feature/qa", CancellationToken.None);
+
+        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*" }));
+        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "switch", "--track", "-c", "feature/qa", "origin/feature/qa" }));
+        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "merge", "--ff-only", "origin/feature/qa" }));
+    }
+
+    [Fact]
+    public async Task DivergedTargetBranchIsRejectedBeforeSwitching()
+    {
+        CreateAutomationProject();
+        Directory.CreateDirectory(Path.Combine(_root, ".git"));
+        var invocations = new List<string[]>();
+        var service = new TestAutomationService(
+            _root,
+            (_, arguments, _, _, _, _, _) =>
+            {
+                var values = arguments.ToArray();
+                invocations.Add(values);
+                var output = values.SequenceEqual(new[] { "rev-parse", "--show-toplevel" }) ? _root :
+                    values.SequenceEqual(new[] { "branch", "--show-current" }) ? "dev" : string.Empty;
+                var exitCode = values.FirstOrDefault() == "merge-base" ? 1 : 0;
+                return Task.FromResult(new ProcessResult(exitCode, output, string.Empty));
+            }, _ => "git.exe");
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.UpdateSourceAsync("master", CancellationToken.None));
+
+        Assert.Contains("divergiu", error.Message);
+        Assert.DoesNotContain(invocations, args => args.FirstOrDefault() == "switch");
+    }
+
+    [Fact]
     public void ParsesOnlyRealTestCaseHeadings()
     {
         var tests = TestAutomationService.ParseTestCases(new[]
@@ -52,6 +190,7 @@ public sealed class TestAutomationServiceTests : IDisposable
         var device = Assert.Single(catalog.Devices);
         Assert.Equal("stone", device.SuggestedDeviceTag);
         Assert.Equal(new[] { "stone" }, device.DeviceTags);
+        Assert.True(device.AutoCampaignSupported);
         Assert.Equal("PDV", Assert.Single(catalog.Suites).Name);
         Assert.Equal(2, catalog.Suites[0].TestCases.Count);
     }
@@ -160,6 +299,38 @@ public sealed class TestAutomationServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task ParallelCampaignUsesOneRunnerWithDistinctDeviceTags()
+    {
+        CreateAutomationProject(campaignRunner: true);
+        File.AppendAllText(Path.Combine(_root, ".env"), "\nGETNET_P2_UDID=P2SERIAL\n");
+        File.AppendAllText(Path.Combine(_root, "resources", "data", "devices.yaml"),
+            "  getnet_p2:\n    udid: \"${GETNET_P2_UDID}\"\n");
+        IReadOnlyList<string>? capturedArguments = null;
+        var service = new TestAutomationService(
+            _root,
+            (_, arguments, _, _, _, _, _) =>
+            {
+                capturedArguments = arguments.ToArray();
+                return Task.FromResult(new ProcessResult(0, "2 tests, 2 passed, 0 failed", string.Empty));
+            },
+            _ => "available");
+        var deviceCatalog = DeviceCatalogService.Parse(new[] { "STONE_UDID=STONE123", "GETNET_P2_UDID=P2SERIAL" });
+
+        var result = await service.RunParallelAsync("pdv/pdv.robot",
+            [("STONE123", "stone"), ("P2SERIAL", "getnet_p2")],
+            [Device("STONE123", "Stone"), Device("P2SERIAL", "Getnet P2")],
+            deviceCatalog, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.NotNull(capturedArguments);
+        Assert.Contains("-DeviceTags", capturedArguments!);
+        Assert.Contains("stone,getnet_p2", capturedArguments!);
+        Assert.DoesNotContain("-Debug", capturedArguments!);
+        Assert.DoesNotContain("STONE123", capturedArguments!);
+        Assert.Contains("-Campaign", capturedArguments!);
+    }
+
+    [Fact]
     public async Task Android7RunUsesDedicatedLegacyAppiumHome()
     {
         CreateAutomationProject();
@@ -194,6 +365,7 @@ public sealed class TestAutomationServiceTests : IDisposable
     public async Task SourceUpdateRefusesDirtyAutomationWithoutFetchingOrSwitching()
     {
         CreateAutomationProject();
+        Directory.CreateDirectory(Path.Combine(_root, ".git"));
         var invocations = new List<string[]>();
         var service = new TestAutomationService(
             _root,
@@ -201,7 +373,9 @@ public sealed class TestAutomationServiceTests : IDisposable
             {
                 var values = arguments.ToArray();
                 invocations.Add(values);
-                return Task.FromResult(new ProcessResult(0, " M run_tests.ps1", string.Empty));
+                var output = values.SequenceEqual(new[] { "rev-parse", "--show-toplevel" })
+                    ? _root : " M run_tests.ps1";
+                return Task.FromResult(new ProcessResult(0, output, string.Empty));
             },
             _ => "available");
 
@@ -209,8 +383,8 @@ public sealed class TestAutomationServiceTests : IDisposable
             service.UpdateSourceAsync("dev", CancellationToken.None));
 
         Assert.Contains("alterações locais", error.Message);
-        Assert.Single(invocations);
-        Assert.Equal(new[] { "status", "--porcelain" }, invocations[0]);
+        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "status", "--porcelain" }));
+        Assert.DoesNotContain(invocations, args => args.Contains("fetch"));
     }
 
     [Fact]
@@ -225,7 +399,8 @@ public sealed class TestAutomationServiceTests : IDisposable
             {
                 var values = arguments.ToArray();
                 invocations.Add(values);
-                var output = values.SequenceEqual(new[] { "branch", "--show-current" }) ? "master\n" : string.Empty;
+                var output = values.SequenceEqual(new[] { "branch", "--show-current" }) ? "master\n" :
+                    values.SequenceEqual(new[] { "rev-parse", "--show-toplevel" }) ? _root : string.Empty;
                 var exitCode = values.SequenceEqual(new[] { "show-ref", "--verify", "--quiet", "refs/heads/dev" }) ? 1 : 0;
                 return Task.FromResult(new ProcessResult(exitCode, output, string.Empty));
             },
@@ -233,7 +408,7 @@ public sealed class TestAutomationServiceTests : IDisposable
 
         await service.UpdateSourceAsync("dev", CancellationToken.None);
 
-        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "fetch", "origin", "dev" }));
+        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*" }));
         Assert.Contains(invocations, args => args.SequenceEqual(new[] { "switch", "--track", "-c", "dev", "origin/dev" }));
         Assert.Contains(invocations, args => args.SequenceEqual(new[] { "merge", "--ff-only", "origin/dev" }));
         Assert.DoesNotContain(invocations, args => args.Contains("origin/master", StringComparer.Ordinal));
@@ -251,7 +426,8 @@ public sealed class TestAutomationServiceTests : IDisposable
             {
                 var values = arguments.ToArray();
                 invocations.Add(values);
-                var output = values.SequenceEqual(new[] { "branch", "--show-current" }) ? "dev\n" : string.Empty;
+                var output = values.SequenceEqual(new[] { "branch", "--show-current" }) ? "dev\n" :
+                    values.SequenceEqual(new[] { "rev-parse", "--show-toplevel" }) ? _root : string.Empty;
                 var exitCode = values.SequenceEqual(new[] { "show-ref", "--verify", "--quiet", "refs/heads/DEV-Sarmento" }) ? 1 : 0;
                 return Task.FromResult(new ProcessResult(exitCode, output, string.Empty));
             },
@@ -259,7 +435,7 @@ public sealed class TestAutomationServiceTests : IDisposable
 
         await service.UpdateSourceAsync("DEV-Sarmento", CancellationToken.None);
 
-        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "fetch", "origin", "DEV-Sarmento" }));
+        Assert.Contains(invocations, args => args.SequenceEqual(new[] { "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*" }));
         Assert.Contains(invocations, args => args.SequenceEqual(
             new[] { "switch", "--track", "-c", "DEV-Sarmento", "origin/DEV-Sarmento" }));
         Assert.Contains(invocations, args => args.SequenceEqual(new[] { "merge", "--ff-only", "origin/DEV-Sarmento" }));

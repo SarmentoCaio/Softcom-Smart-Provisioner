@@ -152,9 +152,11 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   gap: 8px;
   flex-wrap: wrap;
 }
-.test-source-field { display: grid; gap: 3px; min-width: 180px; }
+.test-source-toolbar > button { align-self: center; white-space: nowrap; }
+.test-source-field { display: grid; gap: 3px; min-width: 210px; }
 .test-source-field > span { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .5px; }
 .test-source-field select { min-height: 36px; padding: 7px 30px 7px 10px; }
+.test-source-field input { min-height: 36px; padding: 7px 10px; }
 .test-source-field small { color: var(--muted); font-size: 10px; }
 .test-source-field small.warn { color: var(--warning); }
 .test-prerequisites {
@@ -174,6 +176,10 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 }
 .test-check.ok { color: var(--success); border-color: rgba(54,201,143,.32); background: rgba(54,201,143,.08); }
 .test-check.bad { color: var(--danger); border-color: rgba(255,107,114,.32); background: rgba(255,107,114,.08); }
+.test-first-use { margin-bottom: 18px; }
+.test-first-use h2 { margin: 5px 0 0; font-size: 18px; }
+.test-first-use p { color: var(--muted); line-height: 1.5; }
+.test-first-use-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .test-device-details {
   min-height: 58px;
   border: 1px solid var(--border);
@@ -193,6 +199,15 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 }
 .test-run-copy h2 { margin: 0; font-size: 18px; }
 .test-run-copy p { margin: 8px 0 0; color: var(--muted); }
+.auto-test-selection { grid-column: 1 / -1; display: grid; gap: 9px; }
+.auto-test-selection-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.auto-test-selection > small { color: var(--muted); }
+.auto-test-device-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+.auto-test-device-option { display: flex; align-items: flex-start; gap: 9px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--input); cursor: pointer; }
+.auto-test-device-option input { width: auto; margin: 2px 0 0; }
+.auto-test-device-option strong, .auto-test-device-option small { display: block; }
+.auto-test-device-option small { color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
+.auto-test-device-option.unavailable { opacity: .55; cursor: not-allowed; }
 .test-run-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .test-run-summary {
   grid-column: 1 / -1;

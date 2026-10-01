@@ -10,7 +10,7 @@ using SoftcomSmartProvisioner.Services;
 
 namespace SoftcomSmartProvisioner;
 
-public sealed class MainForm : Form
+public sealed partial class MainForm : Form
 {
     private static string AppVersion => AppVersionInfo.Current;
 
@@ -50,6 +50,8 @@ public sealed class MainForm : Form
     private readonly object _testAutomationGate = new();
     private CancellationTokenSource? _testAutomationRun;
     private bool _testAutomationSourceUpdating;
+    private bool _autoTestCampaignRunning;
+    private bool _manualProvisioningRunning;
     private DeviceCatalogSnapshot _deviceCatalog = new(null, Array.Empty<DeviceCatalogEntry>(), Array.Empty<string>(),
         new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase));
 
@@ -343,8 +345,24 @@ public sealed class MainForm : Form
                     await UpdateTestAutomationSourceAsync(request.Payload);
                     break;
 
+                case "cloneTestAutomation":
+                    await CloneTestAutomationAsync();
+                    break;
+
+                case "importTestAutomationEnv":
+                    await ImportTestAutomationEnvironmentAsync();
+                    break;
+
+                case "openTestAutomationFolder":
+                    OpenTestAutomationFolder();
+                    break;
+
                 case "runTestAutomation":
                     await RunTestAutomationAsync(request.Payload);
+                    break;
+
+                case "runAutoTestCampaign":
+                    await RunAutoTestCampaignAsync(request.Payload);
                     break;
 
                 case "cancelTestAutomation":
@@ -1607,10 +1625,11 @@ public sealed class MainForm : Form
         PostBusy("testAutomationCatalog", true);
         try
         {
+            _deviceCatalog = _deviceCatalogService.Load();
             if (ReadBool(payload, "refreshDevices", false))
                 await RefreshAndroidAsync();
 
-            var catalog = _testAutomationService.LoadCatalog(_androidDevices, _deviceCatalog);
+            var catalog = _testAutomationService.LoadCatalog(_androidDevices, GetTestDeviceCatalog());
             SaveTestAutomationChannel(catalog.Source.CurrentBranch);
             PostEvent("testAutomationCatalog", catalog);
         }
@@ -1638,9 +1657,10 @@ public sealed class MainForm : Form
                 branch,
                 _shutdown.Token,
                 progress => PostEvent("testAutomationSourceProgress", progress));
-            var catalog = _testAutomationService.LoadCatalog(_androidDevices, _deviceCatalog);
+            var catalog = _testAutomationService.LoadCatalog(_androidDevices, GetTestDeviceCatalog());
             SaveTestAutomationChannel(catalog.Source.CurrentBranch);
             PostEvent("testAutomationCatalog", catalog);
+            PostEvent("testAutomationSourceUpdated", new { branch = catalog.Source.CurrentBranch });
             PostEvent("toast", new
             {
                 type = "success",
@@ -1661,6 +1681,85 @@ public sealed class MainForm : Form
         }
     }
 
+    private DeviceCatalogSnapshot GetTestDeviceCatalog()
+    {
+        var root = _testAutomationService.ResolveProjectRoot();
+        var envPath = root is null ? null : Path.Combine(root, ".env");
+        return envPath is not null && File.Exists(envPath)
+            ? DeviceCatalogService.Parse(File.ReadLines(envPath), envPath)
+            : _deviceCatalog;
+    }
+
+    private async Task CloneTestAutomationAsync()
+    {
+        lock (_testAutomationGate)
+        {
+            if (_testAutomationRun is not null || _testAutomationSourceUpdating)
+                throw new InvalidOperationException("Aguarde a operação de testes atual terminar.");
+            _testAutomationSourceUpdating = true;
+        }
+        PostBusy("testAutomationClone", true);
+        PostEvent("testAutomationCloneStarted", new { });
+        try
+        {
+            await _testAutomationService.CloneForFirstUseAsync(_shutdown.Token,
+                progress => PostEvent("testAutomationSourceProgress", progress));
+            var catalog = _testAutomationService.LoadCatalog(_androidDevices, GetTestDeviceCatalog());
+            SaveTestAutomationChannel(catalog.Source.CurrentBranch);
+            PostEvent("testAutomationCatalog", catalog);
+            PostEvent("testAutomationCloneFinished", new { });
+            PostEvent("toast", new { type = "success", message = "Automation dev baixado neste computador." });
+        }
+        catch (Exception ex)
+        {
+            var message = SensitiveDataSanitizer.Clean(ex.Message);
+            PostEvent("testAutomationError", new { message });
+            WriteLog("TESTES", message, "ERROR");
+        }
+        finally
+        {
+            lock (_testAutomationGate) _testAutomationSourceUpdating = false;
+            PostBusy("testAutomationClone", false);
+        }
+    }
+
+    private async Task ImportTestAutomationEnvironmentAsync()
+    {
+        lock (_testAutomationGate)
+        {
+            if (_testAutomationRun is not null || _testAutomationSourceUpdating)
+                throw new InvalidOperationException("Aguarde a operação de testes atual terminar.");
+            _testAutomationSourceUpdating = true;
+        }
+        PostBusy("testAutomationEnv", true);
+        try
+        {
+            using var dialog = new OpenFileDialog
+            {
+                Filter = "Configuração de testes (.env)|.env|Todos os arquivos (*.*)|*.*",
+                Title = "Selecione o .env existente para o Automation"
+            };
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            _testAutomationService.ImportEnvironment(dialog.FileName);
+            _deviceCatalog = _deviceCatalogService.Load();
+            await RefreshAndroidAsync();
+            PostEvent("testAutomationCatalog", _testAutomationService.LoadCatalog(_androidDevices, GetTestDeviceCatalog()));
+            PostEvent("toast", new { type = "success", message = ".env importado somente para este computador." });
+        }
+        finally
+        {
+            lock (_testAutomationGate) _testAutomationSourceUpdating = false;
+            PostBusy("testAutomationEnv", false);
+        }
+    }
+
+    private void OpenTestAutomationFolder()
+    {
+        var root = _testAutomationService.ResolveProjectRoot()
+            ?? throw new InvalidOperationException("Baixe o Automation antes de abrir a pasta.");
+        Process.Start(new ProcessStartInfo(root) { UseShellExecute = true });
+    }
+
     private void SaveTestAutomationChannel(string? channel)
     {
         if (string.IsNullOrWhiteSpace(channel)) return;
@@ -1671,6 +1770,8 @@ public sealed class MainForm : Form
 
     private async Task RunTestAutomationAsync(JsonElement payload)
     {
+        if (_manualProvisioningRunning || _autoTestCampaignRunning)
+            throw new InvalidOperationException("Aguarde o provisionamento em andamento antes de iniciar os testes.");
         var request = payload.Deserialize<TestAutomationRunRequest>(JsonOptions)
             ?? throw new InvalidOperationException("Informe o dispositivo e a suíte de testes.");
 
@@ -1700,7 +1801,7 @@ public sealed class MainForm : Form
             var result = await _testAutomationService.RunAsync(
                 request,
                 _androidDevices,
-                _deviceCatalog,
+                GetTestDeviceCatalog(),
                 runCancellation.Token,
                 progress => PostEvent("testAutomationProgress", progress));
             PostEvent("testAutomationFinished", result);
@@ -2012,6 +2113,9 @@ public sealed class MainForm : Form
 
     private async Task PrepareSmartAsync(JsonElement payload)
     {
+        if (_autoTestCampaignRunning || _manualProvisioningRunning)
+            throw new InvalidOperationException("Ja existe um provisionamento em andamento.");
+        _manualProvisioningRunning = true;
         PostBusy("provision", true);
         try
         {
@@ -2104,6 +2208,7 @@ public sealed class MainForm : Form
         }
         finally
         {
+            _manualProvisioningRunning = false;
             PostBusy("provision", false);
         }
     }
@@ -3364,6 +3469,13 @@ public sealed class MainForm : Form
             {
                 var success = element.TryGetProperty("success", out var successElement) && successElement.ValueKind == JsonValueKind.True;
                 context.Outcome = new ProvisioningJobOutcome(success, stage, message);
+            }
+
+            if (_autoTestCampaignRunning)
+            {
+                var level = type == "smartPreparationFinished" && context.Outcome?.Success == false ? "ERROR" : "INFO";
+                PostEvent("testAutomationProgress", new TestAutomationProgress(
+                    DateTimeOffset.Now, stage, $"[{context.Job.FriendlyName}] {message}", level));
             }
 
             var enriched = element.EnumerateObject().ToDictionary(x => x.Name, x => x.Value.Clone(), StringComparer.OrdinalIgnoreCase);

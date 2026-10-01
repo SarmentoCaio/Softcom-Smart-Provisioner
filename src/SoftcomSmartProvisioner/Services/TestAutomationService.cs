@@ -7,18 +7,33 @@ namespace SoftcomSmartProvisioner.Services;
 public sealed partial class TestAutomationService
 {
     private const int TestTimeoutMilliseconds = 2 * 60 * 60 * 1000;
-    private const int GitTimeoutMilliseconds = 60 * 1000;
+    private const int GitTimeoutMilliseconds = 5 * 60 * 1000;
+    private const int CloneTimeoutMilliseconds = 10 * 60 * 1000;
+    private const string AutomationRepository = "https://github.com/lcelsosf/softcom-smart-automation.git";
+    private static readonly IReadOnlyDictionary<string, string?> GitEnvironment =
+        new Dictionary<string, string?> { ["GIT_TERMINAL_PROMPT"] = "0", ["GCM_INTERACTIVE"] = "auto" };
     private static readonly string[] SupportedChannels = ["master", "dev", "DEV-Sarmento"];
     private readonly string? _explicitRoot;
+    private readonly string? _workingDirectory;
+    private readonly string? _baseDirectory;
+    private readonly string _managedRoot;
     private readonly Func<string, IEnumerable<string>, string, CancellationToken, int, Action<string>?, IReadOnlyDictionary<string, string?>?, Task<ProcessResult>> _processRunner;
     private readonly Func<string, string?> _commandResolver;
 
     public TestAutomationService(
         string? explicitRoot = null,
         Func<string, IEnumerable<string>, string, CancellationToken, int, Action<string>?, IReadOnlyDictionary<string, string?>?, Task<ProcessResult>>? processRunner = null,
-        Func<string, string?>? commandResolver = null)
+        Func<string, string?>? commandResolver = null,
+        string? workingDirectory = null,
+        string? baseDirectory = null,
+        string? managedRoot = null)
     {
         _explicitRoot = explicitRoot;
+        _workingDirectory = workingDirectory;
+        _baseDirectory = baseDirectory;
+        _managedRoot = managedRoot ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Softcom", "SmartProvisioner", "automation");
         _processRunner = processRunner ?? ProcessRunner.RunTextStreamingAsync;
         _commandResolver = commandResolver ?? FindCommand;
     }
@@ -88,6 +103,10 @@ public sealed partial class TestAutomationService
         var git = _commandResolver("git")
             ?? throw new InvalidOperationException("Git não está disponível no PATH.");
 
+        await EnsureAutomationRepositoryAsync(git, root, cancellationToken);
+        var branchFormat = await RunGitAsync(git, root, ["check-ref-format", "--branch", channel], cancellationToken, null);
+        if (!branchFormat.Success)
+            throw new InvalidOperationException("Informe um nome de branch válido.");
         var status = await RunGitAsync(git, root, ["status", "--porcelain"], cancellationToken, onProgress);
         EnsureGitSuccess(status, "Não foi possível verificar o estado local do Automation.");
         if (!string.IsNullOrWhiteSpace(status.StandardOutput))
@@ -96,8 +115,13 @@ public sealed partial class TestAutomationService
 
         onProgress?.Invoke(new TestAutomationProgress(
             DateTimeOffset.Now, "fonte", $"Buscando origin/{channel}...", "INFO"));
-        var fetch = await RunGitAsync(git, root, ["fetch", "origin", channel], cancellationToken, onProgress);
-        EnsureGitSuccess(fetch, $"Não foi possível buscar origin/{channel}.");
+        var fetch = await RunGitAsync(git, root,
+            ["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"], cancellationToken, onProgress);
+        EnsureGitSuccess(fetch, "Não foi possível buscar as branches do Automation.");
+        var remoteBranch = await RunGitAsync(git, root,
+            ["show-ref", "--verify", "--quiet", $"refs/remotes/origin/{channel}"], cancellationToken, null);
+        if (!remoteBranch.Success)
+            throw new InvalidOperationException($"A branch {channel} não existe no origin.");
 
         var current = await RunGitAsync(git, root, ["branch", "--show-current"], cancellationToken, onProgress);
         EnsureGitSuccess(current, "Não foi possível identificar a branch atual do Automation.");
@@ -105,6 +129,14 @@ public sealed partial class TestAutomationService
         {
             var localBranch = await RunGitAsync(
                 git, root, ["show-ref", "--verify", "--quiet", $"refs/heads/{channel}"], cancellationToken, onProgress);
+            if (localBranch.Success)
+            {
+                var canFastForward = await RunGitAsync(git, root,
+                    ["merge-base", "--is-ancestor", $"refs/heads/{channel}", $"refs/remotes/origin/{channel}"],
+                    cancellationToken, null);
+                if (!canFastForward.Success)
+                    throw new InvalidOperationException($"A branch local {channel} divergiu de origin/{channel}; nenhuma branch foi trocada.");
+            }
             var switchArguments = localBranch.Success
                 ? new[] { "switch", channel }
                 : new[] { "switch", "--track", "-c", channel, $"origin/{channel}" };
@@ -118,6 +150,59 @@ public sealed partial class TestAutomationService
         EnsureGitSuccess(fastForward, $"A branch local {channel} divergiu de origin/{channel}; atualização automática cancelada.");
         onProgress?.Invoke(new TestAutomationProgress(
             DateTimeOffset.Now, "fonte", $"Automation atualizado em {channel}.", "INFO"));
+    }
+
+    public async Task CloneForFirstUseAsync(
+        CancellationToken cancellationToken,
+        Action<TestAutomationProgress>? onProgress = null)
+    {
+        if (ResolveProjectRoot() is not null)
+            throw new InvalidOperationException("O Automation já está disponível neste computador.");
+        var git = _commandResolver("git")
+            ?? throw new InvalidOperationException("Git não está disponível no PATH deste computador.");
+        var target = Path.GetFullPath(_managedRoot);
+        if (Directory.Exists(target) || File.Exists(target))
+            throw new InvalidOperationException($"A pasta {target} já existe. Revise-a antes de preparar o Automation.");
+        var parent = Directory.GetParent(target)?.FullName
+            ?? throw new InvalidOperationException("Destino local do Automation inválido.");
+        Directory.CreateDirectory(parent);
+        var staging = Path.Combine(parent, $"automation-clone-{Guid.NewGuid():N}");
+        try
+        {
+            onProgress?.Invoke(new TestAutomationProgress(DateTimeOffset.Now, "fonte",
+                "Baixando o Automation dev. O Git pode solicitar autenticação no navegador.", "INFO"));
+            var clone = await _processRunner(git,
+                ["clone", "--branch", "dev", "--no-single-branch", AutomationRepository, staging],
+                parent, cancellationToken, CloneTimeoutMilliseconds,
+                line => ForwardGitProgress(line, onProgress), GitEnvironment);
+            EnsureGitSuccess(clone, "Não foi possível baixar o Automation. Verifique o acesso ao repositório.");
+            if (!IsAutomationRoot(staging) || !HasGitMetadata(staging))
+                throw new InvalidOperationException("O download não contém um repositório Automation válido.");
+            Directory.Move(staging, target);
+            onProgress?.Invoke(new TestAutomationProgress(DateTimeOffset.Now, "fonte",
+                "Automation dev baixado. Configure o .env local antes de executar os testes.", "INFO"));
+        }
+        finally
+        {
+            // Remove somente a pasta temporária criada por esta operação.
+            if (Directory.Exists(staging) &&
+                string.Equals(Directory.GetParent(staging)?.FullName, parent, StringComparison.OrdinalIgnoreCase) &&
+                Path.GetFileName(staging).StartsWith("automation-clone-", StringComparison.Ordinal))
+                Directory.Delete(staging, recursive: true);
+        }
+    }
+
+    public void ImportEnvironment(string sourcePath)
+    {
+        var root = ResolveProjectRoot()
+            ?? throw new InvalidOperationException("Baixe o Automation antes de importar o .env.");
+        var source = Path.GetFullPath(sourcePath);
+        if (!File.Exists(source) || !string.Equals(Path.GetFileName(source), ".env", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Selecione um arquivo .env existente.");
+        var target = Path.Combine(root, ".env");
+        if (File.Exists(target))
+            throw new InvalidOperationException("O .env local já existe e não será sobrescrito.");
+        File.Copy(source, target, overwrite: false);
     }
 
     public async Task<TestAutomationRunResult> RunAsync(
@@ -238,6 +323,78 @@ public sealed partial class TestAutomationService
         }
     }
 
+    public async Task<TestAutomationRunResult> RunParallelAsync(
+        string suiteId,
+        IReadOnlyList<(string Serial, string DeviceTag)> selections,
+        IReadOnlyList<DeviceInfo> connectedDevices,
+        DeviceCatalogSnapshot deviceCatalog,
+        CancellationToken cancellationToken,
+        Action<TestAutomationProgress>? onProgress = null)
+    {
+        if (selections.Count is < 1 or > 7 ||
+            selections.Select(x => x.Serial).Distinct(StringComparer.OrdinalIgnoreCase).Count() != selections.Count ||
+            selections.Select(x => x.DeviceTag).Distinct(StringComparer.OrdinalIgnoreCase).Count() != selections.Count)
+            throw new InvalidOperationException("Selecione de 1 a 7 Androids e perfis diferentes para o lote paralelo.");
+
+        var catalog = LoadCatalog(connectedDevices, deviceCatalog);
+        var root = catalog.ProjectRoot ?? throw new InvalidOperationException("Projeto Automation não localizado.");
+        if (!catalog.Prerequisites.RunnerAvailable || !catalog.Prerequisites.EnvironmentAvailable || !catalog.Prerequisites.UvAvailable)
+            throw new InvalidOperationException("Runner, .env ou uv não disponível para os testes.");
+        var suite = catalog.Suites.FirstOrDefault(x => string.Equals(x.Id, suiteId, StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException($"Suíte {suiteId} não localizada no Automation.");
+        foreach (var selection in selections)
+        {
+            var device = catalog.Devices.FirstOrDefault(x => string.Equals(x.Serial, selection.Serial, StringComparison.OrdinalIgnoreCase));
+            if (device is null || !device.IsOnline || !device.DeviceTags.Contains(selection.DeviceTag, StringComparer.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"O perfil {selection.DeviceTag} não corresponde ao Android conectado {selection.Serial}.");
+        }
+
+        var tags = selections.Select(x => NormalizeDeviceTag(x.DeviceTag)).ToArray();
+        var runnerPath = Path.Combine(root, "run_tests.ps1");
+        if (!SupportsCampaignRunner(runnerPath))
+            throw new InvalidOperationException("O Automation instalado não suporta campanhas paralelas.");
+        var campaignName = $"provisioner-auto-{DateTime.Now:yyyyMMdd-HHmmss}-{Path.GetFileNameWithoutExtension(suiteId)}";
+        var arguments = new[]
+        {
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runnerPath,
+            "-DeviceTags", string.Join(',', tags), "-Suite", suite.RelativePath,
+            "-Campaign", campaignName, "-SaveReports", "all", "-NoAllureOpen"
+        };
+        var childEnvironment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["APPIUM_SERVER_URL"] = ResolveLocalAppiumServerUrl()
+        };
+        var stopwatch = Stopwatch.StartNew();
+        using var heartbeatCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var heartbeatTask = ReportHeartbeatAsync(stopwatch, onProgress, heartbeatCancellation.Token);
+        try
+        {
+            onProgress?.Invoke(new TestAutomationProgress(DateTimeOffset.Now, "preparando",
+                $"Executando {suite.Name} em paralelo: {string.Join(", ", tags)}.", "INFO"));
+            var result = await _processRunner(ResolvePowerShell(), arguments, root, cancellationToken,
+                TestTimeoutMilliseconds, line => ForwardSafeProgress(line, onProgress), childEnvironment);
+            stopwatch.Stop();
+            var reportPath = ExistingFileOrNull(Path.Combine(root, "results", "campaigns", campaignName, "index.html"));
+            return new TestAutomationRunResult(result.Success, false, result.ExitCode,
+                string.Join(',', selections.Select(x => x.Serial)), string.Join(',', tags), suite.Name, string.Empty,
+                stopwatch.ElapsedMilliseconds,
+                result.Success ? "Testes paralelos concluídos com sucesso." : "A campanha terminou com falhas.",
+                reportPath, BuildSafeSummary(result.CombinedOutput));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            stopwatch.Stop();
+            return new TestAutomationRunResult(false, true, -1,
+                string.Join(',', selections.Select(x => x.Serial)), string.Join(',', tags), suite.Name, string.Empty,
+                stopwatch.ElapsedMilliseconds, "Campanha cancelada.", null, string.Empty);
+        }
+        finally
+        {
+            heartbeatCancellation.Cancel();
+            try { await heartbeatTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     public string? GetExistingReportPath()
     {
         var root = ResolveProjectRoot();
@@ -249,8 +406,9 @@ public sealed partial class TestAutomationService
     {
         var configured = Environment.GetEnvironmentVariable("SOFTCOM_SMART_AUTOMATION_ROOT");
         var candidates = new List<string?> { _explicitRoot, configured };
-        AddRootCandidates(candidates, Directory.GetCurrentDirectory());
-        AddRootCandidates(candidates, AppContext.BaseDirectory);
+        candidates.Add(_managedRoot);
+        AddRootCandidates(candidates, _workingDirectory ?? Directory.GetCurrentDirectory());
+        AddRootCandidates(candidates, _baseDirectory ?? AppContext.BaseDirectory);
         return candidates
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .Select(path => Path.GetFullPath(path!))
@@ -360,7 +518,10 @@ public sealed partial class TestAutomationService
             device.IsOnline,
             tags,
             suggested,
-            tags.Length != 1);
+            tags.Length != 1)
+        {
+            AutoCampaignSupported = tags.Length == 1 && AutoTestCampaignPlanner.SupportsTag(suggested)
+        };
     }
 
     private static void AddRootCandidates(ICollection<string?> candidates, string startPath)
@@ -370,6 +531,7 @@ public sealed partial class TestAutomationService
         {
             candidates.Add(directory.FullName);
             candidates.Add(Path.Combine(directory.FullName, "softcom-smart-automation"));
+            candidates.Add(Path.Combine(directory.FullName, "Projetos", "softcom-smart-automation"));
         }
     }
 
@@ -386,12 +548,29 @@ public sealed partial class TestAutomationService
     {
         return await _processRunner(
             git, arguments, root, cancellationToken, GitTimeoutMilliseconds,
-            line =>
-            {
-                if (string.IsNullOrWhiteSpace(line)) return;
-                onProgress?.Invoke(new TestAutomationProgress(
-                    DateTimeOffset.Now, "fonte", SensitiveDataSanitizer.Clean(line.Trim()), "INFO"));
-            }, null);
+            line => ForwardGitProgress(line, onProgress), GitEnvironment);
+    }
+
+    private static void ForwardGitProgress(string line, Action<TestAutomationProgress>? onProgress)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return;
+        onProgress?.Invoke(new TestAutomationProgress(
+            DateTimeOffset.Now, "fonte", SensitiveDataSanitizer.Clean(line.Trim()), "INFO"));
+    }
+
+    private static bool HasGitMetadata(string root) =>
+        Directory.Exists(Path.Combine(root, ".git")) || File.Exists(Path.Combine(root, ".git"));
+
+    private async Task EnsureAutomationRepositoryAsync(string git, string root, CancellationToken cancellationToken)
+    {
+        if (!HasGitMetadata(root))
+            throw new InvalidOperationException("A pasta do Automation não é um repositório Git.");
+        var repositoryRoot = await RunGitAsync(git, root, ["rev-parse", "--show-toplevel"],
+            cancellationToken, null);
+        EnsureGitSuccess(repositoryRoot, "Não foi possível verificar o repositório do Automation.");
+        if (!string.Equals(Path.GetFullPath(repositoryRoot.StandardOutput.Trim()).TrimEnd(Path.DirectorySeparatorChar),
+                Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("A pasta do Automation não é a raiz do repositório Git.");
     }
 
     private static string? ResolveLegacyAppiumHome(string automationRoot, DeviceInfo device)
@@ -429,18 +608,25 @@ public sealed partial class TestAutomationService
     private TestAutomationSourceInfo ReadSourceInfo(string root)
     {
         var git = _commandResolver("git");
-        if (git is null || !Directory.Exists(Path.Combine(root, ".git")))
+        if (git is null || !HasGitMetadata(root))
             return new TestAutomationSourceInfo(false, string.Empty, string.Empty, false, SupportedChannels);
 
         var branch = RunGitReadOnly(git, root, ["branch", "--show-current"]);
         var commit = RunGitReadOnly(git, root, ["rev-parse", "--short", "HEAD"]);
         var status = RunGitReadOnly(git, root, ["status", "--porcelain"]);
+        var branches = RunGitReadOnly(git, root,
+            ["for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin"])
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Where(branchName => branchName != "HEAD")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(branchName => branchName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         return new TestAutomationSourceInfo(
             true,
             branch.Trim(),
             commit.Trim(),
             !string.IsNullOrWhiteSpace(status),
-            SupportedChannels);
+            branches.Length > 0 ? branches : SupportedChannels);
     }
 
     private static string RunGitReadOnly(string git, string root, IEnumerable<string> arguments)
@@ -477,15 +663,12 @@ public sealed partial class TestAutomationService
 
     private static string NormalizeChannel(string? value)
     {
-        var channel = value?.Trim().ToLowerInvariant() ?? string.Empty;
-        return channel switch
-        {
-            "master" => "master",
-            "dev" => "dev",
-            "dev-sarmento" => "DEV-Sarmento",
-            _ => throw new InvalidOperationException(
-                "Canal do Automation inválido. Escolha master, dev ou DEV-Sarmento.")
-        };
+        var channel = value?.Trim() ?? string.Empty;
+        if (channel.Length is < 1 or > 120 || channel.Any(char.IsWhiteSpace) ||
+            channel.Any(char.IsControl) || channel.StartsWith('-') ||
+            channel.StartsWith("origin/", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Informe uma branch válida do Automation.");
+        return channel;
     }
 
     private static bool SupportsCampaignRunner(string runnerPath)

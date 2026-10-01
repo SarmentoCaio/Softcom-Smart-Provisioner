@@ -536,13 +536,15 @@
             <label class="test-source-field">
               <span>Fonte dos testes</span>
               <select id="test-automation-channel">
-                <option value="master">Padrão estável (master)</option>
-                <option value="dev">Padrão em desenvolvimento (dev)</option>
-                <option value="DEV-Sarmento">Sarmento (DEV-Sarmento)</option>
+                <option value="dev">dev</option>
+                <option value="master">master</option>
+                <option value="DEV-Sarmento">DEV-Sarmento</option>
+                <option value="__custom__">Outra branch...</option>
               </select>
+              <input class="hidden" id="test-automation-custom-branch" autocomplete="off" spellcheck="false" placeholder="Digite o nome da branch">
               <small id="test-automation-version">Verificando branch...</small>
             </label>
-            <button class="secondary" id="update-test-automation-source">Aplicar e atualizar</button>
+            <button class="secondary" id="update-test-automation-source">Fazer pull da branch</button>
             <button class="ghost" id="refresh-test-automation">Atualizar catálogo</button>
           </div>
         </div>
@@ -553,6 +555,21 @@
           <span class="test-check pending">uv</span>
           <span class="test-check pending">Appium</span>
         </div>
+
+        <article class="panel test-first-use hidden" id="test-automation-clone-panel">
+          <div><span class="eyebrow">PRIMEIRO ACESSO</span><h2>Baixar Automation</h2></div>
+          <p>O projeto será baixado do repositório privado para este computador, começando pela branch dev. O Git pode solicitar seu login.</p>
+          <button class="primary" id="clone-test-automation">Baixar Automation dev</button>
+        </article>
+
+        <article class="panel test-first-use hidden" id="test-automation-env-panel">
+          <div><span class="eyebrow">CONFIGURAÇÃO LOCAL</span><h2>Arquivo .env necessário</h2></div>
+          <p>Importe seu .env existente ou abra a pasta do Automation para criar um a partir de .env.example. Credenciais ficam somente neste computador e não são alteradas pelo pull.</p>
+          <div class="test-first-use-actions">
+            <button class="secondary" id="import-test-automation-env">Importar .env</button>
+            <button class="ghost" id="open-test-automation-folder">Abrir pasta</button>
+          </div>
+        </article>
 
         <div class="grid two test-setup-grid">
           <article class="panel">
@@ -600,10 +617,24 @@
             <h2 id="test-run-title">Pronto para configurar</h2>
             <p id="test-run-message">Selecione um Android e uma suíte. Os testes podem criar ou alterar dados no ambiente selecionado pela automação.</p>
           </div>
+          <div class="auto-test-selection">
+            <div class="auto-test-selection-heading">
+              <strong>Maquininhas no autoteste</strong>
+              <span class="mini-status" id="auto-test-selected-count">0 selecionadas</span>
+            </div>
+            <div id="auto-test-device-list" class="auto-test-device-list">Carregando dispositivos conectados...</div>
+            <small>Desmarque qualquer maquininha que não deve ser provisionada nem testada. Só as selecionadas entram na campanha.</small>
+          </div>
+          <label class="field">
+            <span>Endereço do SelfHost para o autoteste (opcional)</span>
+            <input id="auto-test-selfhost-url" autocomplete="off" placeholder="Automático: IP local e porta 7711">
+            <small>Use um endereço acessível pelas maquininhas se a detecção automática escolher a rede errada.</small>
+          </label>
           <div class="test-run-actions">
-            <button class="danger-soft hidden" id="cancel-test-automation">Cancelar</button>
-            <button class="secondary hidden" id="open-test-report">Abrir relatório</button>
-            <button class="primary big" id="run-test-automation" disabled>Executar testes</button>
+              <button class="danger-soft hidden" id="cancel-test-automation">Cancelar</button>
+              <button class="secondary hidden" id="open-test-report">Abrir relatório</button>
+              <button class="secondary" id="run-auto-test-campaign" disabled>Autoteste das maquininhas</button>
+              <button class="primary big" id="run-test-automation" disabled>Executar testes</button>
           </div>
           <pre class="test-run-summary hidden" id="test-run-summary"></pre>
         </article>

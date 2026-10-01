@@ -135,6 +135,9 @@ public sealed class DeviceCatalogService
         };
         AddSiblingCandidates(candidates, workingDirectory);
         AddSiblingCandidates(candidates, baseDirectory);
+        candidates.Add(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Softcom", "SmartProvisioner", "automation", ".env"));
         return candidates.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => Path.GetFullPath(x!)).FirstOrDefault(File.Exists);
     }
 

@@ -21,7 +21,10 @@ public sealed record TestAutomationDevice(
     bool IsOnline,
     IReadOnlyList<string> DeviceTags,
     string SuggestedDeviceTag,
-    bool RequiresProfileSelection);
+    bool RequiresProfileSelection)
+{
+    public bool AutoCampaignSupported { get; init; }
+}
 
 public sealed record TestAutomationPrerequisites(
     bool ProjectAvailable,

@@ -41,6 +41,14 @@ Os binários de ADB e scrcpy necessários à aplicação são distribuídos com 
 
 Para Smart TEF, informe na própria tela o nome do dispositivo, CNPJ, empresa e token fornecidos para a configuração. Esses dados não possuem valores fixos na interface.
 
+### Primeiro acesso aos testes
+
+Na aba **Testes do Smart**, se o projeto Automation ainda não existir no computador, use **Baixar Automation dev**. O Provisioner usa o Git e o acesso individual ao repositório privado para criar um clone em `%LOCALAPPDATA%\Softcom\SmartProvisioner\automation`. Se o projeto já estiver disponível localmente, ele é reutilizado. O Provisioner não instala Git, uv ou Appium automaticamente; a aba mostra os pré-requisitos ausentes.
+
+O `.env` não acompanha o clone nem a atualização pública. Importe um `.env` já configurado pelo botão da aba ou abra a pasta do Automation e crie um a partir de `.env.example`, preenchendo as credenciais e o UDID do dispositivo localmente. Um `.env` existente nunca é sobrescrito pela importação ou pela atualização do código.
+
+Para atualizar os testes, informe ou escolha uma branch remota e clique em **Fazer pull da branch**. O Provisioner busca as branches, muda para a escolhida e aceita somente atualização por avanço rápido. Se houver alterações locais ou divergência, ele interrompe a operação sem descartá-las. O código privado e o `.env` não são incluídos no pacote de releases do Provisioner.
+
 ## Organização da interface
 
 - **Provisionar:** fluxo principal de cliente, empresa, dispositivo, Android e preparação.
@@ -52,7 +60,7 @@ O modo de acesso fica recolhido. O fluxo normal usa Online; quando for necessár
 
 ## Dados locais e segurança
 
-Os dados do usuário ficam em `%LOCALAPPDATA%\Softcom\SmartProvisioner`, incluindo configurações, logs, perfil do WebView2 e segredos locais protegidos com DPAPI para o usuário atual do Windows.
+Os dados do usuário ficam em `%LOCALAPPDATA%\Softcom\SmartProvisioner`, incluindo configurações, logs, perfil do WebView2 e segredos do Provisioner protegidos com DPAPI para o usuário atual do Windows. O `.env` do Automation é uma exceção: o runner precisa lê-lo em texto legível; mantenha-o somente no computador do usuário e não o distribua.
 
 - Credenciais, tokens e cookies não devem ser incluídos em logs ou documentação.
 - A sessão Online usa o perfil local do WebView2 e os mecanismos de autenticação do próprio Softcomshop.

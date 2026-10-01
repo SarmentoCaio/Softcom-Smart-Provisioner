@@ -43,6 +43,8 @@
     testAutomationSourceUpdating: false,
     testAutomationProgress: [],
     testAutomationChannel: "dev",
+    autoCampaignSelectedSerials: [],
+    autoCampaignSelectionInitialized: false,
     testDeviceSerial: "",
     testDeviceTag: "",
     testSuiteId: "",
@@ -105,7 +107,7 @@
     $("provision-confirm-title").textContent = options.title || "Confirmar provisionamento";
     $("provision-confirm-description").textContent = options.description || "Confira os dados antes de iniciar.";
     $("provision-confirm-module").textContent = options.moduleLabel || "Smart";
-    $("provision-confirm-devices").textContent = selectedProvisionDevicesLabel();
+    $("provision-confirm-devices").textContent = options.devicesLabel || selectedProvisionDevicesLabel();
     $("provision-confirm-access").textContent = options.accessLabel || "—";
     $("provision-confirm-data").textContent = options.clearData ? "Serão limpos" : "Serão preservados";
     $("provision-confirm-preset").textContent = options.configurationLabel || "Somente provisionar";
@@ -141,6 +143,8 @@
       updateInstall: $("install-update"),
       testAutomationCatalog: $("refresh-test-automation"),
       testAutomationSource: $("update-test-automation-source"),
+      testAutomationClone: $("clone-test-automation"),
+      testAutomationEnv: $("import-test-automation-env"),
       testAutomationRun: $("run-test-automation")
     };
     const el = map[key];
@@ -156,7 +160,9 @@
       if (key === "update") el.textContent = active ? "Verificando..." : "Verificar agora";
       if (key === "updateInstall") el.textContent = active ? "Atualizando..." : "Atualizar agora";
       if (key === "testAutomationCatalog") el.textContent = active ? "Atualizando..." : "Atualizar catálogo";
-      if (key === "testAutomationSource") el.textContent = active ? "Buscando..." : "Aplicar e atualizar";
+      if (key === "testAutomationSource") el.textContent = active ? "Buscando..." : "Fazer pull da branch";
+      if (key === "testAutomationClone") el.textContent = active ? "Baixando..." : "Baixar Automation dev";
+      if (key === "testAutomationEnv") el.textContent = active ? "Importando..." : "Importar .env";
       if (key === "testAutomationRun") el.textContent = active ? "Executando..." : "Executar testes";
     }
 
@@ -184,7 +190,8 @@
       state.testAutomationRunning = active;
       updateTestRunActions();
     }
-    if (key === "testAutomationSource") {
+    if (key === "provision") updateTestRunActions();
+    if (key === "testAutomationSource" || key === "testAutomationClone" || key === "testAutomationEnv") {
       state.testAutomationSourceUpdating = active;
       updateTestRunActions();
     }
@@ -256,7 +263,7 @@
     if ($("update-auto-install")) $("update-auto-install").checked = b.settings.autoInstallUpdates !== false;
     if ($("update-stable-url")) $("update-stable-url").value = b.settings.stableManifestUrl || "";
     if ($("update-beta-url")) $("update-beta-url").value = b.settings.betaManifestUrl || "";
-    if (["master", "dev", "DEV-Sarmento"].includes(b.settings.testAutomationChannel)) {
+    if (typeof b.settings.testAutomationChannel === "string" && b.settings.testAutomationChannel.trim()) {
       state.testAutomationChannel = b.settings.testAutomationChannel;
     }
     const activeManifest = (b.settings.updateChannel === "beta" ? b.settings.betaManifestUrl : b.settings.stableManifestUrl) || "";
@@ -1579,7 +1586,7 @@
     if (!host || !catalog) return;
     const checks = [
       ["Projeto", catalog.prerequisites?.projectAvailable],
-      [".env seguro", catalog.prerequisites?.environmentAvailable],
+      [".env local", catalog.prerequisites?.environmentAvailable],
       ["uv", catalog.prerequisites?.uvAvailable],
       ["Appium", catalog.prerequisites?.appiumAvailable]
     ];
@@ -1689,16 +1696,32 @@
     renderTestPrerequisites();
 
     const source = catalog.source || {};
-    const channels = source.availableChannels || ["master", "dev", "DEV-Sarmento"];
-    if (channels.includes(source.currentBranch)) state.testAutomationChannel = source.currentBranch;
+    const channels = [...new Set(["dev", "master", "DEV-Sarmento", ...(source.availableChannels || []),
+      ...(source.currentBranch ? [source.currentBranch] : [])])];
+    if (source.currentBranch) state.testAutomationChannel = source.currentBranch;
     const channelSelect = $("test-automation-channel");
+    const customBranch = $("test-automation-custom-branch");
     if (channelSelect) {
-      channelSelect.value = channels.includes(state.testAutomationChannel) ? state.testAutomationChannel : "dev";
-      channelSelect.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating;
+      channelSelect.innerHTML = channels.map(branch =>
+        `<option value="${escapeAttr(branch)}">${escapeHtml(branch)}</option>`).join("") +
+        '<option value="__custom__">Outra branch...</option>';
+      const selected = state.testAutomationChannel || "dev";
+      const isCustom = !channels.includes(selected);
+      channelSelect.value = isCustom ? "__custom__" : selected;
+      channelSelect.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating || !catalog.projectRoot;
+      if (customBranch) {
+        customBranch.value = isCustom ? selected : "";
+        customBranch.classList.toggle("hidden", !isCustom);
+        customBranch.disabled = channelSelect.disabled;
+      }
     }
+    $("test-automation-clone-panel")?.classList.toggle("hidden", !!catalog.projectRoot);
+    $("test-automation-env-panel")?.classList.toggle("hidden", !catalog.projectRoot || !!catalog.prerequisites?.environmentAvailable);
+    const updateSource = $("update-test-automation-source");
+    if (updateSource) updateSource.disabled = !catalog.projectRoot || state.testAutomationSourceUpdating || state.testAutomationRunning;
     const version = $("test-automation-version");
     if (version) {
-      const branch = source.currentBranch || "branch não identificada";
+      const branch = source.currentBranch || (catalog.projectRoot ? "branch não identificada" : "Automation ainda não baixado");
       const commit = source.commit ? ` · ${source.commit}` : "";
       const dirty = source.hasLocalChanges ? " · alterações locais" : "";
       version.textContent = `${branch}${commit}${dirty}`;
@@ -1725,12 +1748,39 @@
     $("test-suite-count").textContent = `${suites.length} suíte${suites.length === 1 ? "" : "s"}`;
     $("open-test-report").classList.toggle("hidden", !catalog.reportPath);
 
+    renderAutoCampaignDevices();
     renderTestDeviceProfile();
     renderTestCases();
     const warnings = catalog.warnings || [];
     if (warnings.length) {
       $("test-run-message").textContent = warnings.join(" ");
     }
+  }
+
+  function renderAutoCampaignDevices() {
+    const host = $("auto-test-device-list");
+    if (!host) return;
+    const devices = (state.testAutomation?.devices || []).filter(device => device.isOnline);
+    const supported = devices.filter(device => device.autoCampaignSupported && device.suggestedDeviceTag);
+    if (!state.autoCampaignSelectionInitialized && supported.length) {
+      state.autoCampaignSelectedSerials = supported.map(device => device.serial);
+      state.autoCampaignSelectionInitialized = true;
+    }
+    const valid = new Set(supported.map(device => device.serial));
+    state.autoCampaignSelectedSerials = state.autoCampaignSelectedSerials.filter(serial => valid.has(serial));
+    const selected = new Set(state.autoCampaignSelectedSerials);
+    host.innerHTML = devices.length ? devices.map(device => {
+      const available = !!(device.autoCampaignSupported && device.suggestedDeviceTag);
+      const detail = available
+        ? `${device.suggestedDeviceTag} · ${device.serial}`
+        : `Sem mapeamento para as três fases · ${device.serial}`;
+      return `<label class="auto-test-device-option${available ? "" : " unavailable"}">
+        <input type="checkbox" data-auto-serial="${escapeAttr(device.serial)}" data-supported="${available}"${selected.has(device.serial) ? " checked" : ""}${available && !state.testAutomationRunning && !state.testAutomationSourceUpdating ? "" : " disabled"}>
+        <span><strong>${escapeHtml(device.friendlyName || device.serial)}</strong><small>${escapeHtml(detail)}</small></span>
+      </label>`;
+    }).join("") : "Nenhum Android conectado no ADB.";
+    $("auto-test-selected-count").textContent = `${state.autoCampaignSelectedSerials.length} selecionada${state.autoCampaignSelectedSerials.length === 1 ? "" : "s"}`;
+    updateTestRunActions();
   }
 
   function updateTestRunActions() {
@@ -1740,7 +1790,22 @@
       prerequisites?.environmentAvailable && prerequisites?.uvAvailable && state.testDeviceSerial &&
       state.testDeviceTag && state.testSuiteId);
     const run = $("run-test-automation");
-    if (run) run.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating || !ready;
+    if (run) run.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating || state.busy.has("provision") || !ready;
+    const autoRun = $("run-auto-test-campaign");
+    if (autoRun) autoRun.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating ||
+      state.busy.has("provision") || !catalog?.projectRoot || !prerequisites?.runnerAvailable ||
+      !prerequisites?.environmentAvailable || !prerequisites?.uvAvailable ||
+      state.autoCampaignSelectedSerials.length === 0;
+    document.querySelectorAll("#auto-test-device-list input[data-auto-serial]").forEach(input => {
+      input.disabled = input.dataset.supported !== "true" || state.testAutomationRunning ||
+        state.testAutomationSourceUpdating || state.busy.has("provision");
+    });
+    const updateSource = $("update-test-automation-source");
+    if (updateSource) updateSource.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating || !catalog?.projectRoot;
+    const clone = $("clone-test-automation");
+    if (clone) clone.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating;
+    const importEnv = $("import-test-automation-env");
+    if (importEnv) importEnv.disabled = state.testAutomationRunning || state.testAutomationSourceUpdating;
     $("cancel-test-automation")?.classList.toggle("hidden", !state.testAutomationRunning);
   }
 
@@ -2361,13 +2426,32 @@
       send("loadTestAutomation", { refreshDevices: true });
     });
     $("test-automation-channel")?.addEventListener("change", e => {
-      const requested = e.target.value;
-      state.testAutomationChannel = ["master", "dev", "DEV-Sarmento"].includes(requested) ? requested : "dev";
+      const customBranch = $("test-automation-custom-branch");
+      const isCustom = e.target.value === "__custom__";
+      customBranch.classList.toggle("hidden", !isCustom);
+      state.testAutomationChannel = isCustom ? customBranch.value.trim() : e.target.value;
+      if (isCustom) customBranch.focus();
+    });
+    $("test-automation-custom-branch")?.addEventListener("input", e => {
+      state.testAutomationChannel = e.target.value.trim();
     });
     $("update-test-automation-source")?.addEventListener("click", () => {
+      const selected = $("test-automation-channel").value;
+      state.testAutomationChannel = selected === "__custom__"
+        ? $("test-automation-custom-branch").value.trim() : selected;
+      if (!state.testAutomationChannel) {
+        showInlineError("test-automation-error", "Informe a branch do Automation.");
+        return;
+      }
       clearInlineError("test-automation-error");
       send("updateTestAutomationSource", { branch: state.testAutomationChannel });
     });
+    $("clone-test-automation")?.addEventListener("click", () => {
+      clearInlineError("test-automation-error");
+      send("cloneTestAutomation");
+    });
+    $("import-test-automation-env")?.addEventListener("click", () => send("importTestAutomationEnv"));
+    $("open-test-automation-folder")?.addEventListener("click", () => send("openTestAutomationFolder"));
     $("test-device")?.addEventListener("change", e => {
       state.testDeviceSerial = e.target.value;
       state.testDeviceTag = selectedTestDevice()?.suggestedDeviceTag || "";
@@ -2398,6 +2482,42 @@
         includeTag: $("test-include-tag").value.trim() || null
       });
     });
+    $("run-auto-test-campaign")?.addEventListener("click", () => {
+      const selectedDevices = (state.testAutomation?.devices || [])
+        .filter(device => state.autoCampaignSelectedSerials.includes(device.serial));
+      if (!selectedDevices.length) {
+        showInlineError("test-automation-error", "Selecione ao menos uma maquininha para o autoteste.");
+        return;
+      }
+      const names = selectedDevices.map(device => device.friendlyName || device.serial);
+      const devicesLabel = names.length <= 2
+        ? names.join(" + ")
+        : `${names.slice(0, 2).join(" + ")} +${names.length - 2}`;
+      openProvisionConfirmation({
+        title: "Confirmar autoteste das maquininhas",
+        description: "A campanha usa até 7 aparelhos conectados com cadastros em jormungandr e fafnir. Em cada fase, ela apaga os dados do Smart, desvincula o cadastro anterior, vincula novamente e executa a suíte em paralelo. Uma falha interrompe as fases seguintes.",
+        moduleLabel: "Comanda → PDV → Minimercado",
+        devicesLabel,
+        accessLabel: "SelfHost em jormungandr; Web em fafnir",
+        clearData: true,
+        configurationLabel: "Somente provisionar",
+        onConfirm: () => send("runAutoTestCampaign", {
+          serials: selectedDevices.map(device => device.serial),
+          selfHostBaseUrl: $("auto-test-selfhost-url")?.value.trim() || getSelfHostBaseUrl()
+        })
+      });
+    });
+    $("auto-test-device-list")?.addEventListener("change", event => {
+      const input = event.target;
+      if (!input?.matches?.("input[data-auto-serial]")) return;
+      const selected = new Set(state.autoCampaignSelectedSerials);
+      if (input.checked) selected.add(input.dataset.autoSerial);
+      else selected.delete(input.dataset.autoSerial);
+      state.autoCampaignSelectedSerials = [...selected];
+      state.autoCampaignSelectionInitialized = true;
+      $("auto-test-selected-count").textContent = `${selected.size} selecionada${selected.size === 1 ? "" : "s"}`;
+      updateTestRunActions();
+    });
     $("cancel-test-automation")?.addEventListener("click", () => send("cancelTestAutomation"));
     $("open-test-report")?.addEventListener("click", () => send("openTestReport"));
   }
@@ -2427,10 +2547,27 @@
         clearInlineError("test-automation-error");
         renderTestRunState("running", "Testes em execução", `Executando ${payload.testCase || "a suíte selecionada"} em ${payload.serial}.`);
         break;
+      case "autoTestCampaignStarted":
+        state.testAutomationRunning = true;
+        state.testAutomationProgress = [];
+        clearInlineError("test-automation-error");
+        renderTestRunState("running", "Autoteste em andamento", "Validando os cadastros antes de preparar as maquininhas...");
+        break;
       case "testAutomationSourceUpdating":
         state.testAutomationProgress = [];
         clearInlineError("test-automation-error");
         renderTestRunState("running", "Atualizando fonte dos testes", `Buscando a branch ${payload.branch || "selecionada"} sem fazer merge entre DEV e master.`);
+        break;
+      case "testAutomationSourceUpdated":
+        renderTestRunState("success", "Automation atualizado", `Branch ${payload.branch || "selecionada"} pronta para os testes.`);
+        break;
+      case "testAutomationCloneStarted":
+        state.testAutomationProgress = [];
+        clearInlineError("test-automation-error");
+        renderTestRunState("running", "Baixando Automation", "Clonando a branch dev neste computador. Acompanhe o progresso abaixo.");
+        break;
+      case "testAutomationCloneFinished":
+        renderTestRunState("success", "Automation baixado", "Configure o .env local para liberar os testes.");
         break;
       case "testAutomationSourceProgress":
         state.testAutomationProgress.push(payload);
@@ -2461,6 +2598,15 @@
         toast(payload.message || title, payload.success ? "success" : (payload.canceled ? "info" : "error"));
         break;
       }
+      case "autoTestCampaignFinished":
+        state.testAutomationRunning = false;
+        if (payload.reportPath && state.testAutomation) state.testAutomation.reportPath = payload.reportPath;
+        $("open-test-report")?.classList.toggle("hidden", !payload.reportPath);
+        renderTestRunState(payload.success ? "success" : "failed",
+          payload.success ? "Autoteste aprovado" : payload.canceled ? "Autoteste cancelado" : "Autoteste interrompido",
+          payload.message || "Campanha encerrada.");
+        toast(payload.message || "Campanha encerrada.", payload.success ? "success" : payload.canceled ? "info" : "error");
+        break;
       case "testAutomationError":
         state.testAutomationRunning = false;
         showInlineError("test-automation-error", payload.message || "Não foi possível executar os testes.");
