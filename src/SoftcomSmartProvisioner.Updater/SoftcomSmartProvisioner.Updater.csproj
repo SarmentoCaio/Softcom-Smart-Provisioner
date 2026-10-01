@@ -7,9 +7,9 @@
     <Nullable>enable</Nullable>
     <AssemblyName>SoftcomSmartProvisioner.Updater</AssemblyName>
     <RootNamespace>SoftcomSmartProvisioner.Updater</RootNamespace>
-    <Version>1.0.4.1</Version>
-    <AssemblyVersion>1.0.4.1</AssemblyVersion>
-    <FileVersion>1.0.4.1</FileVersion>
+    <Version>1.0.4.2</Version>
+    <AssemblyVersion>1.0.4.2</AssemblyVersion>
+    <FileVersion>1.0.4.2</FileVersion>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>

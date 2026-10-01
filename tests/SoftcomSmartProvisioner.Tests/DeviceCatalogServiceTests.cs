@@ -5,6 +5,34 @@ namespace SoftcomSmartProvisioner.Tests;
 public sealed class DeviceCatalogServiceTests
 {
     [Fact]
+    public void FindsAutomationCatalogWhenInstalledBesideProjetos()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "SoftcomProvisionerCatalogTests", Guid.NewGuid().ToString("N"));
+        var installed = Path.Combine(root, "Softcom Smart Provisioner");
+        var automation = Path.Combine(root, "Projetos", "softcom-smart-automation");
+        var catalogPath = Path.Combine(automation, ".env");
+
+        try
+        {
+            Directory.CreateDirectory(installed);
+            Directory.CreateDirectory(automation);
+            File.WriteAllText(catalogPath, "GETNET_DX8000_UDID=24B4FD807108\n");
+
+            var service = new DeviceCatalogService(workingDirectory: installed, baseDirectory: installed);
+            var snapshot = service.Load();
+            var identity = DeviceCatalogService.Identify("24B4FD807108", snapshot, "DX8000");
+
+            Assert.Equal(catalogPath, snapshot.SourcePath);
+            Assert.True(identity.IsKnownDevice);
+            Assert.Equal("Getnet - DX8000", identity.FriendlyName);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void IdentifiesKnownStoneAndPrioritizesCatalogName()
     {
         var snapshot = DeviceCatalogService.Parse(new[] { "STONE_UDID=4AF303W9U" });

@@ -30,8 +30,18 @@ public sealed class DeviceCatalogService
         };
 
     private readonly string? _explicitPath;
+    private readonly string? _workingDirectory;
+    private readonly string? _baseDirectory;
 
-    public DeviceCatalogService(string? explicitPath = null) => _explicitPath = explicitPath;
+    public DeviceCatalogService(
+        string? explicitPath = null,
+        string? workingDirectory = null,
+        string? baseDirectory = null)
+    {
+        _explicitPath = explicitPath;
+        _workingDirectory = workingDirectory;
+        _baseDirectory = baseDirectory;
+    }
 
     public DeviceCatalogSnapshot Load()
     {
@@ -114,15 +124,17 @@ public sealed class DeviceCatalogService
     public string? ResolveCatalogPath()
     {
         var configured = Environment.GetEnvironmentVariable("SMART_PROVISIONER_DEVICE_ENV");
+        var workingDirectory = _workingDirectory ?? Directory.GetCurrentDirectory();
+        var baseDirectory = _baseDirectory ?? AppContext.BaseDirectory;
         var candidates = new List<string?>
         {
             _explicitPath,
             configured,
-            Path.Combine(Directory.GetCurrentDirectory(), ".env"),
-            Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "..", "softcom-smart-automation", ".env"))
+            Path.Combine(workingDirectory, ".env"),
+            Path.GetFullPath(Path.Combine(workingDirectory, "..", "softcom-smart-automation", ".env"))
         };
-        AddSiblingCandidates(candidates, Directory.GetCurrentDirectory());
-        AddSiblingCandidates(candidates, AppContext.BaseDirectory);
+        AddSiblingCandidates(candidates, workingDirectory);
+        AddSiblingCandidates(candidates, baseDirectory);
         return candidates.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => Path.GetFullPath(x!)).FirstOrDefault(File.Exists);
     }
 
@@ -132,6 +144,9 @@ public sealed class DeviceCatalogService
         for (var level = 0; directory is not null && level < 9; level++, directory = directory.Parent)
         {
             candidates.Add(Path.Combine(directory.FullName, "softcom-smart-automation", ".env"));
+            // A instalacao fica ao lado de Projetos, enquanto o Automation e seu
+            // catalogo de UDIDs ficam dentro de Projetos/softcom-smart-automation.
+            candidates.Add(Path.Combine(directory.FullName, "Projetos", "softcom-smart-automation", ".env"));
         }
     }
 

@@ -383,7 +383,7 @@ public sealed class MainForm : Form
                 name = "Softcom Smart Provisioner",
                 version = AppVersion,
                 architecture = ".NET 8 + WebView2",
-                phase = "1.0.4.1"
+                phase = "1.0.4.2"
             },
             environments = EnvironmentCatalog.Environments.Values,
             selfHost = new

@@ -2,6 +2,10 @@
 
 Este arquivo registra somente as versões distribuídas a partir da 1.0.0. Alterações anteriores foram consolidadas na primeira versão oficial.
 
+## 1.0.4.2
+
+- Corrigida a descoberta do catalogo de UDIDs quando o Provisioner esta instalado ao lado da pasta Projetos.
+
 ## 1.0.4.1
 
 - No fluxo Softcomshop Online, a verificacao de vinculos consulta somente o cliente selecionado; a API SelfHost e consultada apenas quando o vinculo SelfHost esta selecionado.
