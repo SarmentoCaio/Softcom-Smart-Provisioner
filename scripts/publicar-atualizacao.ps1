@@ -42,8 +42,8 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
     throw "Versao nao informada."
 }
 $Version = $Version.Trim().TrimStart([char[]]@('v','V'))
-if ($Version -notmatch '^\d+\.\d+\.\d+$') {
-    throw "Versao invalida. Use o formato X.Y.Z, por exemplo 1.0.2."
+if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+    throw "Versao invalida. Use X.Y.Z ou X.Y.Z.W, por exemplo 1.0.4.1."
 }
 
 if ([string]::IsNullOrWhiteSpace($Message)) {
@@ -52,6 +52,7 @@ if ([string]::IsNullOrWhiteSpace($Message)) {
 
 $mainProject = Join-Path $root "src\SoftcomSmartProvisioner\SoftcomSmartProvisioner.csproj"
 $updaterProject = Join-Path $root "src\SoftcomSmartProvisioner.Updater\SoftcomSmartProvisioner.Updater.csproj"
+$bridgeProject = Join-Path $root "src\SoftcomSmartProvisioner.SelfHostBridge\SoftcomSmartProvisioner.SelfHostBridge.csproj"
 
 function Set-ProjectVersion([string]$Path, [string]$NewVersion) {
     [xml]$xml = Get-Content -LiteralPath $Path
@@ -68,22 +69,20 @@ function Set-ProjectVersion([string]$Path, [string]$NewVersion) {
         $group.Version = $NewVersion
     }
 
-    if ($Path -eq $mainProject) {
-        $assemblyVersion = "$NewVersion.0"
-        if ($null -eq $group.AssemblyVersion) {
-            $node = $xml.CreateElement("AssemblyVersion")
-            $node.InnerText = $assemblyVersion
-            [void]$group.AppendChild($node)
-        } else {
-            $group.AssemblyVersion = $assemblyVersion
-        }
-        if ($null -eq $group.FileVersion) {
-            $node = $xml.CreateElement("FileVersion")
-            $node.InnerText = $assemblyVersion
-            [void]$group.AppendChild($node)
-        } else {
-            $group.FileVersion = $assemblyVersion
-        }
+    $assemblyVersion = if ($NewVersion.Split('.').Count -eq 4) { $NewVersion } else { "$NewVersion.0" }
+    if ($null -eq $group.AssemblyVersion) {
+        $node = $xml.CreateElement("AssemblyVersion")
+        $node.InnerText = $assemblyVersion
+        [void]$group.AppendChild($node)
+    } else {
+        $group.AssemblyVersion = $assemblyVersion
+    }
+    if ($null -eq $group.FileVersion) {
+        $node = $xml.CreateElement("FileVersion")
+        $node.InnerText = $assemblyVersion
+        [void]$group.AppendChild($node)
+    } else {
+        $group.FileVersion = $assemblyVersion
     }
 
     $settings = New-Object System.Xml.XmlWriterSettings
@@ -122,6 +121,7 @@ if (-not [string]::IsNullOrWhiteSpace($remoteTag)) {
 
 Set-ProjectVersion $mainProject $Version
 Set-ProjectVersion $updaterProject $Version
+Set-ProjectVersion $bridgeProject $Version
 
 [void](Invoke-Git -GitArgs @("add", "."))
 & git diff --cached --quiet

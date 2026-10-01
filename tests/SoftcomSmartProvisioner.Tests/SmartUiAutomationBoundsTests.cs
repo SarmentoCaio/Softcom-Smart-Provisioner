@@ -26,6 +26,80 @@ public sealed class SmartUiAutomationBoundsTests
     }
 
     [Fact]
+    public void ParsesGetnetP2NewCompanyBoundsFromAndroid7ActivityDump()
+    {
+        const string dump = """
+                View Hierarchy:
+                  DecorView@3a799fa[EmpresaActivity]
+                    android.widget.LinearLayout{1c55bc6 V.E...... ........ 0,0-720,1344}
+                      android.widget.FrameLayout{64fd6b4 V.E...... ........ 0,0-720,1344}
+                        android.widget.LinearLayout{291f0f9 V.E...... ........ 16,1072-704,1168}
+                          u.q{925a83e VFED..C.. ........ 0,0-344,96 #7f0a00df app:id/btn_cancelar}
+                          u.q{2904484 VFED..C.. ........ 344,0-688,96 #7f0a00f6 app:id/btn_novo}
+            """;
+
+        var result = Parse(dump, "app:id/btn_novo");
+
+        Assert.True(Read<bool>(result, "Success"));
+        Assert.Equal(532, Read<int>(result, "CenterX"));
+        Assert.Equal(1120, Read<int>(result, "CenterY"));
+    }
+
+    [Fact]
+    public void ParsesGetnetP2ModuleConfirmationBoundsFromAndroid7ActivityDump()
+    {
+        const string dump = """
+                View Hierarchy:
+                  DecorView@9a37c63[EmpresaAddConfigActivity]
+                    android.widget.LinearLayout{9477bbf V.E...... ........ 0,0-720,1344}
+                      android.widget.FrameLayout{f7cbdd5 V.E...... ........ 0,48-720,1344}
+                        androidx.constraintlayout.widget.ConstraintLayout{d921e70 V.E...... ........ 0,0-720,1296}
+                          u.q{3a09a39 VFED..C.. ........ 16,1184-352,1280 #7f0a0103 app:id/btn_voltar}
+                          u.q{4a3b165 VFED..C.. ........ 368,1184-704,1280 #7f0a00e7 app:id/btn_confirmar}
+            """;
+
+        var result = Parse(dump, "app:id/btn_confirmar");
+
+        Assert.True(Read<bool>(result, "Success"));
+        Assert.Equal(536, Read<int>(result, "CenterX"));
+        Assert.Equal(1280, Read<int>(result, "CenterY"));
+    }
+
+    [Theory]
+    [InlineData("app:id/btn_digitar", 532, 304)]
+    [InlineData("app:id/text_host", 360, 734)]
+    [InlineData("app:id/btn_confirmar", 532, 852)]
+    public void ParsesGetnetP2ConfigurationControlsFromAndroid7ActivityDump(
+        string resourceId,
+        int expectedX,
+        int expectedY)
+    {
+        const string dump = """
+                View Hierarchy:
+                  DecorView@fef39e[EmpresaAddActivity]
+                    androidx.coordinatorlayout.widget.CoordinatorLayout{2d79122 V.ED..... ........ 0,0-720,1344 app:id/activity_device}
+                      android.widget.LinearLayout{755d49c V.E...... ........ 0,160-720,818 app:id/device_content_main}
+                        android.widget.ScrollView{2fb3ea5 VFED.V... ........ 16,16-704,642}
+                          android.widget.LinearLayout{aae227a V.E...... ........ 0,0-688,724}
+                            android.widget.LinearLayout{b062021 V.E...... ........ 0,80-688,208}
+                              u.q{9ebec46 VFED..C.. ........ 0,0-344,96 #7f0a00fb app:id/btn_qrcode}
+                              u.q{e141e2a VFED..C.. ........ 344,0-688,96 #7f0a00ea app:id/btn_digitar}
+                            com.google.android.material.textfield.TextInputLayout{9682d45 V.ED..... ........ 0,499-688,596}
+                              android.widget.FrameLayout{7847c9a V.E...... ........ 0,22-688,97}
+                                com.google.android.material.textfield.TextInputEditText{43f8d8 VFED..CL. ........ 0,0-688,75 #7f0a05de app:id/text_host}
+                            android.widget.LinearLayout{349b897 V.E...... ........ 0,596-688,724}
+                              u.q{86bca84 VFED..C.. ........ 0,32-344,128 #7f0a0103 app:id/btn_voltar}
+                              u.q{9564ffa VFED..CL. ........ 344,32-688,128 #7f0a00e7 app:id/btn_confirmar}
+            """;
+
+        var result = Parse(dump, resourceId);
+
+        Assert.True(Read<bool>(result, "Success"));
+        Assert.Equal(expectedX, Read<int>(result, "CenterX"));
+        Assert.Equal(expectedY, Read<int>(result, "CenterY"));
+    }
+
+    [Fact]
     public void ParsesMercadoPagoConfirmBoundsAtCurrentLayoutPosition()
     {
         const string dump = """
@@ -265,6 +339,23 @@ public sealed class SmartUiAutomationBoundsTests
 
         Assert.Equal(expectedX, point.X);
         Assert.Equal(expectedY, point.Y);
+    }
+
+    [Fact]
+    public void GetnetP2SynchronizationOkPointUsesMappedSuccessDialogButton()
+    {
+        var method = typeof(SmartUiAutomationService).GetMethod(
+            "GetLegacy80P2SynchronizationOkPoint",
+            BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new MissingMethodException(
+                typeof(SmartUiAutomationService).FullName,
+                "GetLegacy80P2SynchronizationOkPoint");
+
+        var point = ((int X, int Y))(method.Invoke(null, new object[] { 720, 1440 })
+            ?? throw new InvalidOperationException("O ponto do OK da Getnet P2 nao foi calculado."));
+
+        Assert.Equal(558, point.X);
+        Assert.Equal(790, point.Y);
     }
 
     [Fact]

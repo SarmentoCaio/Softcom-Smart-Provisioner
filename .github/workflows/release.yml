@@ -21,10 +21,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Configurar .NET 8
+      - name: Configurar .NET 8 e 10
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
       - name: Resolver versao da tag
         id: version
@@ -33,7 +35,7 @@ jobs:
           $tag = "${{ github.ref_name }}"
           if (-not $tag.StartsWith("v")) { throw "A tag deve iniciar com v." }
           $version = $tag.Substring(1)
-          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versao invalida: $version" }
+          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { throw "Versao invalida: $version" }
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
 
@@ -45,26 +47,30 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
+          $assemblyVersion = if ($version.Split('.').Count -eq 4) { $version } else { "$version.0" }
           dotnet publish src\SoftcomSmartProvisioner\SoftcomSmartProvisioner.csproj `
             -c Release `
             -r win-x64 `
             --self-contained true `
             -o publish\win-x64 `
             /p:Version=$version `
-            /p:AssemblyVersion="$version.0" `
-            /p:FileVersion="$version.0"
+            /p:AssemblyVersion=$assemblyVersion `
+            /p:FileVersion=$assemblyVersion
 
       - name: Publicar Updater
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
+          $assemblyVersion = if ($version.Split('.').Count -eq 4) { $version } else { "$version.0" }
           dotnet publish src\SoftcomSmartProvisioner.Updater\SoftcomSmartProvisioner.Updater.csproj `
             -c Release `
             -r win-x64 `
             --self-contained true `
             -p:PublishSingleFile=true `
             -o publish\updater-temp `
-            /p:Version=$version
+            /p:Version=$version `
+            /p:AssemblyVersion=$assemblyVersion `
+            /p:FileVersion=$assemblyVersion
           Copy-Item publish\updater-temp\SoftcomSmartProvisioner.Updater.exe publish\win-x64\SoftcomSmartProvisioner.Updater.exe -Force
           Remove-Item publish\updater-temp -Recurse -Force
 

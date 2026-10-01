@@ -383,7 +383,7 @@ public sealed class MainForm : Form
                 name = "Softcom Smart Provisioner",
                 version = AppVersion,
                 architecture = ".NET 8 + WebView2",
-                phase = "Desenvolvimento 1.0.4"
+                phase = "1.0.4.1"
             },
             environments = EnvironmentCatalog.Environments.Values,
             selfHost = new
@@ -2490,7 +2490,6 @@ public sealed class MainForm : Form
                 var effectiveAccessMode = modernSelfHost ? "selfhost" : "online";
                 var previouslyLinkedDeviceId = oauthClient.DeviceId?.Trim() ?? string.Empty;
                 var authoritativeSmartDeviceId = confirmedSmartDeviceId;
-                var registrySelfHostInstallation = selfHostInstallation ?? _selfHostDeviceService.DetectInstallation();
 
                 async Task<IReadOnlyList<DeviceRegistryEntry>> LoadManagedDevicesAsync(string operation)
                 {
@@ -2502,11 +2501,11 @@ public sealed class MainForm : Form
                             company.Id,
                             _shutdown.Token));
 
-                    if (!registrySelfHostInstallation.Installed)
+                    if (!modernSelfHost)
                     {
                         Progress(
                             "registry-scan",
-                            $"Vinculos verificados em todos os {softcomshopDevices.Count} dispositivos do Softcomshop; nao ha SelfHost local instalado para consulta cruzada.");
+                            $"Vinculos verificados em todos os {softcomshopDevices.Count} dispositivos do Softcomshop selecionado.");
                         return softcomshopDevices
                             .Select(x => new DeviceRegistryEntry(x, DeviceRegistrySource.Softcomshop))
                             .ToArray();
@@ -2655,7 +2654,7 @@ public sealed class MainForm : Form
                         "online-unlink-check",
                         modernSelfHost
                             ? "Validacao final antes do ultimo Confirmar: conferindo se o cadastro selecionado e os vinculos anteriores estao realmente desvinculados..."
-                            : $"Verificando o Device ID {smartDeviceId} em todos os dispositivos do Softcomshop e do SelfHost local...");
+                            : $"Verificando o Device ID {smartDeviceId} nos dispositivos do Softcomshop selecionado...");
                     var items = await LoadManagedDevicesAsync("verificar vinculos anteriores");
                     var toUnlink = DeviceLinkConflictResolver.FindConflicts(
                         items,
@@ -2683,7 +2682,7 @@ public sealed class MainForm : Form
                     {
                         Progress("online-unlink", modernSelfHost
                             ? "Nenhum vinculo anterior foi encontrado no Softcomshop nem no SelfHost."
-                            : "Nenhum vinculo anterior foi encontrado em nenhuma das fontes consultadas.");
+                            : "Nenhum vinculo anterior foi encontrado no Softcomshop selecionado.");
                     }
 
                     var refreshed = await LoadManagedDevicesAsync("confirmar desvinculacao");

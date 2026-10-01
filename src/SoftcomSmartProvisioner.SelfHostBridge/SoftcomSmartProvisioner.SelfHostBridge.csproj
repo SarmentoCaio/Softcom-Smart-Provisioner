@@ -8,8 +8,8 @@
     <Nullable>enable</Nullable>
     <AssemblyName>SoftcomSmartProvisioner.SelfHostBridge</AssemblyName>
     <RootNamespace>SoftcomSmartProvisioner.SelfHostBridge</RootNamespace>
-    <Version>1.0.4</Version>
-    <AssemblyVersion>1.0.4.0</AssemblyVersion>
-    <FileVersion>1.0.4.0</FileVersion>
+    <Version>1.0.4.1</Version>
+    <AssemblyVersion>1.0.4.1</AssemblyVersion>
+    <FileVersion>1.0.4.1</FileVersion>
   </PropertyGroup>
 </Project>

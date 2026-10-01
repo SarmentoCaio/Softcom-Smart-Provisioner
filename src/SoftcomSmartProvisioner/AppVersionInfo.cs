@@ -15,7 +15,8 @@ public static class AppVersionInfo
             }
 
             var build = version.Build < 0 ? 0 : version.Build;
-            return $"{version.Major}.{version.Minor}.{build}";
+            var release = $"{version.Major}.{version.Minor}.{build}";
+            return version.Revision > 0 ? $"{release}.{version.Revision}" : release;
         }
     }
 }

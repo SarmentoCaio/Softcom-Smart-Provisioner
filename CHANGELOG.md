@@ -2,7 +2,13 @@
 
 Este arquivo registra somente as versões distribuídas a partir da 1.0.0. Alterações anteriores foram consolidadas na primeira versão oficial.
 
-## 1.0.4 — Em desenvolvimento
+## 1.0.4.1
+
+- No fluxo Softcomshop Online, a verificacao de vinculos consulta somente o cliente selecionado; a API SelfHost e consultada apenas quando o vinculo SelfHost esta selecionado.
+- O Getnet DX8000 com Smart 8.0 captura o Device ID na tela de selecao do modulo, antes da etapa de cadastro.
+- O atualizador e a publicacao passaram a aceitar versoes com quatro componentes.
+
+## 1.0.4
 
 - Interface reorganizada para destacar o fluxo Online e reduzir informações técnicas no uso normal.
 - Removida a página Android duplicada; seleção, atualização e scrcpy permanecem na tela Provisionar.

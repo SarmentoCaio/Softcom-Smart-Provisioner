@@ -356,11 +356,10 @@ public sealed class SmartUiAutomationService
                         : $"Tela Configurar Empresas aberta. Device ID autoritativo disponivel: {smartDeviceId}.");
 
                 // IMPORTANTE: no Android 7 deste Smart 8.0, o uiautomator pode retirar o
-                // aplicativo do primeiro plano mesmo na EmpresaActivity. O botao NOVA
-                // EMPRESA ja foi mapeado no aparelho de referencia: bounds
-                // [540,1771][1059,1835] em 1080x1920, centro aproximado 800,1803.
-                // Portanto acionamos diretamente o ponto proporcional, mas somente depois
-                // de confirmar por dumpsys que a EmpresaActivity ainda esta em primeiro plano.
+                // aplicativo do primeiro plano mesmo na EmpresaActivity. O `dumpsys activity
+                // top`, por outro lado, expoe os bounds reais sem provocar essa troca de foco.
+                // Usamos esses bounds inclusive no SDK 25 (Getnet P2); o ponto proporcional
+                // permanece apenas como fallback quando o Android nao expuser app:id/btn_novo.
                 var activityBeforeNewCompany = await GetLegacySmartActivityAsync(serial, cancellationToken);
                 if (!IsLegacyCompanyActivity(activityBeforeNewCompany))
                 {
@@ -392,7 +391,7 @@ public sealed class SmartUiAutomationService
                 var newCompanyY = Math.Clamp((int)Math.Round(newCompanyDisplay.Height * newCompanyYRatio), 1, newCompanyDisplay.Height - 1);
                 var newCompanySource = "ponto proporcional mapeado";
 
-                if (!largeSelfServiceNewCompany && sdkLevel > 25)
+                if (!largeSelfServiceNewCompany)
                 {
                     var newCompanyBounds = await FindViewBoundsFromActivityDumpAsync(
                         serial,
@@ -1230,6 +1229,27 @@ public sealed class SmartUiAutomationService
 
         var sdkLevel = await GetAndroidSdkLevelAsync(serial, cancellationToken);
 
+        // No DX8000 o Device ID aparece na EmpresaAddConfigActivity (selecao do
+        // modulo), mas nao na EmpresaAddActivity seguinte. Capture o valor enquanto
+        // o proprio Smart ainda o exibe; a verificacao de vinculos continua na
+        // etapa anterior ao envio do Host.
+        if (sdkLevel > 25 &&
+            string.Equals(provisioningProfile?.Trim(), "getnetdx8000", StringComparison.OrdinalIgnoreCase) &&
+            string.IsNullOrWhiteSpace(smartDeviceId))
+        {
+            smartDeviceId = await ResolveSmartDeviceIdFromCurrentScreenAsync(
+                serial,
+                packageName,
+                smartDeviceId,
+                cancellationToken);
+            if (!string.IsNullOrWhiteSpace(smartDeviceId))
+            {
+                progress?.Invoke(
+                    "legacy80-mobile-device-id",
+                    $"Device ID real do Smart localizado na selecao do modulo: {smartDeviceId}.");
+            }
+        }
+
         // Referencia real do celular/GPOS: 304x674.
         // A lista de modulos aparece sempre na mesma ordem no Smart 8.0.x.
         var moduleX = Math.Clamp((int)Math.Round(display.Width * (268d / 304d)), 1, display.Width - 1);
@@ -1239,33 +1259,33 @@ public sealed class SmartUiAutomationService
         var moduleSource = "ponto proporcional mapeado";
         var firstConfirmSource = "ponto proporcional mapeado";
 
-        if (sdkLevel > 25)
+        // `dumpsys activity top` tambem e seguro no Android 7 da Getnet P2 e
+        // fornece os bounds reais deste layout 720x1440. Os pontos proporcionais
+        // abaixo continuam sendo apenas fallback para aparelhos sem hierarquia.
+        var moduleResourceId = GetLegacy80ModuleResourceId(module);
+        if (!string.IsNullOrWhiteSpace(moduleResourceId))
         {
-            var moduleResourceId = GetLegacy80ModuleResourceId(module);
-            if (!string.IsNullOrWhiteSpace(moduleResourceId))
-            {
-                var moduleBounds = await FindViewBoundsFromActivityDumpAsync(
-                    serial,
-                    moduleResourceId,
-                    cancellationToken);
-                if (IsActivityPointInsideDisplay(moduleBounds, display))
-                {
-                    moduleX = moduleBounds.CenterX;
-                    moduleY = moduleBounds.CenterY;
-                    moduleSource = $"dumpsys activity top ({moduleResourceId})";
-                }
-            }
-
-            var firstConfirmBounds = await FindViewBoundsFromActivityDumpAsync(
+            var moduleBounds = await FindViewBoundsFromActivityDumpAsync(
                 serial,
-                "app:id/btn_confirmar",
+                moduleResourceId,
                 cancellationToken);
-            if (IsActivityPointInsideDisplay(firstConfirmBounds, display))
+            if (IsActivityPointInsideDisplay(moduleBounds, display))
             {
-                firstConfirmX = firstConfirmBounds.CenterX;
-                firstConfirmY = firstConfirmBounds.CenterY;
-                firstConfirmSource = "dumpsys activity top (app:id/btn_confirmar)";
+                moduleX = moduleBounds.CenterX;
+                moduleY = moduleBounds.CenterY;
+                moduleSource = $"dumpsys activity top ({moduleResourceId})";
             }
+        }
+
+        var firstConfirmBounds = await FindViewBoundsFromActivityDumpAsync(
+            serial,
+            "app:id/btn_confirmar",
+            cancellationToken);
+        if (IsActivityPointInsideDisplay(firstConfirmBounds, display))
+        {
+            firstConfirmX = firstConfirmBounds.CenterX;
+            firstConfirmY = firstConfirmBounds.CenterY;
+            firstConfirmSource = "dumpsys activity top (app:id/btn_confirmar)";
         }
 
         if (string.Equals(module, "smart_pdv", StringComparison.OrdinalIgnoreCase))
@@ -1370,7 +1390,6 @@ public sealed class SmartUiAutomationService
                 packageName,
                 smartDeviceId,
                 cancellationToken);
-
             if (!string.IsNullOrWhiteSpace(smartDeviceId))
             {
                 progress?.Invoke(
@@ -1411,18 +1430,15 @@ public sealed class SmartUiAutomationService
         var hostSource = "ponto proporcional mapeado";
         var confirmSource = "ponto proporcional mapeado";
 
-        if (sdkLevel > 25)
+        var typeBounds = await FindViewBoundsFromActivityDumpAsync(
+            serial,
+            "app:id/btn_digitar",
+            cancellationToken);
+        if (IsActivityPointInsideDisplay(typeBounds, display))
         {
-            var typeBounds = await FindViewBoundsFromActivityDumpAsync(
-                serial,
-                "app:id/btn_digitar",
-                cancellationToken);
-            if (IsActivityPointInsideDisplay(typeBounds, display))
-            {
-                typeX = typeBounds.CenterX;
-                typeY = typeBounds.CenterY;
-                typeSource = "dumpsys activity top (app:id/btn_digitar)";
-            }
+            typeX = typeBounds.CenterX;
+            typeY = typeBounds.CenterY;
+            typeSource = "dumpsys activity top (app:id/btn_digitar)";
         }
 
         progress?.Invoke(
@@ -1455,18 +1471,15 @@ public sealed class SmartUiAutomationService
                 smartDeviceId);
         }
 
-        if (sdkLevel > 25)
+        var hostBounds = await FindViewBoundsFromActivityDumpAsync(
+            serial,
+            "app:id/text_host",
+            cancellationToken);
+        if (IsActivityPointInsideDisplay(hostBounds, display))
         {
-            var hostBounds = await FindViewBoundsFromActivityDumpAsync(
-                serial,
-                "app:id/text_host",
-                cancellationToken);
-            if (IsActivityPointInsideDisplay(hostBounds, display))
-            {
-                hostX = hostBounds.CenterX;
-                hostY = hostBounds.CenterY;
-                hostSource = "dumpsys activity top (app:id/text_host)";
-            }
+            hostX = hostBounds.CenterX;
+            hostY = hostBounds.CenterY;
+            hostSource = "dumpsys activity top (app:id/text_host)";
         }
 
         progress?.Invoke(
@@ -1575,18 +1588,15 @@ public sealed class SmartUiAutomationService
             beforeSubmitCompleted = true;
         }
 
-        if (sdkLevel > 25)
+        var confirmBounds = await FindViewBoundsFromActivityDumpAsync(
+            serial,
+            "app:id/btn_confirmar",
+            cancellationToken);
+        if (IsActivityPointInsideDisplay(confirmBounds, display))
         {
-            var confirmBounds = await FindViewBoundsFromActivityDumpAsync(
-                serial,
-                "app:id/btn_confirmar",
-                cancellationToken);
-            if (IsActivityPointInsideDisplay(confirmBounds, display))
-            {
-                confirmX = confirmBounds.CenterX;
-                confirmY = confirmBounds.CenterY;
-                confirmSource = "dumpsys activity top (app:id/btn_confirmar)";
-            }
+            confirmX = confirmBounds.CenterX;
+            confirmY = confirmBounds.CenterY;
+            confirmSource = "dumpsys activity top (app:id/btn_confirmar)";
         }
 
         progress?.Invoke(
@@ -1661,7 +1671,7 @@ public sealed class SmartUiAutomationService
         // Quando fechamos o teclado, rele o botao no layout ja redimensionado. No
         // N950 o teclado permanece como no fluxo anteriormente validado, portanto
         // mantemos a coordenada obtida nesse mesmo estado antes da digitacao.
-        if (sdkLevel > 25 && !preserveKeyboardForN950)
+        if (!preserveKeyboardForN950)
         {
             var currentConfirmBounds = await FindViewBoundsFromActivityDumpAsync(
                 serial,
@@ -1716,18 +1726,15 @@ public sealed class SmartUiAutomationService
                 smartDeviceId);
         }
 
-        if (sdkLevel > 25)
+        var finalConfirmBounds = await FindViewBoundsFromActivityDumpAsync(
+            serial,
+            "app:id/btn_confirmar",
+            cancellationToken);
+        if (IsActivityPointInsideDisplay(finalConfirmBounds, display))
         {
-            var finalConfirmBounds = await FindViewBoundsFromActivityDumpAsync(
-                serial,
-                "app:id/btn_confirmar",
-                cancellationToken);
-            if (IsActivityPointInsideDisplay(finalConfirmBounds, display))
-            {
-                confirmX = finalConfirmBounds.CenterX;
-                confirmY = finalConfirmBounds.CenterY;
-                confirmSource = "dumpsys activity top atualizado (app:id/btn_confirmar)";
-            }
+            confirmX = finalConfirmBounds.CenterX;
+            confirmY = finalConfirmBounds.CenterY;
+            confirmSource = "dumpsys activity top atualizado (app:id/btn_confirmar)";
         }
 
         progress?.Invoke(
@@ -2603,6 +2610,72 @@ public sealed class SmartUiAutomationService
                    !HasAdditionalWindowForActivity(afterTap.CombinedOutput, foregroundActivity);
         }
 
+        // A Getnet P2 com Smart 8.0.x/Android 7 nao publica o botao OK do dialogo
+        // em `dumpsys activity top`. O WindowManager, entretanto, expoe o modal como
+        // uma segunda janela da EmpresaAddActivity. Depois da confirmacao autoritativa
+        // do vinculo, usamos essa segunda janela como guarda e acionamos o ponto mapeado
+        // do unico botao do dialogo, sem recorrer ao UIAutomator instavel desta ROM.
+        var legacy80P2Dialog =
+            string.Equals(AdbService.ClassifySmartFlow(installedVersion), "Smart legado (< 8.1)", StringComparison.OrdinalIgnoreCase) &&
+            sdkLevel is > 0 and <= 25 &&
+            display.Width == 720 &&
+            display.Height == 1440;
+        if (legacy80P2Dialog)
+        {
+            var foregroundActivity = await GetForegroundActivityAsync(serial, cancellationToken);
+            if (IsLegacyLoginActivity(foregroundActivity))
+            {
+                progress?.Invoke(
+                    "legacy80-sync-finished",
+                    "O Smart ja encerrou a confirmacao de sincronizacao e retornou para a tela de Login.");
+                return true;
+            }
+
+            if (string.IsNullOrWhiteSpace(foregroundActivity) ||
+                !foregroundActivity.Contains(packageName, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            for (var attempt = 0; attempt < 12; attempt++)
+            {
+                var windows = await _adb.ShellAsync(
+                    serial,
+                    "dumpsys window windows",
+                    cancellationToken,
+                    8000);
+                if (windows.Success &&
+                    HasAdditionalWindowForActivity(windows.CombinedOutput, foregroundActivity))
+                {
+                    var (okX, okY) = GetLegacy80P2SynchronizationOkPoint(display.Width, display.Height);
+                    progress?.Invoke(
+                        "legacy80-sync-ok-p2",
+                        $"Dialogo final da Getnet P2 confirmado. Acionando OK em {okX},{okY}, sem UIAutomator...");
+                    var tap = await _adb.TapAsync(serial, okX, okY, cancellationToken);
+                    if (!tap.Success)
+                    {
+                        return false;
+                    }
+
+                    await Task.Delay(700, cancellationToken);
+                    var afterTap = await _adb.ShellAsync(
+                        serial,
+                        "dumpsys window windows",
+                        cancellationToken,
+                        8000);
+                    return afterTap.Success &&
+                           !HasAdditionalWindowForActivity(afterTap.CombinedOutput, foregroundActivity);
+                }
+
+                await Task.Delay(350, cancellationToken);
+            }
+
+            progress?.Invoke(
+                "legacy80-sync-ok-p2-wait",
+                "O vinculo foi confirmado, mas o dialogo final da Getnet P2 ainda nao foi exposto pelo WindowManager. Nenhum toque foi enviado fora de hora.");
+            return false;
+        }
+
         // dialog_button pertence ao custom_dialog.xml do Smart 8.0.1. button1 cobre
         // o AlertDialog padrao usado por outras compilacoes sem afetar o formulario,
         // pois ambos sao procurados somente apos a confirmacao remota do vinculo.
@@ -2741,6 +2814,12 @@ public sealed class SmartUiAutomationService
         (
             Math.Clamp((int)Math.Round(width * (540d / 1080d)), 1, Math.Max(1, width - 1)),
             Math.Clamp((int)Math.Round(height * (1089d / 1920d)), 1, Math.Max(1, height - 1))
+        );
+
+    private static (int X, int Y) GetLegacy80P2SynchronizationOkPoint(int width, int height) =>
+        (
+            Math.Clamp((int)Math.Round(width * (558d / 720d)), 1, Math.Max(1, width - 1)),
+            Math.Clamp((int)Math.Round(height * (790d / 1440d)), 1, Math.Max(1, height - 1))
         );
 
     private static bool HasAdditionalWindowForPackage(string? windowDump, string? packageName)

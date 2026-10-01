@@ -2,7 +2,7 @@
 
 Aplicativo Windows usado pela equipe para preparar, vincular e validar dispositivos do Softcom Smart. A interface reúne o acesso ao Softcomshop, a seleção da empresa e do dispositivo, a identificação do Android por ADB e a automação do Smart.
 
-Versão de desenvolvimento: **1.0.4**. A versão 1.0.3 publicada permanece congelada. O histórico está no [CHANGELOG.md](CHANGELOG.md).
+Versão atual: **1.0.4.1**. O histórico está no [CHANGELOG.md](CHANGELOG.md).
 
 ## Fluxos suportados
 
