@@ -1,7 +1,7 @@
 {
-  "version": "1.0.4.1",
-  "downloadUrl": "https://github.com/SarmentoCaio/Softcom-Smart-Provisioner-Releases/releases/download/v1.0.4.1/Softcom-Smart-Provisioner-v1.0.4.1.zip",
-  "sha256": "f6ce371024c1870e9179e5e4b7ead48954ff81bdf355edf6142eac02557d16bf",
+  "version": "1.0.4.2",
+  "downloadUrl": "https://github.com/SarmentoCaio/Softcom-Smart-Provisioner-Releases/releases/download/v1.0.4.2/Softcom-Smart-Provisioner-v1.0.4.2.zip",
+  "sha256": "f0da17299ddbfb5cd780796d6b76043ce9ef78899f522a654f6fceaae7dbcef5",
   "required": false,
-  "notes": "Atualizacao emergencial v1.0.4.1: corrige a verificacao de vinculos no modo Softcomshop Online."
+  "notes": "Atualizacao v1.0.4.2: corrige a identificacao dos dispositivos pelo catalogo de UDIDs na instalacao."
 }
